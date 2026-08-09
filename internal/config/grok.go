@@ -21,6 +21,7 @@ type Model struct {
 	BaseURL               string
 	APIBaseURL            string
 	APIBackend            string
+	ChatSearchDialect     ChatSearchDialect
 	SupportsBackendSearch bool
 	AuthScheme            string
 	IncomingAuthScheme    string
@@ -40,6 +41,8 @@ type ChatSearchDialect string
 const (
 	ChatSearchDialectSearchParameters ChatSearchDialect = "search_parameters"
 	ChatSearchDialectWebSearchOptions ChatSearchDialect = "web_search_options"
+	ChatSearchDialectResponses        ChatSearchDialect = "responses"
+	ChatSearchDialectMessages         ChatSearchDialect = "messages"
 )
 
 // authProviderConfig mirrors the fields Grok Build accepts in
@@ -59,9 +62,12 @@ type Route struct {
 	Host       string // e.g. congee.pro
 	OriginBase string // effective upstream base_url before proxy rewriting
 	APIBackend string // original upstream backend
-	WireModel  string // model value sent to the upstream
-	APIKey     string // resolved channel credential
-	AuthScheme string // upstream bearer | x_api_key
+	// ChatSearchDialect selects the provider extension used both by the fixed
+	// Responses-to-Chat WebSearchClient adapter and native Chat search promotion.
+	ChatSearchDialect ChatSearchDialect
+	WireModel         string // model value sent to the upstream
+	APIKey            string // resolved channel credential
+	AuthScheme        string // upstream bearer | x_api_key
 	// IncomingAuthScheme is the scheme Grok Build uses on the local facade.
 	// Unlike the upstream default for Messages, Build defaults every backend to
 	// bearer unless auth_scheme is explicitly configured.
@@ -70,9 +76,9 @@ type Route struct {
 	// ExtraHeaders are channel-owned values from extra_headers and resolved
 	// env_http_headers. They are safe to reapply after discarding session auth.
 	ExtraHeaders map[string]string
-	// SupportsBackendSearch controls whether the facade may add a hosted search
-	// declaration for this channel. False keeps Build's client web_search path
-	// intact for an explicit search model or Build's authenticated default.
+	// SupportsBackendSearch controls whether the facade routes a structured
+	// web_search declaration to this channel's hosted search API. False keeps
+	// Build's configured client-search model or authenticated official fallback.
 	SupportsBackendSearch bool
 }
 
@@ -140,6 +146,10 @@ func LoadModels(path string) ([]Model, error) {
 		baseURL := inheritedString(m, provider, "base_url")
 		apiBaseURL := inheritedString(m, provider, "api_base_url")
 		apiBackend := normalizeAPIBackend(inheritedString(m, provider, "api_backend"))
+		chatSearchDialect, err := normalizeChatSearchDialect(inheritedString(m, provider, "chat_search_dialect"))
+		if err != nil {
+			return nil, fmt.Errorf("[model.%s].chat_search_dialect %w", id, err)
+		}
 		supportsBackendSearch, err := inheritedBool(m, provider, "supports_backend_search")
 		if err != nil {
 			return nil, fmt.Errorf("[model.%s].supports_backend_search %w", id, err)
@@ -195,6 +205,7 @@ func LoadModels(path string) ([]Model, error) {
 			BaseURL:               baseURL,
 			APIBaseURL:            apiBaseURL,
 			APIBackend:            apiBackend,
+			ChatSearchDialect:     chatSearchDialect,
 			SupportsBackendSearch: supportsBackendSearch,
 			AuthScheme:            upstreamAuthScheme,
 			IncomingAuthScheme:    modelAuthScheme,
@@ -340,11 +351,22 @@ func normalizeAuthScheme(value string) string {
 }
 
 func normalizeAPIBackend(value string) string {
+	return strings.ToLower(strings.TrimSpace(value))
+}
+
+func normalizeChatSearchDialect(value string) (ChatSearchDialect, error) {
 	value = strings.ToLower(strings.TrimSpace(value))
-	if value == "message" {
-		return "messages"
+	switch ChatSearchDialect(value) {
+	case "":
+		return "", nil
+	case ChatSearchDialectSearchParameters, ChatSearchDialectWebSearchOptions,
+		ChatSearchDialectResponses, ChatSearchDialectMessages:
+		return ChatSearchDialect(value), nil
+	default:
+		return "", fmt.Errorf("must be %q, %q, %q, or %q",
+			ChatSearchDialectWebSearchOptions, ChatSearchDialectSearchParameters,
+			ChatSearchDialectResponses, ChatSearchDialectMessages)
 	}
-	return value
 }
 
 func envKeyList(v any) []string {
@@ -495,6 +517,7 @@ func BuildRoutes(models []Model) ([]Route, error) {
 			Host:                  displayHost,
 			OriginBase:            origin,
 			APIBackend:            backend,
+			ChatSearchDialect:     m.ChatSearchDialect,
 			WireModel:             wireModel,
 			APIKey:                key,
 			AuthScheme:            authScheme,

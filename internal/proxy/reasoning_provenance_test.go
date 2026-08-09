@@ -157,14 +157,14 @@ func TestCanonicalReasoningSignaturesAcceptsOnlyProtocolContainers(t *testing.T)
 }
 
 func TestReasoningProjectionLeavesRequestsWithoutOpaqueStateUnchanged(t *testing.T) {
-	body := []byte(`{"model":"display","input":[{"type":"reasoning","content":[{"type":"reasoning_text","text":"plain"}]},{"type":"message","role":"user","content":"hello"}],"stream":true}`)
+	body := []byte(`{"model":"display","messages":[{"role":"assistant","content":"previous","reasoning_content":"plain"},{"role":"user","content":"hello"}],"stream":true}`)
 	route := config.Route{ChannelID: "chat", APIBackend: "chat_completions", WireModel: "wire", OriginBase: "https://chat.example/v1"}
-	baseline, err := adaptFacadeRequest(body, route, newSearchReplayCache())
+	baseline, err := adaptFacadeRequest(body, route, wireChatCompletions)
 	if err != nil {
 		t.Fatal(err)
 	}
 	store, _ := newReasoningProvenanceStore("")
-	projected, err := adaptFacadeRequestWithReasoning(body, route, newSearchReplayCache(), store, keepUnknownReasoning)
+	projected, err := adaptFacadeRequestWithReasoning(body, route, wireChatCompletions, store, keepUnknownReasoning)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -173,23 +173,30 @@ func TestReasoningProjectionLeavesRequestsWithoutOpaqueStateUnchanged(t *testing
 	}
 }
 
-func TestForeignReasoningIsRemovedBeforeEveryTargetProtocol(t *testing.T) {
+func TestForeignOpaqueReasoningIsRemovedFromNativeProtocols(t *testing.T) {
 	store, _ := newReasoningProvenanceStore("")
 	source := config.Route{ChannelID: "source", APIBackend: "responses", WireModel: "source-model", OriginBase: "https://source.example/v1"}
 	store.captureCanonical(reasoningDomain(source), map[string]any{"type": "reasoning", "encrypted_content": "source-signature"})
-	body := []byte(`{"input":[{"type":"reasoning","content":[{"type":"reasoning_text","text":"foreign private state"}],"encrypted_content":"source-signature"},{"type":"reasoning","content":[{"type":"reasoning_text","text":"plain summary"}]},{"type":"message","role":"assistant","content":"visible answer"},{"type":"message","role":"user","content":"continue"}]}`)
-	for _, backend := range []string{"responses", "messages", "chat_completions"} {
-		t.Run(backend, func(t *testing.T) {
-			route := config.Route{ChannelID: "target-" + backend, APIBackend: backend, WireModel: "target-model", OriginBase: "https://target.example/v1"}
-			request, err := adaptFacadeRequestWithReasoning(body, route, newSearchReplayCache(), store, keepUnknownReasoning)
+	tests := []struct {
+		backend  string
+		protocol wireProtocol
+		body     string
+	}{
+		{"responses", wireResponses, `{"input":[{"type":"reasoning","content":[{"type":"reasoning_text","text":"foreign private state"}],"encrypted_content":"source-signature"},{"type":"reasoning","content":[{"type":"reasoning_text","text":"plain summary"}]},{"type":"message","role":"user","content":"continue"}]}`},
+		{"messages", wireMessages, `{"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"foreign private state","signature":"source-signature"},{"type":"text","text":"plain summary"}]},{"role":"user","content":"continue"}],"max_tokens":100}`},
+	}
+	for _, test := range tests {
+		t.Run(test.backend, func(t *testing.T) {
+			route := config.Route{ChannelID: "target-" + test.backend, APIBackend: test.backend, WireModel: "target-model", OriginBase: "https://target.example/v1"}
+			request, err := adaptFacadeRequestWithReasoning([]byte(test.body), route, test.protocol, store, keepUnknownReasoning)
 			if err != nil {
 				t.Fatal(err)
 			}
 			if request.Reasoning.Dropped != 1 || bytes.Contains(request.Body, []byte("source-signature")) || bytes.Contains(request.Body, []byte("foreign private state")) {
-				t.Fatalf("foreign state reached %s: stats=%+v body=%s", backend, request.Reasoning, request.Body)
+				t.Fatalf("foreign state reached %s: stats=%+v body=%s", test.backend, request.Reasoning, request.Body)
 			}
 			if !bytes.Contains(request.Body, []byte("plain summary")) || !bytes.Contains(request.Body, []byte("continue")) {
-				t.Fatalf("portable history was lost for %s: %s", backend, request.Body)
+				t.Fatalf("portable history was lost for %s: %s", test.backend, request.Body)
 			}
 		})
 	}

@@ -180,6 +180,69 @@ func filterReasoningInput(
 	return stats
 }
 
+func filterReasoningRequest(
+	root map[string]any,
+	protocol wireProtocol,
+	route config.Route,
+	store *reasoningProvenanceStore,
+	mode reasoningFilterMode,
+) reasoningFilterStats {
+	if protocol == wireResponses {
+		return filterReasoningInput(root, route, store, mode)
+	}
+	if protocol != wireMessages {
+		return reasoningFilterStats{}
+	}
+	messages, ok := root["messages"].([]any)
+	if !ok {
+		return reasoningFilterStats{}
+	}
+	targetDomain := reasoningDomain(route)
+	stats := reasoningFilterStats{}
+	for _, rawMessage := range messages {
+		message, _ := rawMessage.(map[string]any)
+		content, ok := message["content"].([]any)
+		if !ok {
+			continue
+		}
+		filtered := make([]any, 0, len(content))
+		for _, rawBlock := range content {
+			block, _ := rawBlock.(map[string]any)
+			signature := ""
+			if block != nil {
+				switch stringValue(block["type"]) {
+				case "thinking":
+					signature = stringValue(block["signature"])
+				case "redacted_thinking":
+					signature = stringValue(block["data"])
+				}
+			}
+			if signature == "" {
+				filtered = append(filtered, rawBlock)
+				continue
+			}
+			stats.Opaque++
+			known, compatible := store.compatible(signature, targetDomain)
+			switch {
+			case mode == dropAllOpaqueReasoning:
+				stats.Dropped++
+			case known && compatible:
+				stats.Compatible++
+				filtered = append(filtered, rawBlock)
+			case known:
+				stats.Dropped++
+			default:
+				stats.Unknown++
+				filtered = append(filtered, rawBlock)
+			}
+		}
+		if len(filtered) != len(content) {
+			message["content"] = filtered
+		}
+	}
+	return stats
+}
+
 func isOpaqueReasoningRejection(status int, data []byte) bool {
 	if status < 400 || len(data) == 0 {
 		return false
@@ -342,33 +405,62 @@ func (s *reasoningProvenanceStore) pruneLocked() {
 
 func canonicalReasoningSignatures(value any) map[string]struct{} {
 	signatures := map[string]struct{}{}
-	inspectItem := func(raw any) {
-		item, _ := raw.(map[string]any)
-		if item == nil || stringValue(item["type"]) != "reasoning" {
-			return
-		}
-		if signature := stringValue(item["encrypted_content"]); signature != "" {
-			signatures[signature] = struct{}{}
-		}
-	}
-	inspectItems := func(raw any) {
-		items, _ := raw.([]any)
-		for _, item := range items {
-			inspectItem(item)
-		}
-	}
+	var walk func(any)
+	walk = func(current any) {
+		switch typed := current.(type) {
+		case map[string]any:
+			typ := stringValue(typed["type"])
+			switch typ {
+			case "reasoning":
+				if signature := stringValue(typed["encrypted_content"]); signature != "" {
+					signatures[signature] = struct{}{}
+				}
+			case "thinking":
+				if signature := stringValue(typed["signature"]); signature != "" {
+					signatures[signature] = struct{}{}
+				}
+			case "redacted_thinking":
+				if signature := stringValue(typed["data"]); signature != "" {
+					signatures[signature] = struct{}{}
+				}
+			case "signature_delta":
+				if signature := stringValue(typed["signature"]); signature != "" {
+					signatures[signature] = struct{}{}
+				}
+			}
 
-	switch typed := value.(type) {
-	case []any:
-		inspectItems(typed)
-	case map[string]any:
-		inspectItem(typed)
-		inspectItems(typed["output"])
-		inspectItem(typed["item"])
-		if response, _ := typed["response"].(map[string]any); response != nil {
-			inspectItems(response["output"])
+			keys := []string(nil)
+			switch {
+			case typ == "" && stringValue(typed["object"]) == "response":
+				keys = []string{"output"}
+			case typ == "":
+				keys = []string{"output"}
+			case typ == "message":
+				keys = []string{"content"}
+			case strings.HasPrefix(typ, "response.output_item."):
+				keys = []string{"item"}
+			case typ == "response.created" || typ == "response.in_progress" ||
+				typ == "response.completed" || typ == "response.failed" || typ == "response.incomplete":
+				keys = []string{"response"}
+			case typ == "message_start":
+				keys = []string{"message"}
+			case typ == "content_block_start":
+				keys = []string{"content_block"}
+			case typ == "content_block_delta":
+				keys = []string{"delta"}
+			}
+			for _, key := range keys {
+				if child, exists := typed[key]; exists {
+					walk(child)
+				}
+			}
+		case []any:
+			for _, child := range typed {
+				walk(child)
+			}
 		}
 	}
+	walk(value)
 	return signatures
 }
 

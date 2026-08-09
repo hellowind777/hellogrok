@@ -126,7 +126,7 @@ func TestMessagesReasoningProvenanceSurvivesProxyRestart(t *testing.T) {
 	source := newServer(log.New(io.Discard, "", 0), path)
 	source.SetRoutes([]config.Route{sourceRoute})
 	startPathTestServer(t, source)
-	if data, status := postFacade(t, source, sourceRoute.ChannelID, []byte(`{"input":"first","stream":false}`), ""); status != http.StatusOK {
+	if data, status := postFacade(t, source, sourceRoute.ChannelID, nativeRequestBody("messages", false), ""); status != http.StatusOK {
 		t.Fatalf("Messages source status=%d body=%s", status, data)
 	}
 	source.Stop()
@@ -194,7 +194,12 @@ func TestStreamingReasoningIsCapturedBeforeTheNextModelTurn(t *testing.T) {
 			s := New(log.New(io.Discard, "", 0))
 			s.SetRoutes([]config.Route{sourceRoute, targetRoute})
 			startPathTestServer(t, s)
-			if data, status := postFacade(t, s, sourceRoute.ChannelID, []byte(`{"input":"first","stream":true}`), ""); status != http.StatusOK || !bytes.Contains(data, []byte("response.completed")) {
+			sourceBody := nativeRequestBody(backend, true)
+			terminal := []byte("response.completed")
+			if backend == "messages" {
+				terminal = []byte("message_stop")
+			}
+			if data, status := postFacade(t, s, sourceRoute.ChannelID, sourceBody, ""); status != http.StatusOK || !bytes.Contains(data, terminal) {
 				t.Fatalf("source stream status=%d body=%s", status, data)
 			}
 			if data, status := postFacade(t, s, targetRoute.ChannelID, opaqueHistory(signature), ""); status != http.StatusOK {

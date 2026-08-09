@@ -10,8 +10,17 @@ import (
 	"github.com/hellowind777/hellogrok/internal/config"
 )
 
+type facadeRequestKind uint8
+
+const (
+	nativeSessionRequest facadeRequestKind = iota
+	clientSearchRequest
+)
+
 type facadeRequest struct {
 	Body                 []byte
+	Kind                 facadeRequestKind
+	IncomingProtocol     wireProtocol
 	Protocol             wireProtocol
 	Stream               bool
 	HostedWebSearch      bool
@@ -21,46 +30,96 @@ type facadeRequest struct {
 	ProxyAddedWebSearch  bool
 	ClientSearchPrepared bool
 	ClientSearchAlias    string
-	ReplayScope          string
 	Reasoning            reasoningFilterStats
 	ReasoningRecovery    bool
 }
 
-func channelFromPath(escapedPath string) (string, bool) {
+func channelFromPath(escapedPath string) (string, wireProtocol, bool) {
 	parts := strings.Split(strings.Trim(escapedPath, "/"), "/")
-	if len(parts) != 3 || parts[0] != "c" || parts[2] != "responses" {
-		return "", false
+	if len(parts) < 3 || parts[0] != "c" {
+		return "", wireUnknown, false
 	}
 	id, err := url.PathUnescape(parts[1])
 	if err != nil || strings.TrimSpace(id) == "" {
-		return "", false
+		return "", wireUnknown, false
 	}
-	return id, true
+	var protocol wireProtocol
+	switch {
+	case len(parts) == 3 && parts[2] == "responses":
+		protocol = wireResponses
+	case len(parts) == 3 && parts[2] == "messages":
+		protocol = wireMessages
+	case len(parts) == 4 && parts[2] == "chat" && parts[3] == "completions":
+		protocol = wireChatCompletions
+	default:
+		return "", wireUnknown, false
+	}
+	return id, protocol, true
 }
 
-func upstreamTarget(route config.Route, rawQuery string) (string, wireProtocol, error) {
-	u, err := url.Parse(route.OriginBase)
-	if err != nil || u.Host == "" {
-		return "", wireUnknown, fmt.Errorf("invalid upstream base_url")
-	}
-	var suffix string
-	var protocol wireProtocol
+func routeProtocol(route config.Route) (wireProtocol, error) {
 	switch strings.ToLower(strings.TrimSpace(route.APIBackend)) {
 	case "responses":
-		suffix, protocol = "/responses", wireResponses
+		return wireResponses, nil
 	case "messages":
-		suffix, protocol = "/messages", wireMessages
+		return wireMessages, nil
 	case "chat_completions", "":
-		suffix, protocol = "/chat/completions", wireChatCompletions
+		return wireChatCompletions, nil
 	default:
-		return "", wireUnknown, fmt.Errorf("unsupported api_backend %q", route.APIBackend)
+		return wireUnknown, fmt.Errorf("unsupported api_backend %q", route.APIBackend)
+	}
+}
+
+// providerSearchProtocol selects the provider API that can actually execute
+// hosted search. Chat channels may explicitly bridge to Responses or Messages;
+// official xAI and DeepSeek endpoints use their known working search APIs.
+func providerSearchProtocol(route config.Route) (wireProtocol, error) {
+	native, err := routeProtocol(route)
+	if err != nil || native != wireChatCompletions {
+		return native, err
+	}
+	switch chatSearchDialect(route) {
+	case config.ChatSearchDialectResponses:
+		return wireResponses, nil
+	case config.ChatSearchDialectMessages:
+		return wireMessages, nil
+	case config.ChatSearchDialectSearchParameters, config.ChatSearchDialectWebSearchOptions:
+		return wireChatCompletions, nil
+	default:
+		return wireUnknown, fmt.Errorf("unsupported Chat search dialect %q", chatSearchDialect(route))
+	}
+}
+
+func upstreamTarget(route config.Route, protocol wireProtocol, rawQuery string) (string, error) {
+	u, err := url.Parse(route.OriginBase)
+	if err != nil || u.Host == "" {
+		return "", fmt.Errorf("invalid upstream base_url")
+	}
+	var suffix string
+	switch protocol {
+	case wireResponses:
+		suffix = "/responses"
+	case wireMessages:
+		suffix = "/messages"
+		if native, _ := routeProtocol(route); native == wireChatCompletions && isOfficialDeepSeekHost(route.Host) {
+			basePath := strings.TrimRight(u.Path, "/")
+			basePath = strings.TrimSuffix(basePath, "/v1")
+			if !strings.HasSuffix(basePath, "/anthropic") {
+				basePath += "/anthropic"
+			}
+			u.Path = basePath
+		}
+	case wireChatCompletions:
+		suffix = "/chat/completions"
+	default:
+		return "", fmt.Errorf("unsupported upstream protocol %q", protocol)
 	}
 	u.Path = strings.TrimRight(u.Path, "/") + suffix
 	u.RawPath = ""
 	if rawQuery != "" {
 		incoming, err := url.ParseQuery(rawQuery)
 		if err != nil {
-			return "", wireUnknown, fmt.Errorf("invalid request query parameters: %w", err)
+			return "", fmt.Errorf("invalid request query parameters: %w", err)
 		}
 		merged := u.Query()
 		for key, values := range incoming {
@@ -71,101 +130,121 @@ func upstreamTarget(route config.Route, rawQuery string) (string, wireProtocol, 
 		}
 		u.RawQuery = merged.Encode()
 	}
-	return u.String(), protocol, nil
+	return u.String(), nil
 }
 
-func adaptFacadeRequest(body []byte, route config.Route, replays *searchReplayCache) (facadeRequest, error) {
-	return adaptFacadeRequestWithReasoning(body, route, replays, nil, keepUnknownReasoning)
+func adaptFacadeRequest(body []byte, route config.Route, incoming wireProtocol) (facadeRequest, error) {
+	return adaptFacadeRequestWithReasoning(body, route, incoming, nil, keepUnknownReasoning)
 }
 
 func adaptFacadeRequestWithReasoning(
 	body []byte,
 	route config.Route,
-	replays *searchReplayCache,
+	incoming wireProtocol,
 	provenance *reasoningProvenanceStore,
 	filterMode reasoningFilterMode,
 ) (facadeRequest, error) {
 	root, err := decodeRequestObject(body)
 	if err != nil {
-		return facadeRequest{}, fmt.Errorf("decode Responses request: %w", err)
+		return facadeRequest{}, fmt.Errorf("decode %s request: %w", protocolLabel(incoming), err)
+	}
+	native, err := routeProtocol(route)
+	if err != nil {
+		return facadeRequest{}, err
 	}
 	stream, _ := root["stream"].(bool)
-	replayScope := replayConversationFingerprint(root["input"])
 	_, _, buildHostedSearch, _, buildXSearch := summarizeBody(body)
-	root["model"] = route.WireModel
-	reasoning := filterReasoningInput(root, route, provenance, filterMode)
-	clientSearchPrepared := prepareClientSearchExecution(root, buildHostedSearch, buildXSearch)
-	proxyAddedSearch := false
-	clientSearchAlias := ""
-	capabilities := hostedSearchCapabilities{}
-	if clientSearchPrepared {
-		// Build's WebSearchClient always sends exactly one hosted web_search
-		// request. It is independent of the conversation model's backend-search
-		// setting and must never gain x_search.
-		capabilities.Web = true
-	} else if route.SupportsBackendSearch {
-		capabilities = routeHostedSearchCapabilities(route)
-		proxyAddedSearch = ensureHostedSearch(root, capabilities)
-	} else {
-		describeClientWebTools(root)
-		clientSearchAlias = chooseClientWebSearchWireAlias(root)
+	preparedSearch := false
+	if incoming == wireResponses {
+		preparedSearch = prepareClientSearchExecution(root, buildHostedSearch, buildXSearch)
 	}
-	normalizeHostedSearchObject(root, capabilities)
-	hosted := hasHostedSearchTool(root)
-	query := lastUserText(root["input"])
-	requestInfo := facadeRequest{
+	expected := native
+	if route.SupportsBackendSearch {
+		expected = wireResponses
+	}
+	if incoming != expected && !(incoming == wireResponses && preparedSearch) {
+		return facadeRequest{}, fmt.Errorf("channel %q expects %s while the facade is active; received %s",
+			route.ChannelID, protocolLabel(expected), protocolLabel(incoming))
+	}
+
+	request := facadeRequest{
+		Kind:                 nativeSessionRequest,
+		IncomingProtocol:     incoming,
 		Stream:               stream,
-		HostedWebSearch:      hosted,
-		SearchQuery:          query,
 		BuildHostedWebSearch: buildHostedSearch,
 		BuildXSearch:         buildXSearch,
-		ProxyAddedWebSearch:  proxyAddedSearch,
-		ClientSearchPrepared: clientSearchPrepared,
-		ClientSearchAlias:    clientSearchAlias,
-		ReplayScope:          replayScope,
-		Reasoning:            reasoning,
+		ClientSearchPrepared: preparedSearch,
 		ReasoningRecovery:    filterMode == dropAllOpaqueReasoning,
 	}
 
-	switch strings.ToLower(strings.TrimSpace(route.APIBackend)) {
-	case "responses":
-		replays.restore(route.ChannelID, root)
-		if !aliasClientWebSearchOnWire(root, clientSearchAlias) {
-			requestInfo.ClientSearchAlias = ""
+	// Capable sessions and Grok Build's dedicated WebSearchClient both arrive as
+	// Responses. Convert that canonical request only at the provider boundary.
+	if route.SupportsBackendSearch || preparedSearch {
+		root["model"] = route.WireModel
+		request.Reasoning = filterReasoningInput(root, route, provenance, filterMode)
+		request.SearchQuery = lastUserText(root["input"])
+		capabilities := hostedSearchCapabilities{Web: preparedSearch}
+		if route.SupportsBackendSearch && !preparedSearch {
+			capabilities = routeHostedSearchCapabilities(route)
+			request.ProxyAddedWebSearch = ensureHostedSearch(root, capabilities)
 		}
-		encoded, err := encodeRequestObject(root)
+		normalizeHostedSearchObject(root, capabilities)
+		request.HostedWebSearch = hasHostedSearchTool(root)
+		if err := validateResponsesToolHistory(root["input"]); err != nil {
+			return facadeRequest{}, err
+		}
+		if preparedSearch {
+			request.Kind = clientSearchRequest
+		}
+		request.Protocol, err = providerSearchProtocol(route)
 		if err != nil {
 			return facadeRequest{}, err
 		}
-		requestInfo.Body = encoded
-		requestInfo.Protocol = wireResponses
-		return requestInfo, nil
-	case "messages":
-		converted, err := responsesToMessagesRequest(root, route.ChannelID, replays)
-		if err != nil {
-			return facadeRequest{}, err
+		switch request.Protocol {
+		case wireResponses:
+			request.Body, err = encodeRequestObject(root)
+		case wireMessages:
+			var converted map[string]any
+			converted, err = responsesToMessagesRequest(root)
+			if err == nil {
+				request.Body, err = encodeRequestObject(converted)
+			}
+		case wireChatCompletions:
+			var converted map[string]any
+			converted, err = responsesToChatRequest(root, route)
+			if err == nil {
+				request.Body, err = encodeRequestObject(converted)
+			}
 		}
-		if !aliasClientWebSearchOnWire(converted, clientSearchAlias) {
-			requestInfo.ClientSearchAlias = ""
-		}
-		encoded, err := json.Marshal(converted)
-		requestInfo.Body = encoded
-		requestInfo.Protocol = wireMessages
-		return requestInfo, err
-	case "chat_completions", "":
-		converted, err := responsesToChatRequest(root, route)
-		if err != nil {
-			return facadeRequest{}, err
-		}
-		if !aliasClientWebSearchOnWire(converted, clientSearchAlias) {
-			requestInfo.ClientSearchAlias = ""
-		}
-		encoded, err := json.Marshal(converted)
-		requestInfo.Body = encoded
-		requestInfo.Protocol = wireChatCompletions
-		return requestInfo, err
+		return request, err
+	}
+
+	root["model"] = route.WireModel
+	request.Protocol = native
+	request.Reasoning = filterReasoningRequest(root, native, route, provenance, filterMode)
+	request.SearchQuery = lastUserTextForProtocol(root, native)
+	if err := validateNativeToolHistory(root, native); err != nil {
+		return facadeRequest{}, err
+	}
+	describeClientWebTools(root)
+	request.ClientSearchAlias = chooseClientWebSearchWireAlias(root)
+	if !aliasClientWebSearchOnWire(root, request.ClientSearchAlias, native) {
+		request.ClientSearchAlias = ""
+	}
+	request.Body, err = encodeRequestObject(root)
+	return request, err
+}
+
+func protocolLabel(protocol wireProtocol) string {
+	switch protocol {
+	case wireResponses:
+		return "Responses"
+	case wireMessages:
+		return "Messages"
+	case wireChatCompletions:
+		return "Chat Completions"
 	default:
-		return facadeRequest{}, fmt.Errorf("unsupported api_backend %q", route.APIBackend)
+		return "unknown protocol"
 	}
 }
 
@@ -184,7 +263,7 @@ func describeClientWebTools(root map[string]any) {
 	}
 	for _, raw := range anySlice(root["tools"]) {
 		tool, _ := raw.(map[string]any)
-		if tool == nil || stringValue(tool["type"]) != "function" {
+		if tool == nil {
 			continue
 		}
 		name := strings.ToLower(strings.TrimSpace(functionToolName(tool)))
@@ -332,9 +411,10 @@ func toolChoiceAllowsHostedSearch(choice any) bool {
 }
 
 func routeHostedSearchCapabilities(route config.Route) hostedSearchCapabilities {
+	protocol, _ := providerSearchProtocol(route)
 	return hostedSearchCapabilities{
 		Web: true,
-		X:   strings.EqualFold(strings.TrimSpace(route.APIBackend), "responses") && isGrokRoute(route),
+		X:   protocol == wireResponses && isOfficialXAIHost(route.Host),
 	}
 }
 
@@ -372,8 +452,8 @@ func hasHostedSearchTool(root map[string]any) bool {
 	return false
 }
 
-func responsesToMessagesRequest(root map[string]any, channel string, replays *searchReplayCache) (map[string]any, error) {
-	messages, system, err := responsesInputToMessages(root["input"], true, channel, replays)
+func responsesToMessagesRequest(root map[string]any) (map[string]any, error) {
+	messages, system, err := responsesInputToMessages(root["input"], true)
 	if err != nil {
 		return nil, err
 	}
@@ -424,11 +504,14 @@ func responsesToMessagesRequest(root map[string]any, channel string, replays *se
 			}
 		}
 	}
+	if err := validateMessagesToolHistory(out["messages"]); err != nil {
+		return nil, fmt.Errorf("converted Messages request: %w", err)
+	}
 	return out, nil
 }
 
 func responsesToChatRequest(root map[string]any, route config.Route) (map[string]any, error) {
-	messages, _, err := responsesInputToMessages(root["input"], false, "", nil)
+	messages, _, err := responsesInputToMessages(root["input"], false)
 	if err != nil {
 		return nil, err
 	}
@@ -481,15 +564,22 @@ func responsesToChatRequest(root map[string]any, route config.Route) (map[string
 		}
 	}
 	if hosted && !toolsDisabled {
+		searchTool := firstHostedSearchTool(root["tools"])
 		switch chatSearchDialect(route) {
 		case config.ChatSearchDialectSearchParameters:
 			mode := "auto"
 			if hostedToolChoiceRequired(root["tool_choice"]) {
 				mode = "on"
 			}
-			out["search_parameters"] = map[string]any{"mode": mode, "sources": []any{map[string]any{"type": "web"}}}
+			source := map[string]any{"type": "web"}
+			copySearchDomainFilters(source, searchTool, "allowed_websites", "excluded_websites")
+			out["search_parameters"] = map[string]any{"mode": mode, "sources": []any{source}}
+		case config.ChatSearchDialectWebSearchOptions:
+			options := map[string]any{}
+			copyIfPresent(options, searchTool, "search_context_size", "user_location")
+			out["web_search_options"] = options
 		default:
-			out["web_search_options"] = map[string]any{}
+			return nil, fmt.Errorf("Chat search dialect %q requires a protocol bridge", chatSearchDialect(route))
 		}
 	}
 	if reasoning, _ := root["reasoning"].(map[string]any); reasoning != nil {
@@ -497,10 +587,23 @@ func responsesToChatRequest(root map[string]any, route config.Route) (map[string
 			out["reasoning_effort"] = effort
 		}
 	}
+	if err := validateChatToolHistory(out["messages"]); err != nil {
+		return nil, fmt.Errorf("converted Chat Completions request: %w", err)
+	}
 	return out, nil
 }
 
-func responsesInputToMessages(input any, anthropic bool, channel string, replays *searchReplayCache) ([]any, []string, error) {
+func firstHostedSearchTool(value any) map[string]any {
+	for _, raw := range anySlice(value) {
+		tool, _ := raw.(map[string]any)
+		if tool != nil && (stringValue(tool["type"]) == "x_search" || isHostedWebSearchType(stringValue(tool["type"]))) {
+			return tool
+		}
+	}
+	return map[string]any{}
+}
+
+func responsesInputToMessages(input any, anthropic bool) ([]any, []string, error) {
 	var messages []any
 	var system []string
 	var pendingReasoning []string
@@ -509,7 +612,7 @@ func responsesInputToMessages(input any, anthropic bool, channel string, replays
 		return []any{map[string]any{"role": "user", "content": text}}, nil, nil
 	}
 	items := anySlice(input)
-	for index, raw := range items {
+	for _, raw := range items {
 		item, _ := raw.(map[string]any)
 		if item == nil {
 			continue
@@ -561,7 +664,7 @@ func responsesInputToMessages(input any, anthropic bool, channel string, replays
 			pendingReasoning = nil
 			chatAssistantIndex = -1
 			if anthropic {
-				appendMessage(&messages, "user", []any{map[string]any{"type": "tool_result", "tool_use_id": id, "content": output}})
+				appendBlockToRole(&messages, "user", map[string]any{"type": "tool_result", "tool_use_id": id, "content": output})
 			} else {
 				messages = append(messages, map[string]any{"role": "tool", "tool_call_id": id, "content": output})
 			}
@@ -578,8 +681,7 @@ func responsesInputToMessages(input any, anthropic bool, channel string, replays
 			}
 		case "web_search_call":
 			if anthropic {
-				conversation := replayConversationFingerprint(items[:index])
-				for _, block := range replays.messagesBlocks(channel, conversation, item) {
+				for _, block := range responseWebSearchToMessagesBlocks(item) {
 					appendBlockToRole(&messages, "assistant", block)
 				}
 				continue
@@ -604,6 +706,44 @@ func responsesInputToMessages(input any, anthropic bool, channel string, replays
 		}
 	}
 	return messages, system, nil
+}
+
+// responseWebSearchToMessagesBlocks reconstructs the provider-neutral search
+// history carried by a Responses web_search_call. Keeping the tool-use block
+// adjacent to its result avoids relying on process-local replay state and makes
+// continued Messages conversations deterministic after restarts.
+func responseWebSearchToMessagesBlocks(item map[string]any) []map[string]any {
+	action, _ := item["action"].(map[string]any)
+	if action == nil {
+		return nil
+	}
+	query := strings.TrimSpace(firstString(action, "query"))
+	if query == "" {
+		query = firstSearchQuery(action["queries"])
+	}
+	id := firstString(item, "id")
+	if id == "" {
+		id = compatID("srv")
+	}
+	use := map[string]any{
+		"type": "server_tool_use", "id": id, "name": "web_search",
+		"input": map[string]any{"query": query},
+	}
+	results := make([]any, 0)
+	for _, raw := range anySlice(action["sources"]) {
+		source, _ := raw.(map[string]any)
+		url := strings.TrimSpace(firstString(source, "url"))
+		if url == "" {
+			continue
+		}
+		result := map[string]any{"type": "web_search_result", "url": url}
+		copyIfPresent(result, source, "title", "page_age", "encrypted_content")
+		results = append(results, result)
+	}
+	result := map[string]any{
+		"type": "web_search_tool_result", "tool_use_id": id, "content": results,
+	}
+	return []map[string]any{use, result}
 }
 
 func appendAnthropicAssistantContent(messages *[]any, content any) {
@@ -670,6 +810,250 @@ func backendToolSummary(item map[string]any) string {
 			code = code[:100] + "..."
 		}
 		return "[backend code_interpreter] " + code
+	}
+	return ""
+}
+
+func validateNativeToolHistory(root map[string]any, protocol wireProtocol) error {
+	switch protocol {
+	case wireResponses:
+		return validateResponsesToolHistory(root["input"])
+	case wireMessages:
+		return validateMessagesToolHistory(root["messages"])
+	case wireChatCompletions:
+		return validateChatToolHistory(root["messages"])
+	default:
+		return fmt.Errorf("unsupported request protocol")
+	}
+}
+
+func validateResponsesToolHistory(value any) error {
+	if _, ok := value.(string); ok {
+		return nil
+	}
+	items, ok := value.([]any)
+	if !ok {
+		return fmt.Errorf("Responses request input must be a string or array")
+	}
+	open := map[string]struct{}{}
+	seenCalls := map[string]struct{}{}
+	seenResults := map[string]struct{}{}
+	order := []string{}
+	flush := func() error {
+		if len(open) == 0 {
+			return nil
+		}
+		return fmt.Errorf("Responses tool history is invalid: missing function_call_output for %s", strings.Join(unresolvedIDs(order, open), ", "))
+	}
+	for _, raw := range items {
+		item, _ := raw.(map[string]any)
+		typ := stringValue(item["type"])
+		if typ != "function_call" && typ != "function_call_output" {
+			if err := flush(); err != nil {
+				return err
+			}
+			order = nil
+			continue
+		}
+		id := firstString(item, "call_id")
+		if id == "" {
+			return fmt.Errorf("Responses tool history is invalid: %s has no call_id", typ)
+		}
+		if typ == "function_call" {
+			if len(open) == 0 {
+				order = nil
+			}
+			if _, duplicate := seenCalls[id]; duplicate {
+				return fmt.Errorf("Responses tool history is invalid: duplicate function_call id %s", id)
+			}
+			seenCalls[id] = struct{}{}
+			open[id] = struct{}{}
+			order = append(order, id)
+			continue
+		}
+		if _, duplicate := seenResults[id]; duplicate {
+			return fmt.Errorf("Responses tool history is invalid: duplicate function_call_output for %s", id)
+		}
+		if _, found := open[id]; !found {
+			return fmt.Errorf("Responses tool history is invalid: function_call_output %s has no preceding unresolved function_call", id)
+		}
+		seenResults[id] = struct{}{}
+		delete(open, id)
+	}
+	return flush()
+}
+
+func validateMessagesToolHistory(value any) error {
+	messages, ok := value.([]any)
+	if !ok {
+		return fmt.Errorf("Messages request messages must be an array")
+	}
+	seenCalls := map[string]struct{}{}
+	seenResults := map[string]struct{}{}
+	var pending map[string]struct{}
+	var order []string
+	for index, raw := range messages {
+		message, _ := raw.(map[string]any)
+		if message == nil {
+			return fmt.Errorf("Messages request messages[%d] must be an object", index)
+		}
+		role := stringValue(message["role"])
+		blocks := contentBlocks(message["content"])
+		if len(pending) > 0 {
+			if role != "user" {
+				return fmt.Errorf("Messages tool history is invalid: tool_result blocks for %s must be in the immediately following user message", strings.Join(unresolvedIDs(order, pending), ", "))
+			}
+			sawNonResult := false
+			for _, block := range blocks {
+				if stringValue(block["type"]) != "tool_result" {
+					sawNonResult = true
+					continue
+				}
+				if sawNonResult {
+					return fmt.Errorf("Messages tool history is invalid: tool_result blocks must precede other user content")
+				}
+				id := stringValue(block["tool_use_id"])
+				if id == "" {
+					return fmt.Errorf("Messages tool history is invalid: tool_result has no tool_use_id")
+				}
+				if _, duplicate := seenResults[id]; duplicate {
+					return fmt.Errorf("Messages tool history is invalid: duplicate tool_result for %s", id)
+				}
+				if _, found := pending[id]; !found {
+					return fmt.Errorf("Messages tool history is invalid: tool_result %s does not match the immediately preceding assistant tool_use batch", id)
+				}
+				seenResults[id] = struct{}{}
+				delete(pending, id)
+			}
+			if len(pending) > 0 {
+				return fmt.Errorf("Messages tool history is invalid: missing tool_result for %s", strings.Join(unresolvedIDs(order, pending), ", "))
+			}
+			pending, order = nil, nil
+		} else {
+			for _, block := range blocks {
+				if stringValue(block["type"]) == "tool_result" {
+					return fmt.Errorf("Messages tool history is invalid: tool_result %s has no immediately preceding assistant tool_use", stringValue(block["tool_use_id"]))
+				}
+			}
+		}
+		if role != "assistant" {
+			continue
+		}
+		for _, block := range blocks {
+			if stringValue(block["type"]) != "tool_use" {
+				continue
+			}
+			id := stringValue(block["id"])
+			if id == "" {
+				return fmt.Errorf("Messages tool history is invalid: tool_use has no id")
+			}
+			if _, duplicate := seenCalls[id]; duplicate {
+				return fmt.Errorf("Messages tool history is invalid: duplicate tool_use id %s", id)
+			}
+			if pending == nil {
+				pending = map[string]struct{}{}
+			}
+			seenCalls[id] = struct{}{}
+			pending[id] = struct{}{}
+			order = append(order, id)
+		}
+	}
+	if len(pending) > 0 {
+		return fmt.Errorf("Messages tool history is invalid: missing tool_result for %s", strings.Join(unresolvedIDs(order, pending), ", "))
+	}
+	return nil
+}
+
+func validateChatToolHistory(value any) error {
+	messages, ok := value.([]any)
+	if !ok {
+		return fmt.Errorf("Chat Completions request messages must be an array")
+	}
+	seenCalls := map[string]struct{}{}
+	seenResults := map[string]struct{}{}
+	var pending map[string]struct{}
+	var order []string
+	for index, raw := range messages {
+		message, _ := raw.(map[string]any)
+		if message == nil {
+			return fmt.Errorf("Chat Completions request messages[%d] must be an object", index)
+		}
+		role := stringValue(message["role"])
+		if role == "tool" {
+			id := stringValue(message["tool_call_id"])
+			if id == "" {
+				return fmt.Errorf("Chat Completions tool history is invalid: tool message has no tool_call_id")
+			}
+			if _, duplicate := seenResults[id]; duplicate {
+				return fmt.Errorf("Chat Completions tool history is invalid: duplicate tool result for %s", id)
+			}
+			if _, found := pending[id]; !found {
+				return fmt.Errorf("Chat Completions tool history is invalid: tool result %s has no immediately preceding assistant tool_call batch", id)
+			}
+			seenResults[id] = struct{}{}
+			delete(pending, id)
+			continue
+		}
+		if len(pending) > 0 {
+			return fmt.Errorf("Chat Completions tool history is invalid: missing tool result for %s", strings.Join(unresolvedIDs(order, pending), ", "))
+		}
+		pending, order = nil, nil
+		if role != "assistant" {
+			continue
+		}
+		for _, rawCall := range anySlice(message["tool_calls"]) {
+			call, _ := rawCall.(map[string]any)
+			id := stringValue(call["id"])
+			if id == "" {
+				return fmt.Errorf("Chat Completions tool history is invalid: tool_call has no id")
+			}
+			if _, duplicate := seenCalls[id]; duplicate {
+				return fmt.Errorf("Chat Completions tool history is invalid: duplicate tool_call id %s", id)
+			}
+			if pending == nil {
+				pending = map[string]struct{}{}
+			}
+			seenCalls[id] = struct{}{}
+			pending[id] = struct{}{}
+			order = append(order, id)
+		}
+	}
+	if len(pending) > 0 {
+		return fmt.Errorf("Chat Completions tool history is invalid: missing tool result for %s", strings.Join(unresolvedIDs(order, pending), ", "))
+	}
+	return nil
+}
+
+func unresolvedIDs(order []string, unresolved map[string]struct{}) []string {
+	missing := make([]string, 0, len(unresolved))
+	for _, id := range order {
+		if _, ok := unresolved[id]; ok {
+			missing = append(missing, id)
+		}
+	}
+	return missing
+}
+
+func contentBlocks(value any) []map[string]any {
+	blocks := make([]map[string]any, 0)
+	for _, raw := range anySlice(value) {
+		if block, ok := raw.(map[string]any); ok && block != nil {
+			blocks = append(blocks, block)
+		}
+	}
+	return blocks
+}
+
+func lastUserTextForProtocol(root map[string]any, protocol wireProtocol) string {
+	if protocol == wireResponses {
+		return lastUserText(root["input"])
+	}
+	messages := anySlice(root["messages"])
+	for index := len(messages) - 1; index >= 0; index-- {
+		message, _ := messages[index].(map[string]any)
+		if stringValue(message["role"]) == "user" {
+			return contentText(message["content"])
+		}
 	}
 	return ""
 }
@@ -757,7 +1141,7 @@ func messagesTools(value, choice any) ([]any, bool) {
 			tools = append(tools, entry)
 		case (typ == "x_search" || isHostedWebSearchType(typ)) && hosted:
 			if !containsMessagesHostedSearch(tools) {
-				tools = append(tools, map[string]any{"type": "web_search_20250305", "name": "web_search", "max_uses": 10})
+				tools = append(tools, messagesSearchTool(tool))
 			}
 		}
 	}
@@ -774,35 +1158,73 @@ func containsMessagesHostedSearch(tools []any) bool {
 	return false
 }
 
-func isXAIChatRoute(route config.Route) bool {
-	return isGrokRoute(route)
+func messagesSearchTool(tool map[string]any) map[string]any {
+	out := map[string]any{"type": "web_search_20250305", "name": "web_search", "max_uses": 10}
+	copySearchDomainFilters(out, tool, "allowed_domains", "blocked_domains")
+	if value := positiveInt(tool["max_uses"], 0); value > 0 {
+		out["max_uses"] = value
+	}
+	if location, _ := tool["user_location"].(map[string]any); location != nil {
+		out["user_location"] = cloneMap(location)
+	}
+	return out
+}
+
+func copySearchDomainFilters(dst, tool map[string]any, allowedKey, blockedKey string) {
+	filters, _ := tool["filters"].(map[string]any)
+	for _, entry := range []struct {
+		source string
+		target string
+	}{{"allowed_domains", allowedKey}, {"blocked_domains", blockedKey}} {
+		value := tool[entry.source]
+		if value == nil && filters != nil {
+			value = filters[entry.source]
+		}
+		if domains := nonEmptyStringSlice(value); len(domains) > 0 {
+			dst[entry.target] = domains
+		}
+	}
+}
+
+func nonEmptyStringSlice(value any) []string {
+	var out []string
+	for _, raw := range anySlice(value) {
+		if text, ok := raw.(string); ok && strings.TrimSpace(text) != "" {
+			out = append(out, strings.TrimSpace(text))
+		}
+	}
+	return out
 }
 
 func chatSearchDialect(route config.Route) config.ChatSearchDialect {
-	if isXAIChatRoute(route) {
-		return config.ChatSearchDialectSearchParameters
+	if route.ChatSearchDialect != "" {
+		return route.ChatSearchDialect
+	}
+	if isOfficialDeepSeekHost(route.Host) {
+		return config.ChatSearchDialectMessages
+	}
+	if isOfficialXAIHost(route.Host) {
+		return config.ChatSearchDialectResponses
 	}
 	return config.ChatSearchDialectWebSearchOptions
 }
 
-func isGrokRoute(route config.Route) bool {
-	model := strings.ToLower(strings.TrimSpace(route.WireModel))
-	channel := strings.ToLower(strings.TrimSpace(route.ChannelID))
-	host := strings.ToLower(strings.TrimSpace(route.Host))
+func normalizedHostname(value string) string {
+	host := strings.ToLower(strings.TrimSpace(value))
 	if parsedHost, _, err := net.SplitHostPort(host); err == nil {
 		host = parsedHost
 	}
-	host = strings.Trim(host, "[]")
-	return grokIdentifier(model) || grokIdentifier(channel) ||
-		host == "x.ai" || strings.HasSuffix(host, ".x.ai")
+	return strings.Trim(host, "[]")
 }
 
-func grokIdentifier(value string) bool {
-	value = strings.TrimSpace(strings.ToLower(value))
-	if slash := strings.LastIndex(value, "/"); slash >= 0 {
-		value = value[slash+1:]
-	}
-	return value == "grok" || strings.HasPrefix(value, "grok-") || strings.HasPrefix(value, "grok_")
+func isOfficialXAIHost(value string) bool {
+	host := normalizedHostname(value)
+	return host == "x.ai" || strings.HasSuffix(host, ".x.ai")
+}
+
+func isOfficialDeepSeekHost(value string) bool {
+	host := normalizedHostname(value)
+	return host == "deepseek.com" || strings.HasSuffix(host, ".deepseek.com")
 }
 
 func messagesToolChoice(value any, hosted bool) any {

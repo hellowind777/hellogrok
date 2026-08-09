@@ -137,7 +137,7 @@ func TestStatusDetailPutsEachSectionFirstItemOnHeadingLine(t *testing.T) {
 		"【配置恢复】 临时改写：2 个渠道，停止代理：恢复原值",
 		"【渠道】 配置校验：已通过；数量：2 个\n列表：model-a, model-b",
 		"【Grok 会话】 热切换：已刷新 1/1 个空闲自定义模型会话",
-		"【协议与搜索】 Grok 入口：Responses\n上游协议：按渠道使用 Responses、Messages 或 Chat Completions\n搜索分流：按渠道有效配置",
+		"【协议与搜索】 Grok 消费：搜索开启时投影为 Responses\n上游协议：保持渠道真实格式\n搜索分流：开启走当前渠道，关闭走客户端搜索",
 	} {
 		if !strings.Contains(detail, want) {
 			t.Fatalf("status detail is missing %q:\n%s", want, detail)
@@ -324,6 +324,7 @@ func TestAppStartStopLifecycleRestoresConfigExactly(t *testing.T) {
 		`base_url = "https://api.example.test/v1"`,
 		`api_key = "test-key"`,
 		`api_backend = "chat_completions"`,
+		"supports_backend_search = true",
 		"",
 	}, "\n")
 	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
@@ -349,7 +350,7 @@ func TestAppStartStopLifecycleRestoresConfigExactly(t *testing.T) {
 	for _, expected := range []string{
 		`base_url = "http://127.0.0.1:18787/c/one"`,
 		`api_backend = "responses"`,
-		"supports_backend_search = false",
+		"supports_backend_search = true",
 		"backend_tools = true",
 		"web_fetch = true",
 		"enabled = true",
@@ -543,6 +544,66 @@ func TestAppStopRelinquishesCompleteExternalProviderReplacement(t *testing.T) {
 	}
 }
 
+func TestAppStopPreservesDeletedChannelAndRefreshesOnlyRemainingRoutes(t *testing.T) {
+	dir := t.TempDir()
+	grokHome := filepath.Join(dir, "grok")
+	dataDir := filepath.Join(dir, "data")
+	if err := os.MkdirAll(grokHome, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GROK_HOME", grokHome)
+	configPath := filepath.Join(grokHome, "config.toml")
+	original := "[model.one]\nbase_url = \"https://one.example/v1\"\napi_key = \"one-key\"\n\n" +
+		"[model.two]\nbase_url = \"https://two.example/v1\"\napi_key = \"two-key\"\n"
+	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var refreshTargets []map[string]string
+	refresh := func(_ context.Context, selections map[string]string) (groksync.Result, error) {
+		refreshTargets = append(refreshTargets, cloneStringMap(selections))
+		return groksync.Result{GrokFound: true, ReachableLeaders: 1}, nil
+	}
+	server := proxy.New(log.New(io.Discard, "", 0))
+	server.PathAddr = "127.0.0.1:0"
+	app := &App{logger: log.New(io.Discard, "", 0), dataDir: dataDir, server: server, refreshGrokSessions: refresh}
+	if err := app.Start(); err != nil {
+		t.Fatal(err)
+	}
+	patched, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := strings.Index(string(patched), "[model.one]\n")
+	if start < 0 {
+		t.Fatalf("patched model blocks not found: %q", patched)
+	}
+	endOffset := strings.Index(string(patched)[start:], "[model.two]\n")
+	if endOffset < 0 {
+		t.Fatalf("patched model blocks not found: %q", patched)
+	}
+	withoutOne := string(patched[:start]) + string(patched[start+endOffset:])
+	if err := os.WriteFile(configPath, []byte(withoutOne), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := app.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	current, _ := os.ReadFile(configPath)
+	expectedStart := strings.Index(original, "[model.one]\n")
+	expectedEndOffset := strings.Index(original[expectedStart:], "[model.two]\n")
+	expected := original[:expectedStart] + original[expectedStart+expectedEndOffset:]
+	if string(current) != expected {
+		t.Fatalf("deleted channel was reintroduced or remaining channel was not restored\nwant: %q\ngot:  %q", expected, current)
+	}
+	if len(refreshTargets) != 2 || len(refreshTargets[1]) != 1 || refreshTargets[1]["two"] != "two" {
+		t.Fatalf("stop refreshed deleted or missing routes: %v", refreshTargets)
+	}
+	if _, exists := refreshTargets[1]["one"]; exists {
+		t.Fatalf("deleted channel was selected during stop: %v", refreshTargets[1])
+	}
+}
+
 func TestAppStopKeepsServingWhenConflictStillReferencesHellogrok(t *testing.T) {
 	dir := t.TempDir()
 	grokHome := filepath.Join(dir, "grok")
@@ -563,7 +624,7 @@ func TestAppStopKeepsServingWhenConflictStillReferencesHellogrok(t *testing.T) {
 		t.Fatal(err)
 	}
 	patched, _ := os.ReadFile(configPath)
-	conflicted := strings.Replace(string(patched), `api_backend = "responses"`, `api_backend = "chat_completions"`, 1)
+	conflicted := strings.Replace(string(patched), "supports_backend_search = false", "supports_backend_search = true", 1)
 	if err := os.WriteFile(configPath, []byte(conflicted), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -622,7 +683,7 @@ func TestAppStartReportsOccupiedFacadeAddress(t *testing.T) {
 	}
 }
 
-func TestResolveSearchRoutesExplicitClientModelOverridesEveryConversationRoute(t *testing.T) {
+func TestResolveSearchRoutesPreservesEveryConfiguredNativeSearchCapability(t *testing.T) {
 	app := &App{logger: log.New(io.Discard, "", 0)}
 	routes := []config.Route{
 		{ChannelID: "grok-custom", WireModel: "grok-4.5", APIBackend: "responses", SupportsBackendSearch: true},
@@ -632,13 +693,48 @@ func TestResolveSearchRoutesExplicitClientModelOverridesEveryConversationRoute(t
 	effective := app.resolveSearchRoutes(routes, config.WebSearchSelection{
 		Model: "deepseek-v4-flash", Explicit: true, Source: "config",
 	})
-	for _, route := range effective {
-		if route.SupportsBackendSearch {
-			t.Fatalf("explicit client-search model did not force a client route: %+v", route)
-		}
+	if !effective[0].SupportsBackendSearch || !effective[1].SupportsBackendSearch || effective[2].SupportsBackendSearch {
+		t.Fatalf("configured capabilities were not preserved: %+v", effective)
 	}
 	if !routes[0].SupportsBackendSearch || !routes[1].SupportsBackendSearch {
 		t.Fatalf("search routing mutated its input: %+v", routes)
+	}
+}
+
+func TestBuildSupportsBackendSearchMaterialization(t *testing.T) {
+	for _, test := range []struct {
+		backend    string
+		configured bool
+		want       bool
+	}{
+		{backend: "responses", configured: true, want: true},
+		{backend: "responses", configured: false, want: false},
+		{backend: "messages", configured: true, want: true},
+		{backend: "chat_completions", configured: true, want: true},
+	} {
+		route := config.Route{APIBackend: test.backend, SupportsBackendSearch: test.configured}
+		if got := buildSupportsBackendSearch(route); got != test.want {
+			t.Fatalf("backend=%s configured=%t materialized=%t want=%t", test.backend, test.configured, got, test.want)
+		}
+	}
+}
+
+func TestBuildAPIBackendUsesResponsesOnlyForCapableChannels(t *testing.T) {
+	for _, test := range []struct {
+		backend    string
+		configured bool
+		want       string
+	}{
+		{backend: "responses", configured: true, want: "responses"},
+		{backend: "messages", configured: true, want: "responses"},
+		{backend: "chat_completions", configured: true, want: "responses"},
+		{backend: "messages", configured: false, want: "messages"},
+		{backend: "chat_completions", configured: false, want: "chat_completions"},
+	} {
+		route := config.Route{APIBackend: test.backend, SupportsBackendSearch: test.configured}
+		if got := buildAPIBackend(route); got != test.want {
+			t.Fatalf("backend=%s configured=%t build=%q want=%q", test.backend, test.configured, got, test.want)
+		}
 	}
 }
 

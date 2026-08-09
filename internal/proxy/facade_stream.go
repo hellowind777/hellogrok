@@ -16,7 +16,7 @@ import (
 
 var (
 	errSSEStreamComplete  = errors.New("SSE stream complete")
-	heartbeatNameReplacer = strings.NewReplacer("-", "", "_", "", ".", "")
+	heartbeatNameReplacer = strings.NewReplacer("-", "", "_", "", ".", "", " ", "")
 )
 
 type translatedStreamWriter struct {
@@ -222,6 +222,7 @@ func (s *messagesStreamState) handle(payload []byte) error {
 	if err != nil {
 		return fmt.Errorf("decode Messages SSE event: %w", err)
 	}
+	normalizeMessagesStreamRequiredFields(event)
 	switch stringValue(event["type"]) {
 	case "ping":
 		return nil
@@ -646,21 +647,6 @@ func (s *messagesStreamState) finish() error {
 	return s.writer.emit(typ, map[string]any{"response": terminal})
 }
 
-func (s *messagesStreamState) nativeResponse() []byte {
-	content := make([]any, 0, len(s.blocks))
-	for _, index := range sortedBlockIndexes(s.blocks) {
-		if block := s.blocks[index]; block.native != nil {
-			content = append(content, block.native)
-		}
-	}
-	root := map[string]any{
-		"id": s.messageID, "type": "message", "role": "assistant", "model": s.model,
-		"content": content, "stop_reason": s.stopReason, "usage": s.usage,
-	}
-	data, _ := json.Marshal(root)
-	return data
-}
-
 func (s *Server) streamMessagesSSE(w http.ResponseWriter, response *http.Response, route config.Route, request facadeRequest, started time.Time) {
 	writer, err := beginTranslatedStream(w, response)
 	if err != nil {
@@ -699,9 +685,6 @@ func (s *Server) streamMessagesSSE(w http.ResponseWriter, response *http.Respons
 	} else if !state.terminal {
 		s.log.Printf("UP channel=%s Messages SSE ended without message_stop", route.ChannelID)
 		writer.emitStreamError("upstream Messages stream ended without message_stop")
-	}
-	if state.sawStart {
-		s.replays.captureMessages(route.ChannelID, request.ReplayScope, state.nativeResponse())
 	}
 	s.log.Printf("UP channel=%s Messages SSE done events=%d heartbeats=%d terminal=%t %s", route.ChannelID, writer.sequence, heartbeats, state.terminal, time.Since(started).Round(time.Millisecond))
 	s.logSearchEvidence(route.ChannelID, request, evidence)
@@ -1075,6 +1058,332 @@ func (s *Server) streamChatSSE(w http.ResponseWriter, response *http.Response, r
 	}
 	s.log.Printf("UP channel=%s Chat Completions SSE done events=%d heartbeats=%d terminal=%t %s", route.ChannelID, writer.sequence, heartbeats, state.terminal, time.Since(started).Round(time.Millisecond))
 	s.logSearchEvidence(route.ChannelID, request, evidence)
+}
+
+func (s *Server) streamNativeSSE(w http.ResponseWriter, response *http.Response, route config.Route, request facadeRequest, started time.Time) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeJSONError(w, http.StatusInternalServerError, "stream unsupported")
+		return
+	}
+	copySafeResponseHeaders(w.Header(), response.Header)
+	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(response.StatusCode)
+	flusher.Flush()
+
+	terminal := false
+	heartbeats := 0
+	frames := 0
+	messagesSearchFilter := newMessagesHostedSearchStreamFilter(request)
+	evidence := newSearchEvidence()
+	writeHeartbeat := func() error {
+		_, err := io.WriteString(w, ": keepalive\n\n")
+		if err == nil {
+			flusher.Flush()
+		}
+		return err
+	}
+	streamErr := scanSSEPayloads(response.Body, func(lines []string, payload []byte) error {
+		if isPrivateSSEHeartbeat(lines, string(payload)) {
+			heartbeats++
+			return writeHeartbeat()
+		}
+		trimmed := strings.TrimSpace(string(payload))
+		if request.Protocol == wireChatCompletions && trimmed == "[DONE]" {
+			if err := writeSSEPayloadFrame(w, flusher, lines, []byte("[DONE]")); err != nil {
+				return err
+			}
+			frames++
+			terminal = true
+			return errSSEStreamComplete
+		}
+		root, err := decodeJSONMap(payload)
+		if err != nil {
+			return fmt.Errorf("decode upstream %s SSE frame: %w", protocolLabel(request.Protocol), err)
+		}
+		evidence.observeJSON(payload)
+		if messagesSearchFilter != nil && !messagesSearchFilter.keep(root) {
+			return nil
+		}
+		if request.Protocol == wireMessages {
+			normalizeMessagesStreamRequiredFields(root)
+		}
+		restoreClientWebSearchAlias(root, request.ClientSearchAlias, request.Protocol)
+		s.captureReasoningProvenance(route, root)
+		encoded, err := json.Marshal(root)
+		if err != nil {
+			return err
+		}
+		if err := validateNativeSSEFrame(request.Protocol, root); err != nil {
+			return err
+		}
+		if err := writeSSEPayloadFrame(w, flusher, lines, encoded); err != nil {
+			return err
+		}
+		frames++
+		if request.Protocol == wireMessages {
+			typ := stringValue(root["type"])
+			if typ == "message_stop" || typ == "error" {
+				terminal = true
+				return errSSEStreamComplete
+			}
+		}
+		if request.Protocol == wireChatCompletions && root["error"] != nil {
+			terminal = true
+			return errSSEStreamComplete
+		}
+		return nil
+	})
+	if errors.Is(streamErr, errSSEStreamComplete) {
+		streamErr = nil
+	}
+	if streamErr != nil {
+		s.log.Printf("UP channel=%s %s SSE read error: %v", route.ChannelID, protocolLabel(request.Protocol), streamErr)
+		writeNativeStreamError(w, flusher, request.Protocol, "upstream "+protocolLabel(request.Protocol)+" stream failed")
+	} else if !terminal {
+		s.log.Printf("UP channel=%s %s SSE ended without a terminal event", route.ChannelID, protocolLabel(request.Protocol))
+		writeNativeStreamError(w, flusher, request.Protocol, "upstream "+protocolLabel(request.Protocol)+" stream ended without a terminal event")
+	}
+	s.log.Printf("UP channel=%s %s SSE done frames=%d heartbeats=%d terminal=%t %s",
+		route.ChannelID, protocolLabel(request.Protocol), frames, heartbeats, terminal, time.Since(started).Round(time.Millisecond))
+	s.logSearchEvidence(route.ChannelID, request, evidence)
+}
+
+type messagesHostedSearchStreamFilter struct {
+	dropped map[int]struct{}
+}
+
+func newMessagesHostedSearchStreamFilter(request facadeRequest) *messagesHostedSearchStreamFilter {
+	if request.Protocol != wireMessages || !request.HostedWebSearch {
+		return nil
+	}
+	return &messagesHostedSearchStreamFilter{dropped: make(map[int]struct{})}
+}
+
+func (filter *messagesHostedSearchStreamFilter) keep(root map[string]any) bool {
+	switch stringValue(root["type"]) {
+	case "message_start":
+		if message, _ := root["message"].(map[string]any); message != nil {
+			stripMessagesHostedSearchBlocks(message)
+		}
+	case "content_block_start":
+		index := numberInt(root["index"])
+		block, _ := root["content_block"].(map[string]any)
+		switch stringValue(block["type"]) {
+		case "server_tool_use", "web_search_tool_result":
+			filter.dropped[index] = struct{}{}
+			return false
+		}
+	case "content_block_delta":
+		index := numberInt(root["index"])
+		if _, dropped := filter.dropped[index]; dropped {
+			return false
+		}
+		if delta, _ := root["delta"].(map[string]any); stringValue(delta["type"]) == "citations_delta" {
+			return false
+		}
+	case "content_block_stop":
+		index := numberInt(root["index"])
+		if _, dropped := filter.dropped[index]; dropped {
+			delete(filter.dropped, index)
+			return false
+		}
+	}
+	return true
+}
+
+func validateNativeSSEFrame(protocol wireProtocol, root map[string]any) error {
+	if root["error"] != nil {
+		return nil
+	}
+	switch protocol {
+	case wireMessages:
+		typ := stringValue(root["type"])
+		switch typ {
+		case "content_block_start":
+			block, ok := root["content_block"].(map[string]any)
+			if !ok || block == nil {
+				return fmt.Errorf("Messages content_block_start has no content_block object")
+			}
+			return validateMessagesContentBlock(block)
+		case "content_block_delta":
+			delta, ok := root["delta"].(map[string]any)
+			if !ok || delta == nil {
+				return fmt.Errorf("Messages content_block_delta has no delta object")
+			}
+			return validateMessagesStreamDelta(delta)
+		case "message_start", "message_delta", "message_stop", "content_block_stop", "error":
+			return nil
+		default:
+			return fmt.Errorf("unsupported Messages SSE event type %q", typ)
+		}
+	case wireChatCompletions:
+		choices, choicesPresent := root["choices"]
+		if !choicesPresent {
+			return fmt.Errorf("Chat Completions SSE chunk has no choices")
+		}
+		if _, ok := choices.([]any); !ok {
+			return fmt.Errorf("Chat Completions SSE choices must be an array")
+		}
+		return nil
+	default:
+		return fmt.Errorf("unsupported native stream protocol")
+	}
+}
+
+func writeSSEPayloadFrame(w io.Writer, flusher http.Flusher, lines []string, payload []byte) error {
+	wroteData := false
+	for _, line := range lines {
+		if strings.HasPrefix(line, "data:") {
+			if !wroteData {
+				if _, err := fmt.Fprintf(w, "data: %s\n", payload); err != nil {
+					return err
+				}
+				wroteData = true
+			}
+			continue
+		}
+		if _, err := io.WriteString(w, line+"\n"); err != nil {
+			return err
+		}
+	}
+	if !wroteData {
+		if _, err := fmt.Fprintf(w, "data: %s\n", payload); err != nil {
+			return err
+		}
+	}
+	if _, err := io.WriteString(w, "\n"); err != nil {
+		return err
+	}
+	flusher.Flush()
+	return nil
+}
+
+func writeNativeStreamError(w io.Writer, flusher http.Flusher, protocol wireProtocol, message string) {
+	switch protocol {
+	case wireMessages:
+		payload, _ := json.Marshal(map[string]any{
+			"type":  "error",
+			"error": map[string]any{"type": "proxy_stream_error", "message": message},
+		})
+		_, _ = fmt.Fprintf(w, "event: error\ndata: %s\n\n", payload)
+	case wireChatCompletions:
+		payload, _ := json.Marshal(map[string]any{
+			"error": map[string]any{"type": "proxy_stream_error", "code": "proxy_stream_error", "message": message},
+		})
+		_, _ = fmt.Fprintf(w, "data: %s\n\ndata: [DONE]\n\n", payload)
+	}
+	flusher.Flush()
+}
+
+func writeMessagesSSEFallback(w http.ResponseWriter, response map[string]any) error {
+	if err := validateMessagesEnvelope(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(http.StatusOK)
+	flusher, _ := w.(http.Flusher)
+	emit := func(typ string, value map[string]any) error {
+		value["type"] = typ
+		payload, err := json.Marshal(value)
+		if err != nil {
+			return err
+		}
+		_, err = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", typ, payload)
+		if flusher != nil {
+			flusher.Flush()
+		}
+		return err
+	}
+	started := cloneMap(response)
+	started["content"] = []any{}
+	started["stop_reason"] = nil
+	started["stop_sequence"] = nil
+	if usage, _ := started["usage"].(map[string]any); usage != nil {
+		usage["output_tokens"] = 0
+	}
+	if err := emit("message_start", map[string]any{"message": started}); err != nil {
+		return err
+	}
+	for index, raw := range anySlice(response["content"]) {
+		block, _ := raw.(map[string]any)
+		initial, deltas := messagesFallbackBlock(block)
+		if err := emit("content_block_start", map[string]any{"index": index, "content_block": initial}); err != nil {
+			return err
+		}
+		for _, delta := range deltas {
+			if err := emit("content_block_delta", map[string]any{"index": index, "delta": delta}); err != nil {
+				return err
+			}
+		}
+		if err := emit("content_block_stop", map[string]any{"index": index}); err != nil {
+			return err
+		}
+	}
+	delta := map[string]any{"stop_reason": response["stop_reason"], "stop_sequence": response["stop_sequence"]}
+	usage := map[string]any{}
+	if original, _ := response["usage"].(map[string]any); original != nil {
+		if output, exists := original["output_tokens"]; exists {
+			usage["output_tokens"] = output
+		}
+	}
+	if err := emit("message_delta", map[string]any{"delta": delta, "usage": usage}); err != nil {
+		return err
+	}
+	return emit("message_stop", map[string]any{})
+}
+
+func messagesFallbackBlock(block map[string]any) (map[string]any, []map[string]any) {
+	initial := cloneMap(block)
+	var deltas []map[string]any
+	switch stringValue(block["type"]) {
+	case "text":
+		initial["text"] = ""
+		deltas = append(deltas, map[string]any{"type": "text_delta", "text": stringValue(block["text"])})
+	case "thinking":
+		initial["thinking"] = ""
+		initial["signature"] = ""
+		if text := stringValue(block["thinking"]); text != "" {
+			deltas = append(deltas, map[string]any{"type": "thinking_delta", "thinking": text})
+		}
+		if signature := stringValue(block["signature"]); signature != "" {
+			deltas = append(deltas, map[string]any{"type": "signature_delta", "signature": signature})
+		}
+	case "tool_use", "server_tool_use":
+		input := block["input"]
+		initial["input"] = map[string]any{}
+		encoded, _ := json.Marshal(valueOr(input, map[string]any{}))
+		deltas = append(deltas, map[string]any{"type": "input_json_delta", "partial_json": string(encoded)})
+	}
+	return initial, deltas
+}
+
+func writeChatSSEFallback(w http.ResponseWriter, response map[string]any) error {
+	if err := validateChatEnvelope(response); err != nil {
+		return err
+	}
+	chunk := cloneMap(response)
+	chunk["object"] = "chat.completion.chunk"
+	choices := anySlice(chunk["choices"])
+	for _, raw := range choices {
+		choice, _ := raw.(map[string]any)
+		choice["delta"] = valueOr(choice["message"], map[string]any{})
+		delete(choice, "message")
+	}
+	payload, err := json.Marshal(chunk)
+	if err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(http.StatusOK)
+	_, err = fmt.Fprintf(w, "data: %s\n\ndata: [DONE]\n\n", payload)
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
+	return err
 }
 
 func restoreStreamToolName(name, alias string) string {

@@ -170,7 +170,7 @@ func TestNormalizeHostedSearchDropsCollidingFunctionsAndDeduplicates(t *testing.
 	}
 }
 
-func TestNormalizeHostedSearchRequestRepairsDeepSeekReplay(t *testing.T) {
+func TestNormalizeHostedSearchRequestRepairsDeepSeekHistory(t *testing.T) {
 	body := []byte(`{
 		"model":"deepseek-v4-flash",
 		"input":[

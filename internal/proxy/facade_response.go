@@ -35,7 +35,12 @@ func canonicalFromMessages(data []byte, hosted bool, query string) (canonicalRes
 	if err != nil {
 		return canonicalResult{}, err
 	}
-	if err := validateMessagesEnvelope(root); err != nil {
+	validationRoot := root
+	if hosted {
+		validationRoot = cloneMap(root)
+		stripMessagesHostedSearchBlocks(validationRoot)
+	}
+	if err := validateMessagesEnvelope(validationRoot); err != nil {
 		return canonicalResult{}, err
 	}
 	var result canonicalResult
@@ -123,6 +128,9 @@ func canonicalFromMessages(data []byte, hosted bool, query string) (canonicalRes
 func canonicalFromChat(data []byte, hosted bool, query string) (canonicalResult, error) {
 	root, err := decodeJSONMap(data)
 	if err != nil {
+		return canonicalResult{}, err
+	}
+	if err := validateChatEnvelope(root); err != nil {
 		return canonicalResult{}, err
 	}
 	var result canonicalResult
@@ -240,12 +248,166 @@ func validateMessagesEnvelope(root map[string]any) error {
 		return fmt.Errorf("Messages response content must be an array")
 	}
 	for index, raw := range content {
-		if block, ok := raw.(map[string]any); !ok || block == nil {
+		block, ok := raw.(map[string]any)
+		if !ok || block == nil {
 			return fmt.Errorf("Messages response content[%d] must be an object", index)
+		}
+		if err := validateMessagesContentBlock(block); err != nil {
+			return fmt.Errorf("Messages response content[%d]: %w", index, err)
 		}
 	}
 	if usage, ok := root["usage"].(map[string]any); !ok || usage == nil {
 		return fmt.Errorf("Messages response usage must be an object")
+	}
+	return nil
+}
+
+// Some Messages-compatible gateways omit empty placeholders from streamed
+// block starts and send the real values later as deltas. Grok Build's Messages
+// consumer intentionally models those start fields as required.
+func normalizeMessagesStreamRequiredFields(root map[string]any) {
+	switch stringValue(root["type"]) {
+	case "content_block_start":
+		if block, _ := root["content_block"].(map[string]any); block != nil {
+			normalizeMessagesStreamBlock(block)
+		}
+	case "content_block_delta":
+		if delta, _ := root["delta"].(map[string]any); delta != nil {
+			switch stringValue(delta["type"]) {
+			case "text_delta":
+				setMissingString(delta, "text")
+			case "input_json_delta":
+				setMissingString(delta, "partial_json")
+			case "thinking_delta":
+				setMissingString(delta, "thinking")
+			case "signature_delta":
+				setMissingString(delta, "signature")
+			}
+		}
+	}
+}
+
+func normalizeMessagesStreamBlock(block map[string]any) {
+	switch stringValue(block["type"]) {
+	case "text":
+		setMissingString(block, "text")
+	case "tool_use":
+		if input, exists := block["input"]; !exists || input == nil {
+			block["input"] = map[string]any{}
+		}
+	case "thinking":
+		setMissingString(block, "thinking")
+		setMissingString(block, "signature")
+	}
+}
+
+func setMissingString(value map[string]any, key string) {
+	if current, exists := value[key]; !exists || current == nil {
+		value[key] = ""
+	}
+}
+
+func validateMessagesContentBlock(block map[string]any) error {
+	switch stringValue(block["type"]) {
+	case "text":
+		if _, ok := block["text"].(string); !ok {
+			return fmt.Errorf("text block text must be a string")
+		}
+	case "tool_use":
+		if strings.TrimSpace(stringValue(block["id"])) == "" {
+			return fmt.Errorf("tool_use block id must be a non-empty string")
+		}
+		if strings.TrimSpace(stringValue(block["name"])) == "" {
+			return fmt.Errorf("tool_use block name must be a non-empty string")
+		}
+		if _, exists := block["input"]; !exists {
+			return fmt.Errorf("tool_use block input is required")
+		}
+	case "thinking":
+		if _, ok := block["thinking"].(string); !ok {
+			return fmt.Errorf("thinking block thinking must be a string")
+		}
+		if _, ok := block["signature"].(string); !ok {
+			return fmt.Errorf("thinking block signature must be a string")
+		}
+	case "redacted_thinking":
+		if _, ok := block["data"].(string); !ok {
+			return fmt.Errorf("redacted_thinking block data must be a string")
+		}
+	case "image", "tool_result":
+		// Both variants are part of Grok Build's current Messages ContentBlock
+		// enum, although they are unusual in an assistant response.
+	case "":
+		return fmt.Errorf("content block type must be a non-empty string")
+	default:
+		return fmt.Errorf("unsupported content block type %q", stringValue(block["type"]))
+	}
+	return nil
+}
+
+func validateMessagesStreamDelta(delta map[string]any) error {
+	field := ""
+	switch stringValue(delta["type"]) {
+	case "text_delta":
+		field = "text"
+	case "input_json_delta":
+		field = "partial_json"
+	case "thinking_delta":
+		field = "thinking"
+	case "signature_delta":
+		field = "signature"
+	default:
+		return fmt.Errorf("unsupported Messages stream delta type %q", stringValue(delta["type"]))
+	}
+	if _, ok := delta[field].(string); !ok {
+		return fmt.Errorf("%s %s must be a string", stringValue(delta["type"]), field)
+	}
+	return nil
+}
+
+func stripMessagesHostedSearchBlocks(root map[string]any) bool {
+	content, ok := root["content"].([]any)
+	if !ok {
+		return false
+	}
+	filtered := make([]any, 0, len(content))
+	changed := false
+	for _, raw := range content {
+		block, _ := raw.(map[string]any)
+		switch stringValue(block["type"]) {
+		case "server_tool_use", "web_search_tool_result":
+			changed = true
+		default:
+			filtered = append(filtered, raw)
+		}
+	}
+	if changed {
+		root["content"] = filtered
+	}
+	return changed
+}
+
+func validateChatEnvelope(root map[string]any) error {
+	if strings.TrimSpace(stringValue(root["id"])) == "" {
+		return fmt.Errorf("Chat Completions response id must be a non-empty string")
+	}
+	object := stringValue(root["object"])
+	if object != "chat.completion" && object != "chat.completion.chunk" {
+		return fmt.Errorf("Chat Completions response object must be %q", "chat.completion")
+	}
+	choices, ok := root["choices"].([]any)
+	if !ok || len(choices) == 0 {
+		return fmt.Errorf("Chat Completions response choices must be a non-empty array")
+	}
+	for index, raw := range choices {
+		choice, ok := raw.(map[string]any)
+		if !ok || choice == nil {
+			return fmt.Errorf("Chat Completions response choices[%d] must be an object", index)
+		}
+		message, ok := choice["message"].(map[string]any)
+		if !ok || message == nil {
+			return fmt.Errorf("Chat Completions response choices[%d].message must be an object", index)
+		}
 	}
 	return nil
 }

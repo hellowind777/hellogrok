@@ -6,6 +6,34 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Added
+
+- Channel-scoped endpoints for every Grok Build backend: `/responses`, `/messages`, and `/chat/completions`, backed by one capability-aware protocol facade.
+- Protocol-specific tool-history validation for Responses `function_call` pairs, immediately adjacent Messages `tool_use`/`tool_result` batches, and Chat Completions tool calls/results. Invalid history returns a deterministic non-retryable `400` before reaching the provider.
+- `chat_search_dialect` channel setting for selecting Chat `web_search_options`, Chat `search_parameters`, or an explicit Messages/Responses search bridge.
+
+### Changed
+
+- Channels with `supports_backend_search = true` are exposed to Grok Build as Responses while retaining their real upstream protocol. Responses passes through, Messages receives `web_search_20250305`, and Chat uses its configured hosted-search dialect or protocol bridge; every route returns canonical `web_search_call` items, citations, and source counts to Build.
+- Channels with `supports_backend_search = false` keep their configured Grok Build consumer and use client `web_search`, resolved from `[models].web_search`, `GROK_WEB_SEARCH_MODEL`, or Build's authenticated official fallback. The fixed non-streaming WebSearchClient request can use a selected Responses, Messages, or Chat channel through the same facade.
+- Configuration rewrite state is version 8. It records the provider protocol separately from the protocol projected to Grok Build, preserves the effective search capability, and can restore version 5, 6, and 7 recovery transactions.
+- Client-search aliases are rewritten only in protocol-defined tool declarations, choices, and call-name fields; tool arguments, results, response text, URLs, and other business JSON are never traversed.
+- A provider that ignores `stream=true` now falls back to buffered SSE in the protocol Grok Build is consuming, including canonical Responses events for capability-projected Messages and Chat channels.
+
+### Fixed
+
+- SSE frames with a private heartbeat event name and an empty `data:` payload are recognized before empty-payload handling and normalized to `: keepalive` comments.
+- Native Messages history is rejected locally when an assistant `tool_use` batch is not resolved by leading `tool_result` blocks in the immediately following user message, preventing provider errors such as "tool_use ids were found without tool_result blocks immediately after" from entering repeated retries.
+- Messages `thinking` block starts from compatible relays now receive a missing empty `signature` field while later `signature_delta` values remain unchanged, preventing Grok Build's native decoder from failing before the real signature arrives.
+- Client-search adaptation now rejects upstreams that return ordinary answer text without independent evidence of a completed search, preventing ignored Chat or Messages search extensions from being reported as successful WebSearchClient results.
+- Official DeepSeek Chat channels use `/anthropic/messages` with `X-Api-Key` for hosted search, while official xAI Chat channels use Responses. Search calls, results, citations, and deduplicated sites are converted back without exposing provider credentials.
+- Parallel Responses function calls are converted into one assistant `tool_use` batch followed by one adjacent user `tool_result` batch, preventing valid concurrent tool history from becoming an invalid Messages sequence.
+- Configuration restore now preserves a model channel deleted while the proxy is active and still restores every remaining managed field; edits to individual proxy-owned fields continue to fail closed.
+
+### Removed
+
+- The process-local provider search-replay cache. Responses search history is reconstructed statelessly from each `web_search_call` query and source list, with the DeepSeek `action.queries` repair retained where required.
+
 ## [0.1.4] — 2026-08-08
 
 ### Fixed

@@ -19,9 +19,10 @@ import (
 	"github.com/hellowind777/hellogrok/internal/patch"
 )
 
-// Server is a channel-isolated Responses facade. Grok Build always talks
-// Responses to /c/<channel>/responses; the facade converts to the channel's
-// original upstream protocol.
+// Server is a channel-isolated protocol facade. Search-capable channels expose
+// Responses to Grok Build while retaining the provider's real upstream format;
+// other sessions use their configured consumer protocol. /responses also
+// accepts Build's fixed non-streaming WebSearchClient request.
 type Server struct {
 	PathAddr string
 
@@ -43,7 +44,6 @@ type Server struct {
 
 	probedMu  sync.Mutex
 	probed    map[string]bool
-	replays   *searchReplayCache
 	reasoning *reasoningProvenanceStore
 }
 
@@ -90,7 +90,6 @@ func newServer(logger *log.Logger, reasoningPath string) *Server {
 		requestCtx:      requestCtx,
 		requestCancel:   requestCancel,
 		probed:          map[string]bool{},
-		replays:         newSearchReplayCache(),
 		reasoning:       reasoning,
 	}
 }
@@ -227,7 +226,7 @@ func (s *Server) servePath(w http.ResponseWriter, request *http.Request) {
 		writeJSONError(w, http.StatusForbidden, "browser-origin requests are not accepted")
 		return
 	}
-	channelID, ok := channelFromPath(request.URL.EscapedPath())
+	channelID, protocol, ok := channelFromPath(request.URL.EscapedPath())
 	if !ok {
 		writeJSONError(w, http.StatusNotFound, "unknown proxy route")
 		return
@@ -237,7 +236,7 @@ func (s *Server) servePath(w http.ResponseWriter, request *http.Request) {
 		writeJSONError(w, http.StatusNotFound, "unknown custom channel")
 		return
 	}
-	s.forwardFacade(w, request, route)
+	s.forwardFacade(w, request, route, protocol)
 }
 func newUpstreamTransport(connections *connectionTracker) *http.Transport {
 	dialer := &net.Dialer{
@@ -443,7 +442,6 @@ func (s *Server) streamResponsesSSE(w http.ResponseWriter, response *http.Respon
 		if err := validateResponsesEventPayload(payload); err != nil {
 			return fmt.Errorf("invalid upstream Responses SSE data: %w", err)
 		}
-		s.replays.captureJSON(channel, request.ReplayScope, payload)
 		events++
 		return writePayloadFrame(lines, string(payload))
 	}
@@ -470,18 +468,18 @@ func (s *Server) streamResponsesSSE(w http.ResponseWriter, response *http.Respon
 		}
 		payload, hasData := sseFramePayload(lines)
 		trimmedPayload := strings.TrimSpace(payload)
+		if isPrivateSSEHeartbeat(lines, payload) {
+			heartbeats++
+			return writeHeartbeat()
+		}
 		if !hasData {
 			return writePayloadFrame(lines, "")
 		}
 		if trimmedPayload == "" || trimmedPayload == "[DONE]" {
 			return writePayloadFrame(lines, payload)
 		}
-		if isPrivateSSEHeartbeat(lines, payload) {
-			heartbeats++
-			return writeHeartbeat()
-		}
 
-		restored, err := restoreClientWebSearchAliasJSON([]byte(payload), request.ClientSearchAlias)
+		restored, err := restoreClientWebSearchAliasJSON([]byte(payload), request.ClientSearchAlias, wireResponses)
 		if err != nil {
 			return fmt.Errorf("invalid upstream Responses SSE data: %w", err)
 		}

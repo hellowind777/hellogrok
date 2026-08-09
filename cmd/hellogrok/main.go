@@ -378,9 +378,9 @@ func (a *App) StatusDetail() string {
 		fmt.Sprintf("【渠道】 配置校验：已通过；数量：%d 个\n", len(patched)) +
 		"列表：" + list + "\n\n" +
 		"【Grok 会话】 热切换：" + hotSwitch + "\n\n" +
-		"【协议与搜索】 Grok 入口：Responses\n" +
-		"上游协议：按渠道使用 Responses、Messages 或 Chat Completions\n" +
-		"搜索分流：按渠道有效配置\n\n" +
+		"【协议与搜索】 Grok 消费：搜索开启时投影为 Responses\n" +
+		"上游协议：保持渠道真实格式\n" +
+		"搜索分流：开启走当前渠道，关闭走客户端搜索\n\n" +
 		fmt.Sprintf("【配置恢复】 临时改写：%d 个渠道，停止代理：恢复原值", len(patched))
 	if a.lastError != "" {
 		detail += "\n\n【当前警告】 " + a.lastError
@@ -470,7 +470,7 @@ func (a *App) Start() error {
 	if err := a.server.ServePath(); err != nil {
 		return a.abortStart(fmt.Errorf("start local facade: %w", err))
 	}
-	a.logger.Printf("channel facade on http://%s/c/<channel>/responses", a.server.PathAddr)
+	a.logger.Printf("channel facade on http://%s/c/<channel>/{responses|messages|chat/completions}", a.server.PathAddr)
 
 	// Rewrite every explicit endpoint before Grok can load a direct URL. Waiting
 	// for session discovery races the first request after a model switch.
@@ -491,7 +491,9 @@ func (a *App) Start() error {
 		targets = append(targets, cfgpatch.Target{
 			ID:                    model.ID,
 			APIBaseURL:            strings.TrimSpace(model.APIBaseURL) != "",
-			SupportsBackendSearch: route.SupportsBackendSearch,
+			APIBackend:            route.APIBackend,
+			BuildAPIBackend:       buildAPIBackend(route),
+			SupportsBackendSearch: buildSupportsBackendSearch(route),
 		})
 	}
 	res, err := cfgpatch.ApplyTargets(cfgPath, stPath, targets)
@@ -512,20 +514,11 @@ func (a *App) Start() error {
 	a.modelAliases = cloneStringMap(res.LegacyModelAliases)
 	a.logger.Printf("config rewrite all: model_sections=%d base=%d api_base=%d api_backend=%d backend_search=%d backend_tools=%d web_fetch=%d subagents_enabled=%d targets=%v",
 		res.ModelSections, res.BaseURLs, res.APIBaseURLs, res.APIBackends, res.BackendSearch, res.BackendTools, res.WebFetch, res.SubagentsEnabled, res.Targets)
-	a.logger.Printf("config validation passed: backend_tools=true web_fetch=true backend_search=materialized subagent_defaults=repaired-if-needed responses_targets=%d", res.ValidatedTargets)
+	a.logger.Printf("config validation passed: backend_protocols=capability-projected backend_tools=true web_fetch=true backend_search=materialized subagent_defaults=repaired-if-needed targets=%d", res.ValidatedTargets)
 	a.refreshOpenGrokSessions("enable", enableGrokSessionSelections(a.patchedIDs, a.modelAliases))
 	for _, route := range routes {
 		backend := strings.TrimSpace(route.APIBackend)
-		switch backend {
-		case "responses":
-			a.logger.Printf("channel facade: model=%s upstream=responses canonical Responses passthrough", route.ChannelID)
-		case "messages":
-			a.logger.Printf("channel facade: model=%s upstream=messages bidirectional Responses conversion", route.ChannelID)
-		case "chat_completions":
-			a.logger.Printf("channel facade: model=%s upstream=chat_completions bidirectional Responses conversion", route.ChannelID)
-		default:
-			a.logger.Printf("search adapter unavailable: model=%s api_backend=%s", route.ChannelID, backend)
-		}
+		a.logger.Printf("channel facade: model=%s build_backend=%s upstream_backend=%s", route.ChannelID, buildAPIBackend(route), backend)
 		if route.SupportsBackendSearch {
 			a.logger.Printf("channel search: model=%s supports_backend_search=true mode=hosted-current-channel source=config", route.ChannelID)
 		} else {
@@ -534,7 +527,7 @@ func (a *App) Start() error {
 	}
 
 	a.running = true
-	a.logger.Printf("started path=%s mode=per-channel-responses-facade+auth-isolate", a.server.PathAddr)
+	a.logger.Printf("started path=%s mode=capability-projected-facade+search-adapter+auth-isolate", a.server.PathAddr)
 	return nil
 }
 
@@ -549,18 +542,17 @@ func (a *App) resolveSearchRoutes(
 	selection config.WebSearchSelection,
 ) []config.Route {
 	effective := append([]config.Route(nil), routes...)
-	if !selection.Explicit {
-		return effective
-	}
-
 	proxiedSearchModel := false
 	for index := range effective {
-		effective[index].SupportsBackendSearch = false
 		if effective[index].ChannelID == selection.Model {
 			proxiedSearchModel = true
 		}
 	}
-	a.logger.Printf("search routing: explicit client model=%q source=%s; conversation channels forced supports_backend_search=false; startup_probe=disabled", selection.Model, selection.Source)
+	if !selection.Explicit {
+		a.logger.Printf("search routing: channel capabilities preserved; Messages/Chat compatibility uses a client web_search declaration promoted by the facade; startup_probe=disabled")
+		return effective
+	}
+	a.logger.Printf("search routing: explicit client model=%q source=%s; channel capabilities preserved; startup_probe=disabled", selection.Model, selection.Source)
 	switch {
 	case selection.Model == "":
 		a.logger.Printf("search model routing: explicit empty model disables a usable custom client-search route")
@@ -570,6 +562,24 @@ func (a *App) resolveSearchRoutes(
 		a.logger.Printf("search model routing: model=%s is not a proxied custom route; Build will resolve it directly", selection.Model)
 	}
 	return effective
+}
+
+// Grok Build serializes hosted_tools and consumes structured search results only
+// on Responses. Capable channels therefore use the Responses facade while the
+// route retains the provider's real upstream protocol.
+func buildAPIBackend(route config.Route) string {
+	if route.SupportsBackendSearch {
+		return "responses"
+	}
+	backend := strings.ToLower(strings.TrimSpace(route.APIBackend))
+	if backend == "" {
+		return "chat_completions"
+	}
+	return backend
+}
+
+func buildSupportsBackendSearch(route config.Route) bool {
+	return route.SupportsBackendSearch
 }
 
 func (a *App) abortStart(err error) error {
@@ -647,6 +657,31 @@ func disableGrokSessionSelections(targetIDs []string, legacyAliases map[string]s
 	return selections
 }
 
+func disableGrokSessionSelectionsForReferences(references []string, legacyAliases map[string]string) map[string]string {
+	active := make(map[string]struct{}, len(references))
+	for _, reference := range references {
+		for _, suffix := range []string{".base_url", ".api_base_url"} {
+			if id := strings.TrimSuffix(reference, suffix); id != reference && strings.TrimSpace(id) != "" {
+				active[id] = struct{}{}
+				break
+			}
+		}
+	}
+	targetIDs := make([]string, 0, len(active))
+	for id := range active {
+		targetIDs = append(targetIDs, id)
+	}
+	aliases := make(map[string]string)
+	for legacyID, targetID := range legacyAliases {
+		_, legacyActive := active[legacyID]
+		_, targetActive := active[targetID]
+		if legacyActive || targetActive {
+			aliases[legacyID] = targetID
+		}
+	}
+	return disableGrokSessionSelections(targetIDs, aliases)
+}
+
 func cloneStringMap(values map[string]string) map[string]string {
 	if len(values) == 0 {
 		return nil
@@ -679,8 +714,12 @@ func (a *App) Stop() error {
 		return err
 	}
 
-	n, err := cfgpatch.Restore(cfgPath, stPath)
-	relinquished := false
+	activeReferences, err := cfgpatch.ActiveProxyReferences(cfgPath)
+	var n int
+	if err == nil {
+		n, err = cfgpatch.Restore(cfgPath, stPath)
+	}
+	relinquished := err == nil && len(activeReferences) == 0
 	if err != nil {
 		restoreErr := err
 		// A provider manager may replace the whole live config while hellogrok is
@@ -708,7 +747,7 @@ func (a *App) Stop() error {
 		a.refreshOpenGrokSessions("disable", map[string]string{})
 	} else {
 		a.logger.Printf("config restore: %d proxy-managed setting(s) restored", n)
-		a.refreshOpenGrokSessions("disable", disableGrokSessionSelections(a.patchedIDs, a.modelAliases))
+		a.refreshOpenGrokSessions("disable", disableGrokSessionSelectionsForReferences(activeReferences, a.modelAliases))
 	}
 
 	a.server.Stop()

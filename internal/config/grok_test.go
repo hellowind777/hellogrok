@@ -63,7 +63,7 @@ api_key = "dash-key"
 	}
 }
 
-func TestLoadModelsNormalizesSingularMessageBackend(t *testing.T) {
+func TestBuildRoutesRejectsDeprecatedSingularMessageBackend(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.toml")
 	raw := `[model.claude-llmx]
 model = "claude-opus-5"
@@ -78,15 +78,49 @@ api_backend = "message"
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(models) != 1 || models[0].APIBackend != "messages" {
-		t.Fatalf("models = %+v, want singular message normalized to messages", models)
+	if len(models) != 1 || models[0].APIBackend != "message" {
+		t.Fatalf("models = %+v, want source value preserved for validation", models)
 	}
-	routes, err := BuildRoutes(models)
-	if err != nil {
+	if _, err := BuildRoutes(models); err == nil || !strings.Contains(err.Error(), `unsupported api_backend "message"`) {
+		t.Fatalf("deprecated backend was not rejected: %v", err)
+	}
+}
+
+func TestLoadModelsValidatesExplicitChatSearchDialect(t *testing.T) {
+	for _, dialect := range []ChatSearchDialect{
+		ChatSearchDialectSearchParameters,
+		ChatSearchDialectWebSearchOptions,
+		ChatSearchDialectResponses,
+		ChatSearchDialectMessages,
+	} {
+		t.Run(string(dialect), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.toml")
+			raw := "[model.chat]\nbase_url = \"https://relay.example/v1\"\napi_backend = \"chat_completions\"\n" +
+				`chat_search_dialect = "` + string(dialect) + `"` + "\n"
+			if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			models, err := LoadModels(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(models) != 1 || models[0].ChatSearchDialect != dialect {
+				t.Fatalf("models=%+v", models)
+			}
+			routes, err := BuildRoutes(models)
+			if err != nil || routes[0].ChatSearchDialect != dialect {
+				t.Fatalf("routes=%+v err=%v", routes, err)
+			}
+		})
+	}
+
+	path := filepath.Join(t.TempDir(), "config.toml")
+	raw := "[model.chat]\nbase_url = \"https://relay.example/v1\"\napi_backend = \"chat_completions\"\nchat_search_dialect = \"automatic\"\n"
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if len(routes) != 1 || routes[0].APIBackend != "messages" || routes[0].WireModel != "claude-opus-5" || routes[0].AuthScheme != "bearer" {
-		t.Fatalf("routes = %+v", routes)
+	if _, err := LoadModels(path); err == nil || !strings.Contains(err.Error(), "chat_search_dialect") {
+		t.Fatalf("invalid dialect was accepted: %v", err)
 	}
 }
 

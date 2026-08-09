@@ -3,7 +3,7 @@ param(
     [int]$TimeoutSeconds = 150,
     [int]$MaxTurns = 1,
     [string]$Prompt = "Reply with exactly: OK. Do not call tools.",
-    [string]$SearchPrompt = "Call web_search exactly once to find the latest commit in the public xai-org/grok-build GitHub repository. After that tool result, do not call any tool again. Reply with the repository name and the first 7 characters of the current HEAD commit. Do not answer from memory.",
+    [string]$SearchPrompt = "Call web_search exactly once to find the latest commit in the public xai-org/grok-build GitHub repository. After that tool result, do not call any tool again. Reply with the repository name, the first 7 characters of the current HEAD commit, and one source URL. Do not answer from memory.",
     [string]$SubagentSearchPrompt = "Call spawn_subagent exactly once with subagent_type general-purpose. Tell the child to use web_search now to find the latest commit in the public xai-org/grok-build GitHub repository and return the repository name, the first 7 characters of the current HEAD commit, and a source URL. Do not search in the parent. Wait for the child and return its result.",
     [string]$FetchPrompt = "Use the web_fetch tool, not web_search, to fetch https://example.com/ and reply with the page title.",
     [string]$ExpectedSubagentModel = "",
@@ -18,7 +18,6 @@ $realGrokHome = if ($env:GROK_HOME) { $env:GROK_HOME } else { Join-Path $HOME ".
 $dataDir = Join-Path $env:LOCALAPPDATA "hellogrok"
 $outDir = Join-Path $dataDir "channel-smoke"
 $isolatedHomes = Join-Path $outDir "isolated-homes"
-$lastRequest = Join-Path $dataDir "last_request_meta.json"
 $proxyLog = Join-Path $dataDir "hellogrok.log"
 New-Item -ItemType Directory -Force -Path $outDir, $isolatedHomes | Out-Null
 
@@ -172,41 +171,22 @@ $results = foreach ($model in $Models) {
     $buildXSearch = 0
     $proxyAddedWebSearch = $false
     $clientWebSearchAliased = $false
-    if (Test-Path -LiteralPath $lastRequest) {
-        $requestFile = Get-Item -LiteralPath $lastRequest
-        if ($requestFile.LastWriteTime -ge $started.AddSeconds(-1)) {
-            try {
-                $request = Get-Content -Raw -LiteralPath $lastRequest | ConvertFrom-Json -Depth 100
-                $proxyHit = $true
-                $requestModel = [string]$request.model
-                $toolCount = [int]$request.tools
-                $webSearch = [int]$request.web_search
-                $hostedWebSearch = [int]$request.hosted_web_search
-                $functionWebSearch = [int]$request.function_web_search
-                $xSearch = [int]$request.x_search
-                $buildHostedWebSearch = [int]$request.build_hosted_web_search
-                $buildXSearch = [int]$request.build_x_search
-                $proxyAddedWebSearch = [bool]$request.proxy_added_web_search
-                $clientWebSearchAliased = [bool]$request.client_web_search_aliased
-            } catch {}
-        }
-    }
-
-    # last_request_meta.json may describe the client search model's second
-    # request. Prefer the first proxy request for the channel under test.
+    # The global last_request_meta.json cannot be attributed to a channel when
+    # another Grok session is active. Use only channel-scoped log evidence from
+    # this probe's time window so concurrent requests cannot create false hits.
     $escapedChannel = [Regex]::Escape($model)
     $channelRequestLines = @($newLogLines | Where-Object {
-        $_ -match "UP channel=$escapedChannel\s+backend="
+        $_ -match "UP channel=$escapedChannel\s+(?:backend|incoming)="
     })
     $channelRequestLine = if ($searchProbe) {
-        @($channelRequestLines | Where-Object {
+        $channelRequestLines | Where-Object {
             $_ -match '\sweb_search=[1-9][0-9]*'
-        } | Select-Object -First 1)
+        } | Select-Object -First 1
     } else {
-        @($channelRequestLines | Select-Object -First 1)
+        $channelRequestLines | Select-Object -First 1
     }
-    if ($channelRequestLine.Count -gt 0) {
-        $line = [string]$channelRequestLine[0]
+    if ($null -ne $channelRequestLine) {
+        $line = [string]$channelRequestLine
         $proxyHit = $true
         if ($line -match '\smodel=([^\s]+)') { $requestModel = $Matches[1] }
         if ($line -match '\stools=([0-9]+)') { $toolCount = [int]$Matches[1] }
@@ -222,12 +202,15 @@ $results = foreach ($model in $Models) {
 
     $backendCall = $false
     $backendResult = $false
+    $searchSourceURLs = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $proxySearchSources = 0
     $localToolCall = $false
     $localWebSearchCall = $false
     $webFetchCall = $false
     $webFetchResult = $false
     $subagentCall = $false
     $subagentResult = $false
+    $subagentCompletedResult = $false
     $subagentWaitResult = $false
     $message = ""
     if ($status -eq "ok") {
@@ -247,6 +230,18 @@ $results = foreach ($model in $Models) {
                             }
                             if ($block.type -eq "web_search_tool_result") {
                                 $backendResult = $true
+                                foreach ($entry in @($block.content)) {
+                                    $url = [string]$entry.url
+                                    if ($url -match '^https?://') {
+                                        [void]$searchSourceURLs.Add($url)
+                                    }
+                                }
+                            }
+                            foreach ($citation in @($block.citations)) {
+                                $url = [string]$citation.url
+                                if ($url -match '^https?://') {
+                                    [void]$searchSourceURLs.Add($url)
+                                }
                             }
                             if ($block.type -eq "tool_use") {
                                 if ($block.name -match '^(?i:spawn_subagent|agent|task)$') {
@@ -285,11 +280,21 @@ $results = foreach ($model in $Models) {
                                     if ($clientResult.type -eq "WebSearch" -and $clientContent -and
                                         $clientContent -ne "No search results found.") {
                                         $backendResult = $true
+                                        foreach ($match in [Regex]::Matches($clientContent, 'https?://[^\s<>()\[\]{}"'']+')) {
+                                            [void]$searchSourceURLs.Add($match.Value.TrimEnd('.', ',', ';', ':', '!', '?'))
+                                        }
                                     }
                                 } catch {}
                             }
                             if ($block.type -eq "tool_result" -and $subagentCallIds.Contains([string]$block.tool_use_id)) {
                                 $subagentResult = $true
+                                try {
+                                    $spawnResult = ([string]$block.content) | ConvertFrom-Json -Depth 100
+                                    if ($spawnResult.type -eq "SubagentCompleted" -and
+                                        -not [string]::IsNullOrWhiteSpace([string]$spawnResult.output)) {
+                                        $subagentCompletedResult = $true
+                                    }
+                                } catch {}
                             }
                             if ($block.type -eq "tool_result" -and $subagentWaitCallIds.Contains([string]$block.tool_use_id)) {
                                 $subagentWaitResult = $true
@@ -308,14 +313,22 @@ $results = foreach ($model in $Models) {
 
             if ($searchProbe) {
                 $evidenceCall = [bool]($newLogLines | Where-Object {
-                    $_ -match 'search evidence declared=true .*calls=[1-9][0-9]* completed=[1-9][0-9]*'
+                    $_ -match "UP channel=$escapedChannel search evidence declared=true .*calls=[1-9][0-9]* completed=[1-9][0-9]*"
                 })
                 $evidenceResult = [bool]($newLogLines | Where-Object {
-                    $_ -match 'search evidence declared=true .*sources=[1-9][0-9]*' -or
-                    $_ -match 'search evidence declared=true .*annotations=[1-9][0-9]*'
+                    $_ -match "UP channel=$escapedChannel search evidence declared=true .*sources=[1-9][0-9]*" -or
+                    $_ -match "UP channel=$escapedChannel search evidence declared=true .*annotations=[1-9][0-9]*"
                 })
+                foreach ($line in @($newLogLines | Where-Object {
+                    $_ -match "UP channel=$escapedChannel search evidence declared=true"
+                })) {
+                    $sources = if ($line -match '\ssources=([0-9]+)') { [int]$Matches[1] } else { 0 }
+                    $annotations = if ($line -match '\sannotations=([0-9]+)') { [int]$Matches[1] } else { 0 }
+                    $proxySearchSources = [Math]::Max($proxySearchSources, [Math]::Max($sources, $annotations))
+                }
                 $backendCall = $backendCall -or $evidenceCall
                 $backendResult = $backendResult -or $evidenceResult
+                $searchSourceCount = [Math]::Max($searchSourceURLs.Count, $proxySearchSources)
 
                 $answerMatches = $message -match '(?i)grok-build' -and
                     $message -match '(?i)(?<![0-9a-f])[0-9a-f]{7}(?![0-9a-f])'
@@ -330,19 +343,20 @@ $results = foreach ($model in $Models) {
                     $expectedChildModel = if ($ExpectedSubagentModel) { $ExpectedSubagentModel } else { $model }
                     $escapedChildModel = [Regex]::Escape($expectedChildModel)
                     $childRequestLines = @($newLogLines | Where-Object {
-                        $_ -match "UP channel=$escapedChildModel\s+backend="
+                        $_ -match "UP channel=$escapedChildModel\s+(?:backend|incoming)="
                     })
                     if ($expectedChildModel -eq $model) {
                         $childRequestLines = @($childRequestLines | Select-Object -Skip 1)
                     }
-                    $childClientSearch = [bool](@($newLogLines | Where-Object {
+                    $childClientSearch = [bool](@($childRequestLines | Where-Object {
                         $_ -match 'client_web_search_prepared=true'
                     }).Count)
                     $childHostedSearch = [bool]($newLogLines | Where-Object {
                         $_ -match "UP channel=$escapedChildModel search evidence declared=true .*calls=[1-9][0-9]* completed=[1-9][0-9]*"
                     })
+                    $subagentCompletionObserved = $subagentWaitResult -or $subagentCompletedResult
                     if ($childRequestLines.Count -eq 0 -or -not $subagentCall -or -not $subagentResult -or
-                        -not $subagentWaitResult -or -not $parentDidNotStealSearch -or -not $backendResult -or
+                        -not $subagentCompletionObserved -or -not $parentDidNotStealSearch -or -not $backendResult -or
                         -not $answerMatches -or (-not $childClientSearch -and -not $childHostedSearch)) {
                         $status = "failed"
                         $message = "parent did not delegate verifiable web_search to expected child model $expectedChildModel"
@@ -358,9 +372,9 @@ $results = foreach ($model in $Models) {
                         $functionWebSearch -eq 1 -and $xSearch -eq 0 -and -not $proxyAddedWebSearch -and
                         $clientWebSearchAliased
                     $executionMatches = if ($wireIsHosted) {
-                        $backendCall -and $backendResult -and -not $localWebSearchCall
+                        $backendCall -and $backendResult -and $searchSourceCount -gt 0 -and -not $localWebSearchCall
                     } else {
-                        ($backendCall -or $localToolCall) -and $backendResult
+                        ($backendCall -or $localToolCall) -and $backendResult -and $searchSourceCount -gt 0
                     }
                     if ((-not $wireIsHosted -and -not $wireIsClient) -or -not $executionMatches -or
                         -not $answerMatches) {
@@ -370,7 +384,7 @@ $results = foreach ($model in $Models) {
                 }
             } else {
                 $proxyFetchCall = [bool]($newLogLines | Where-Object {
-                    $_ -match 'search evidence .*web_fetch_calls=[1-9][0-9]*'
+                    $_ -match "UP channel=$escapedChannel search evidence .*web_fetch_calls=[1-9][0-9]*"
                 })
                 $webFetchCall = $webFetchCall -or $proxyFetchCall
                 $answerMatches = $message -match '(?i)example domain'
@@ -422,6 +436,7 @@ $results = foreach ($model in $Models) {
         ClientWebSearchAliased = $clientWebSearchAliased
         BackendCall = $backendCall
         BackendResult = $backendResult
+        SearchSources = [Math]::Max($searchSourceURLs.Count, $proxySearchSources)
         LocalToolCall = $localToolCall
         WebFetchCall = $webFetchCall
         WebFetchResult = $webFetchResult

@@ -47,10 +47,14 @@ hellogrok 为这些自定义渠道提供统一的本地兼容层。运行时准�
 
 ### 渠道兼容
 
-- 支持上游 `responses`、`chat_completions` 和 Anthropic 兼容 `messages` API。
-- 兼容历史单数写法 `message`；Grok Build 配置仍应优先使用官方复数写法 `messages`。
-- 逐帧透传 Responses SSE，并逐帧转换 Messages 与 Chat Completions SSE，包括推理、正文、函数参数、hosted 搜索活动和终止错误。
+- 支持采用 `responses`、`messages` 或 `chat_completions` 的上游渠道。
+- 在供应商边界保留渠道配置的真实协议、URL 路径、模型、凭据、推理和工具语义。
+- 当 `supports_backend_search = true` 时，临时让 Grok Build 将该渠道作为 Responses 消费，再在代理内把请求、响应和 SSE 事件转换到供应商的真实协议。三种上游格式因此都能向 Grok Build 返回 `web_search_call`、来源和站点数量。
+- 当 `supports_backend_search = false` 或缺省时，Grok Build 保持使用配置的原生消费者，其客户端 `web_search` 依次使用 `[models].web_search`、`GROK_WEB_SEARCH_MODEL` 或已登录官方账号的回退路径。
+- 提供渠道隔离的 `/responses`、`/messages` 和 `/chat/completions` 路由，并在代理停止时逐字节恢复原始 `api_backend`。
+- 转发前校验各协议的工具历史：Responses 调用必须有匹配的 `function_call_output`，Messages 的 `tool_use` 必须由紧邻的下一条 user 消息中的 `tool_result` 完整配对，Chat 工具调用必须有匹配的 tool 消息。确定性错误返回不可重试的 `400`，不会进入 Grok Build 重试循环。
 - 在私有 `keepalive`、`keep-alive`、`keep_alive`、`heartbeat`、`ping` 帧到达 Grok Build 前将其转换为标准 SSE 注释，不占用 Responses 事件序号；收到各协议的终止事件后立即关闭上游流。
+- Messages 的 `thinking` 起始块缺少空 `signature` 时补齐该字段，同时保留供应商随后发送的真实 `signature_delta`，使 Messages 兼容中转可被 Grok Build 的严格原生解码器消费。
 - 保留每个渠道配置的上游 URL 路径和模型标识。
 - 使用前准备所有显式自定义渠道，避免通过 `/model` 切换后首次请求失败。
 - 热切换模型时保留可移植的会话历史，只排除已知属于不同渠道、协议、线上模型或上游端点的加密推理。
@@ -58,7 +62,11 @@ hellogrok 为这些自定义渠道提供统一的本地兼容层。运行时准�
 ### 原生 Web 工具
 
 - 支持 hosted 和客户端搜索两种 Grok Build 原生 `web_search` 工作流。
-- 将三种受支持上游协议中的真实搜索 URL 同时保留到 `web_search_call.action.sources` 和 `output_text.annotations`；响应已独立证明确实执行搜索但缺少结构化引用时，也会使用最终回答中的有效链接，让当前 Grok Build 的 hosted 与客户端搜索都能显示原生的去重站点数量。
+- 当 `supports_backend_search = true` 时，三种格式都使用当前渠道自身的 hosted 搜索：Responses 直接转发，Messages 使用 `web_search_20250305`，Chat 使用配置的搜索方言或协议桥接。
+- 对启用能力的渠道，Grok Build 始终收到规范的 Responses 搜索事件，包括已完成的 `web_search_call`、已验证来源、引用、用量和原生去重站点数。
+- 当 `supports_backend_search = false` 时，Grok Build 改用客户端 `web_search`。三种后端仍都可被选为客户端搜索模型；代理只适配 Grok Build 固定的非流式 WebSearchClient 请求。
+- 将适配后搜索结果中的真实 URL 同时写入 `web_search_call.action.sources` 与 `output_text.annotations`；只有响应能独立证明已执行搜索时，才会使用最终回答中的有效链接。Grok Build 因此可显示原生去重站点数。
+- 只有上游能独立证明搜索已完成并同时返回非空回答文本时，适配后的客户端搜索才会成功。静默忽略搜索扩展的供应商会收到不可重试的 `502`；hellogrok 无法为此类渠道凭空生成搜索能力。
 - 当前代理工具权限允许时，将 `web_fetch` 作为独立工具保留。
 - 让受支持的子代理使用相同的搜索行为。
 - Grok 官方模型继续使用 Grok Build 原生搜索和登录路径。
@@ -86,37 +94,38 @@ hellogrok 是 Grok Build 渠道代理，不是系统代理、PAC 服务、VPN �
 
 ### 搜索模式
 
-搜索行为优先取决于显式搜索模型，其次取决于当前自定义渠道的 `supports_backend_search` 设置：
+搜索行为先看显式搜索模型选择，再看当前后端：
 
 | 设置 | 搜索行为 |
 |------|----------|
-| 设置了 `[models].web_search` 或 `GROK_WEB_SEARCH_MODEL` | 所有自定义对话渠道都通过已选搜索模型使用 Grok Build 客户端 `web_search`。该搜索模型可采用 `responses`、`messages` 或 `chat_completions`，客户端搜索请求独立于 `supports_backend_search` 处理。环境变量优先于配置文件的值；选择过程只做本地解析，启动时不会请求所选渠道。 |
-| 未设置搜索模型，`supports_backend_search = true` | hellogrok 直接信任该声明，由当前渠道执行自身的 hosted Web search。 |
-| 未设置搜索模型，`supports_backend_search = false` 或缺省 | 使用 Grok Build 客户端搜索路径；存在有效 xAI 凭据时可使用官方搜索回退。 |
+| 设置了 `[models].web_search` 或 `GROK_WEB_SEARCH_MODEL` | Grok Build 客户端 `web_search` 使用所选模型。该模型可采用 `responses`、`messages` 或 `chat_completions`；它的 WebSearchClient 请求独立于 `supports_backend_search` 处理。环境变量优先，且选择过程不会发起启动请求。 |
+| 任意渠道设置 `supports_backend_search = true` | Grok Build 使用 Responses hosted 工具，hellogrok 则调用该渠道自身实际可用的搜索 API：Responses、Messages `web_search_20250305`，或选定的 Chat 搜索方言/桥接。 |
+| 任意渠道设置 `supports_backend_search = false` 或缺省 | Grok Build 使用客户端 `web_search`：优先 `[models].web_search` 或 `GROK_WEB_SEARCH_MODEL`，否则使用已登录官方账号的回退路径。 |
 | 没有可用的 hosted 或客户端搜索路径 | 当前模型无法使用 `web_search`。 |
 | `web_fetch` | 独立于搜索模型选择，并受当前工具权限限制。 |
 
-hellogrok 不会创建、选择或替换 `[models].web_search`。代理启动时不会向任何上游发送搜索能力探测请求：显式 `true` 直接信任，`false` 与缺省等价。若上游实际上不支持所声明的 hosted 搜索，错误会在首次真实搜索请求时返回并写入日志，而不会拖慢代理启动。
+hellogrok 不会创建、选择或替换 `[models].web_search`，启动时也不会发送搜索能力探测。标记为可用的 Messages 渠道必须真正支持 `web_search_20250305`。Chat 默认使用 `web_search_options`；DeepSeek 官方 Chat 自动桥接到 Messages，xAI 官方 Chat 自动桥接到 Responses。中转需要指定策略时，可把 `chat_search_dialect` 设置为 `web_search_options`、`search_parameters`、`messages` 或 `responses`。代理无法为供应商凭空增加搜索能力。
 
-对于客户端搜索，hellogrok 只会向上游模型明确说明工具用途，不会根据提示词推断或强制调用工具。必须调用某个工具时，只以 Grok Build 或其他调用方提供的结构化 `tool_choice` 为准。内部传输别名只在协议中的工具名称字段内还原，不会改写响应正文、URL 或工具参数。
+对于客户端搜索，hellogrok 会明确工具用途，但不会根据提示词推断或强制调用工具。强制选择只来自结构化 `tool_choice`。内部传输别名只修改协议定义的工具声明、选择和调用名称字段；响应正文、URL、工具参数、工具结果及其他业务 JSON 均保持不变。
 
 ### 配置示例
 
-下面的示例使用已有自定义渠道作为 Grok Build 客户端搜索模型：
+下面示例把一个支持 `web_search_options` 的 Chat Completions 渠道设为 Grok Build 客户端搜索模型：
 
 ```toml
 [models]
-web_search = "deepseek-v4-flash"
+web_search = "search-relay"
 
-[model.deepseek-v4-flash]
-model = "deepseek-v4-flash"
+[model.search-relay]
+model = "provider-search-model"
 base_url = "https://api.example.com/v1"
-env_key = ["DEEPSEEK_API_KEY"]
-api_backend = "responses"
+env_key = ["SEARCH_RELAY_API_KEY"]
+api_backend = "chat_completions"
+chat_search_dialect = "web_search_options"
 supports_backend_search = false
 ```
 
-如果希望由当前渠道执行自身的 hosted search，并且配置的上游端点确实支持搜索，则改为 `supports_backend_search = true`。
+任意渠道若要在普通会话中使用自身 hosted 搜索，都应仅在确认所选供应商 API 确实支持后设置 `supports_backend_search = true`。Messages 使用 `web_search_20250305`；DeepSeek 官方 Chat 自动调用 `/anthropic/messages`，其他 Chat 中转可显式选择 `chat_search_dialect`。
 
 ### 支持的渠道设置
 
@@ -124,14 +133,15 @@ supports_backend_search = false
 |------|----------|--------|------|
 | `model` | 否 | 模型表 ID | 发送给上游渠道的模型标识。 |
 | `base_url` 或 `api_base_url` | 是 | 无 | 自定义上游端点；没有自定义 URL 的模型不会进入代理。 |
-| `api_backend` | 否 | `chat_completions` | 上游 API 格式：`responses`、`chat_completions` 或 `messages`。 |
+| `api_backend` | 否 | `chat_completions` | 上游真实 API 格式：`responses`、`messages` 或 `chat_completions`。启用搜索能力的非 Responses 渠道只会在 Grok Build 侧临时投影为 Responses；上游格式及恢复后的配置不变。 |
+| `chat_search_dialect` | 否 | 按主机判断 | Chat hosted 搜索策略：`web_search_options`、`search_parameters`、`messages` 或 `responses`。DeepSeek 官方默认 `messages`，xAI 官方默认 `responses`，其他主机默认 `web_search_options`。 |
 | `api_key` | 三选一 | 无 | 静态渠道凭据；共享配置建议优先使用 `env_key`。 |
 | `env_key` | 三选一 | 无 | 保存渠道凭据的环境变量名或按顺序尝试的名称列表。 |
 | `auth_provider` | 三选一 | 无 | Grok 命令式鉴权提供器。 |
 | `auth_scheme` | 否 | `bearer` | 上游鉴权方式；只有服务商明确要求 `X-Api-Key` 时才设置为 `x_api_key`。 |
 | `extra_headers` | 否 | 空 | 额外的渠道自有 HTTP 请求头。 |
 | `env_http_headers` | 否 | 空 | 从环境变量读取的 HTTP 请求头。 |
-| `supports_backend_search` | 否 | `false` | 选择 hosted search（`true`）或 Grok Build 客户端搜索（`false`）；缺省按 `false` 处理。 |
+| `supports_backend_search` | 否 | `false` | 为 true 时，三种上游格式都使用当前渠道自身的 hosted 搜索，并向 Grok Build 输出规范 Responses 搜索事件；为 false 时，Grok Build 使用配置或登录回退的客户端搜索路径。 |
 
 模型设置可以直接写在 `[model.<id>]` 下，也可以从引用的 `[model_providers.<id>]` 继承；模型级设置优先。
 
@@ -242,6 +252,8 @@ Windows 的“状态与日志”分割工具条提供自动清理天数选择和
 
 **退出保护：** 当供应商管理工具仍持有 Grok Build 配置所有权时，托盘会推迟退出以避免留下孤立代理地址——先解决配置冲突再退出。
 
+代理运行期间删除整个模型渠道会被视为明确的用户操作：停止时保留该删除，同时恢复其余受管渠道和全局开关。只修改现有渠道中的单个代理受管字段仍会触发退出保护。
+
 ### 与 CC Switch 兼容
 
 只有在 CC Switch 不管理 Grok Build 时，它才能与 hellogrok 同时运行。CC Switch 的 Grok Build 代理接管和供应商切换都会写入 `~/.grok/config.toml`；即使两个代理监听不同端口，同时操作仍会发生配置所有权冲突。
@@ -318,7 +330,9 @@ hellogrok local channel proxy
 Configured custom API channel
 ```
 
-启动时，hellogrok 校验自定义渠道并临时将其指向本地代理；会话期间，每个请求都按该渠道配置的 API、凭据、模型和搜索模式转发；停止时恢复原始 Grok 配置。
+启动时，hellogrok 校验每个自定义渠道，并把 URL 指向渠道隔离的本地路由。未启用后端搜索的渠道保持配置的 Grok Build 消费器和原生流格式。启用能力的渠道会临时投影为 Responses，因为只有该 Grok Build 消费器会序列化 hosted 工具并展示结构化搜索结果；hellogrok 再在供应商边界完成转换，并在停止时恢复原始配置。
+
+Responses 供应商继续使用 Responses。Messages 供应商接收 Messages 请求，其结果通过双向转换器返回为 Responses 事件。Chat 供应商使用 `web_search_options`、`search_parameters`，或按配置桥接到 Messages/Responses。当自定义渠道被选为客户端搜索模型时，Grok Build 固定的非流式 `WebSearchClient` 请求也复用同一组供应商适配器。
 
 原生 `web_search`、`web_fetch`、Grok 官方登录行为和受支持的子代理工作流仍由 Grok Build 管理，不会被替换成独立搜索服务。
 
@@ -330,7 +344,7 @@ Configured custom API channel
 
 ### 无法使用 `web_search`
 
-先查看启动日志中的配置搜索路由，再检查首次失败的真实搜索请求。设置 `supports_backend_search = true` 的渠道必须实际实现 hosted 搜索；hellogrok 信任该设置，不会预先请求验证。客户端搜索路径需要有效的 `[models].web_search` 模型或可用的 xAI 官方凭据。`web_fetch` 与搜索模型独立，但仍可能被当前工具权限排除。
+先查看启动日志中的 Build 协议和上游协议，再检查首次失败的真实搜索请求。启用能力的 Responses 渠道必须实现 Responses hosted 工具，Messages 必须支持 `web_search_20250305`，Chat 必须支持选定的 `chat_search_dialect`。标记为 false 的渠道则需要有效的 `[models].web_search` / `GROK_WEB_SEARCH_MODEL`，或可用的 xAI 官方凭据。`web_fetch` 与搜索模型独立，但仍可能被当前工具权限排除。
 
 ### 请求返回 401、403 或 502
 
@@ -340,21 +354,29 @@ Configured custom API channel
 
 渠道 ID 含点号时优先使用 `[model."完整.ID"]`。未引用的 `[model.foo.bar]` 会被 TOML 解析成嵌套表，Grok Build 原本只看到 `foo`；hellogrok 启用后会临时规范化并验证该表头。`name` 中的点号或连字符不会参与鉴权。
 
+### `tool_use` ID 后没有紧邻的 `tool_result`
+
+这个供应商错误表示 Messages 会话历史结构无效：只要 assistant 消息含一个或多个 `tool_use`，紧邻的下一条 user 消息就必须用开头的 `tool_result` 块完整解析这一批调用。hellogrok 会校验原生历史，并在 Responses 转 Messages 时把并行调用及结果分别合并为紧邻的一条 assistant/user 消息后再请求供应商。真正缺失的结果仍返回不可重试的 `400`，不会伪造工具状态。
+
+### Messages 提示 `serialization error: missing field signature`
+
+请使用当前构建重新启动代理。部分 Messages 兼容中转会在流式 `thinking` 起始块中省略必需的空 `signature`，随后才通过 `signature_delta` 发送真实不透明值；Grok Build 的原生 Messages 解码器会在读取增量前拒绝这个不完整起始块。hellogrok 只补齐缺失的协议字段，并原样保留真实增量供后续轮次使用。若中转始终不发送真实签名，下游无法重建可验证的隐藏推理，只能由供应商修复 Messages 响应。
+
 ### 输出最后一次性出现
 
-对于 Grok Build 的流式请求，hellogrok 会向三类受支持后端都发送 `stream=true`。Responses SSE 逐帧透传，Messages 与 Chat Completions SSE 逐帧转换。如果日志出现 `ignored stream=true; emitting buffered JSON fallback`，说明该上游返回的是一次性完整 JSON，本次请求客观上无法实现真正流式。代理仍会生成协议兼容的 SSE，但会明确标记这是缓冲回退，而不是伪装成上游流式。
+对于流式请求，hellogrok 会向选定的供应商 API 发送 `stream=true`。未启用能力的渠道保持原生 SSE；启用能力的 Messages 和 Chat 渠道会被增量转换成 Responses 事件，使 Grok Build 能消费推理、文本、函数调用、`web_search_call`、来源和终止状态。日志若提示缓冲回退，说明上游只返回了一次性完整 JSON，本次请求无法实现真正流式。
 
-当前 Grok Build 有两条来源路径：hosted 搜索读取 `web_search_call.action.sources`，客户端 `web_search` 工具读取 `output_text.annotations` 中的 URL 引用；两者显示的都是唯一域名数，不是原始链接条数。对于 `responses`、`messages` 和 `chat_completions` 渠道，hellogrok 都会把同一批已验证 URL 写入两种表示，优先使用结构化结果和引用；只有响应已独立证明确实执行搜索时，才会从最终回答恢复有效 HTTP(S) 链接。普通回答中的链接不会凭空创建搜索调用。若供应商在整个响应中都不返回任何真实 URL，可以显示搜索活动，但不能伪造可信的站点数量。
+当前 Grok Build 有两条 Responses 来源展示路径：hosted 搜索读取 `web_search_call.action.sources`，客户端 `web_search` 工具读取 `output_text.annotations` 中的 URL 引用。WebSearchClient 适配器会把任一支持搜索后端的已验证 URL 写入两种结构：优先使用结构化结果和引用；只有响应能独立证明已执行搜索时，才从最终回答恢复有效 HTTP(S) 链接。普通回答链接不会凭空创建搜索调用。如果供应商没有返回真实 URL，仍可显示搜索活动，但不能伪造可信站点数。
 
 ### 出现 `unknown variant keepalive` 或持续 `Waiting for response...`
 
-请把两个 hellogrok 可执行文件都升级到 v0.1.4 或更高版本，然后重启代理。部分中转会向 Responses 流注入私有 `keepalive`、`keep-alive`、`keep_alive`、`heartbeat` 或 `ping` 事件；Grok Build 会用严格的 Responses 事件枚举反序列化每个数据帧，因此即使上游仍在生成，直接转发这些 JSON 对象也会触发序列化错误。hellogrok 现在会从 SSE `event:` 字段、JSON `type`/`event` 字段和裸数据载荷中吸收这些名称，再输出标准的 `: keepalive` 注释。收到 Responses 完成事件、Messages `message_stop` 或 Chat Completions `[DONE]` 后，也会立即关闭上游请求，不再等待服务商主动断开连接。
+请把两个 hellogrok 可执行文件升级到相同的当前发布版或构建版，然后重启代理。部分中转会向 SSE 流注入私有 `keepalive`、`keep-alive`、`keep_alive`、`heartbeat` 或 `ping` 事件；Grok Build 严格的 Responses 反序列化器会拒绝这些 JSON 事件，即使上游仍在生成。hellogrok 会从 SSE `event:` 字段、JSON `type`/`event` 字段、裸数据载荷以及空数据心跳帧中吸收这些名称，再输出标准的 `: keepalive` 注释。收到 Responses 完成事件、Messages `message_stop` 或 Chat Completions `[DONE]` 后，也会立即关闭上游请求，不再等待服务商套接字。
 
 流结束日志会包含 `heartbeats=<数量>`。若仍出现同一错误且该计数始终为零，请用 `hellogrok routes` 确认 Grok Build 确实经过当前代理；此时服务商很可能使用了其他私有事件名，应根据不含凭据的流抓取结果诊断，而不是添加模型专用绕过逻辑。
 
 ### Claude Messages 渠道选错模型或返回 404
 
-请使用复数写法 `api_backend = "messages"`。Grok Build 当前源码只定义 `chat_completions`、`responses`、`messages` 三种后端，Claude 本身受 Messages 后端支持。hellogrok 启用时会兼容历史单数值 `message`，但不经过 hellogrok 直接连接时仍必须使用官方复数写法。`base_url` 必须填写追加 `/messages` 之前的 API 根地址：若真实端点是 `/v1/messages`，配置应以 `/v1` 结尾，因为 hellogrok 会追加 `/messages`；上游成功返回 `text/html` 通常说明缺少这一 API 前缀。同时确认 `model` 填写的是服务商实际支持的 Claude 上游模型 ID，而不是渠道 ID。
+请使用复数写法 `api_backend = "messages"`。Grok Build 只定义 `chat_completions`、`responses`、`messages` 三种后端；hellogrok 会拒绝废弃的单数拼写。`base_url` 必须填写追加 `/messages` 之前的 API 根地址：若真实端点是 `/v1/messages`，配置应以 `/v1` 结尾。启用能力的 Messages 渠道会临时向 Grok Build 显示为 Responses，但上游仍调用该 `/messages` 端点。同时确认 `model` 填写的是供应商实际支持的上游模型 ID，而不是渠道 ID。
 
 ### 已打开窗口没有随代理切换
 
@@ -404,6 +426,7 @@ CI 会在 Windows、Linux、Intel macOS 和 Apple Silicon macOS 上运行测试�
 ## 使用限制
 
 - hellogrok 无法创造服务商侧的搜索能力；hosted search 渠道必须真实支持搜索并返回结果。
+- Responses 到 Messages/Chat 的普通会话转换只对显式设置 `supports_backend_search = true` 的渠道开放，另加 Grok Build 固定的非流式 WebSearchClient 请求；其他跨协议请求会被拒绝。
 - 中转如果主动删除工具声明、工具调用、引用或结果事件，下游无法完整恢复。
 - 供应商若无视 `stream=true`，等完整 JSON 已经返回后无法再变成真正流式；hellogrok 会记录并使用缓冲兼容回退。
 - 服务商加密的隐藏推理只属于其来源签名域。跨域切换会保留可见会话与工具历史，但会主动排除不兼容的私有推理。

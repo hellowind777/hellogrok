@@ -20,7 +20,7 @@ import (
 const (
 	ProxyHost    = "127.0.0.1"
 	ProxyPort    = "18787"
-	stateVersion = 6
+	stateVersion = 8
 
 	ccSwitchProxyToken = "PROXY_MANAGED"
 )
@@ -48,12 +48,14 @@ var (
 
 // Target describes one resolved custom model. APIBaseURL is true when Grok
 // could select a separate API-key endpoint, which must be routed through the
-// same channel facade to prevent a direct-request bypass. SupportsBackendSearch
-// is the effective model/provider capability that must be made explicit while
-// the facade is active so Grok Build cannot inherit a catalog value instead.
+// same channel facade to prevent a direct-request bypass. APIBackend is the
+// provider's real protocol; BuildAPIBackend is the protocol exposed to Grok
+// Build while the facade is active.
 type Target struct {
 	ID                    string
 	APIBaseURL            bool
+	APIBackend            string
+	BuildAPIBackend       string
 	SupportsBackendSearch bool
 }
 
@@ -93,10 +95,12 @@ type SubagentState struct {
 }
 
 type ModelState struct {
-	Section       ModelSectionState `json:"section,omitempty"`
-	BaseURL       ManagedLineState  `json:"base_url"`
-	APIBaseURL    ManagedLineState  `json:"api_base_url,omitempty"`
-	APIBackend    ManagedLineState  `json:"api_backend"`
+	Section    ModelSectionState `json:"section,omitempty"`
+	BaseURL    ManagedLineState  `json:"base_url"`
+	APIBaseURL ManagedLineState  `json:"api_base_url,omitempty"`
+	// APIBackend is nil when the exposed and provider protocols are identical.
+	// A pointer also keeps v5/v6 rewrite states decodable during restoration.
+	APIBackend    *ManagedLineState `json:"api_backend,omitempty"`
 	BackendSearch ManagedLineState  `json:"backend_search"`
 }
 
@@ -314,10 +318,10 @@ func ChannelIDFromProxyURL(raw string) string {
 	return id
 }
 
-// ApplyTargets gives every resolved custom model a Build-facing Responses
-// endpoint, materializes its effective backend-search capability, and enables
-// Build's backend-tool and web-fetch feature gates. It preserves
-// [models].web_search and stream_tool_calls.
+// ApplyTargets gives every resolved custom model a channel-scoped facade URL,
+// projects the protocol Grok Build must consume, materializes its effective
+// backend-search capability, and enables Build's backend-tool and web-fetch
+// feature gates. It preserves [models].web_search and stream_tool_calls.
 func ApplyTargets(configPath, statePath string, targets []Target) (ApplyResult, error) {
 	configPath, err := canonicalConfigPath(configPath)
 	if err != nil {
@@ -330,9 +334,28 @@ func ApplyTargets(configPath, statePath string, targets []Target) (ApplyResult, 
 	targetMap := map[string]Target{}
 	for _, target := range targets {
 		target.ID = strings.TrimSpace(target.ID)
-		if target.ID != "" {
-			targetMap[target.ID] = target
+		if target.ID == "" {
+			continue
 		}
+		target.APIBackend = strings.ToLower(strings.TrimSpace(target.APIBackend))
+		if target.APIBackend == "" {
+			target.APIBackend = "chat_completions"
+		}
+		switch target.APIBackend {
+		case "responses", "messages", "chat_completions":
+		default:
+			return ApplyResult{}, fmt.Errorf("model %q uses unsupported api_backend %q", target.ID, target.APIBackend)
+		}
+		target.BuildAPIBackend = strings.ToLower(strings.TrimSpace(target.BuildAPIBackend))
+		if target.BuildAPIBackend == "" {
+			target.BuildAPIBackend = target.APIBackend
+		}
+		switch target.BuildAPIBackend {
+		case "responses", "messages", "chat_completions":
+		default:
+			return ApplyResult{}, fmt.Errorf("model %q uses unsupported Build api_backend %q", target.ID, target.BuildAPIBackend)
+		}
+		targetMap[target.ID] = target
 	}
 	if len(targetMap) == 0 {
 		return ApplyResult{}, nil
@@ -493,14 +516,42 @@ func validateManagedConfig(raw []byte, targets map[string]Target, state State) e
 				return fmt.Errorf("[model.%s].api_base_url must be %q", id, proxyURL)
 			}
 		}
-		if value, ok := model["api_backend"].(string); !ok || value != "responses" {
-			return fmt.Errorf("[model.%s].api_backend must be %q", id, "responses")
+		backend, err := effectiveModelBackend(root, model)
+		if err != nil {
+			return fmt.Errorf("[model.%s].api_backend %w", id, err)
+		}
+		if backend != targets[id].BuildAPIBackend {
+			return fmt.Errorf("[model.%s].api_backend must be %q, got %q", id, targets[id].BuildAPIBackend, backend)
 		}
 		if value, ok := model["supports_backend_search"].(bool); !ok || value != targets[id].SupportsBackendSearch {
 			return fmt.Errorf("[model.%s].supports_backend_search must be %t", id, targets[id].SupportsBackendSearch)
 		}
 	}
 	return nil
+}
+
+func effectiveModelBackend(root, model map[string]any) (string, error) {
+	value, exists := model["api_backend"]
+	if !exists {
+		providerID, _ := model["model_provider"].(string)
+		providers, _ := root["model_providers"].(map[string]any)
+		provider, _ := providers[strings.TrimSpace(providerID)].(map[string]any)
+		value, exists = provider["api_backend"]
+	}
+	if !exists {
+		return "chat_completions", nil
+	}
+	backend, ok := value.(string)
+	if !ok {
+		return "", fmt.Errorf("must be a string")
+	}
+	backend = strings.ToLower(strings.TrimSpace(backend))
+	switch backend {
+	case "responses", "messages", "chat_completions":
+		return backend, nil
+	default:
+		return "", fmt.Errorf("uses unsupported value %q", backend)
+	}
 }
 
 func validateTargetBackendSearchValues(root map[string]any, targets map[string]Target) error {
@@ -557,7 +608,7 @@ func discardUncommittedState(statePath string, cause error) error {
 }
 
 func supportedStateVersion(version int) bool {
-	return version == 5 || version == stateVersion
+	return version == 5 || version == 6 || version == 7 || version == stateVersion
 }
 
 // rewriteSubagentEnabled repairs a Grok Build 0.2.118 defaulting bug. When a
@@ -816,8 +867,16 @@ func rewriteModelBlock(block []string, id string, target Target, state *State, e
 	if target.APIBaseURL {
 		fields = append(fields, managedField{name: "api_base_url", pattern: apiBaseURLLine, anyPattern: apiBaseURLAnyLine, value: quoteTOML(proxyURL), state: &modelState.APIBaseURL, changed: &result.APIBaseURLs})
 	}
+	if target.BuildAPIBackend != target.APIBackend || modelState.APIBackend != nil {
+		if modelState.APIBackend == nil {
+			modelState.APIBackend = &ManagedLineState{}
+		}
+		fields = append(fields, managedField{
+			name: "api_backend", pattern: apiBackendLine, anyPattern: apiBackendAnyLine,
+			value: quoteTOML(target.BuildAPIBackend), state: modelState.APIBackend, changed: &result.APIBackends,
+		})
+	}
 	fields = append(fields,
-		managedField{name: "api_backend", pattern: apiBackendLine, anyPattern: apiBackendAnyLine, value: quoteTOML("responses"), state: &modelState.APIBackend, changed: &result.APIBackends},
 		managedField{name: "supports_backend_search", pattern: backendSearchLine, anyPattern: backendSearchAnyLine, value: fmt.Sprintf("%t", target.SupportsBackendSearch), state: &modelState.BackendSearch, changed: &result.BackendSearch},
 	)
 
@@ -1025,7 +1084,7 @@ func matchesOriginalManagedState(raw []byte, state State) (bool, error) {
 		for _, check := range []managedValueCheck{
 			{key: "base_url", state: modelState.BaseURL},
 			{key: "api_base_url", state: modelState.APIBaseURL},
-			{key: "api_backend", state: modelState.APIBackend},
+			{key: "api_backend", state: legacyManagedState(modelState.APIBackend)},
 			{key: "supports_backend_search", state: modelState.BackendSearch},
 		} {
 			matches, err := managedValueMatchesOriginal(model, check)
@@ -1122,13 +1181,20 @@ func validateRestorableConfig(raw []byte, state State) error {
 	for _, id := range ids {
 		model := models[id]
 		modelState := state.Models[id]
+		// Removing an entire model while the proxy is active is an unambiguous
+		// user-owned channel deletion. There is no proxy URL left to restore for
+		// that model, so preserve the deletion while restoring all remaining
+		// managed fields. Edits inside an existing model still fail closed below.
+		if model == nil && sectionLines[id] == "" {
+			continue
+		}
 		if modelState.Section.Managed && sectionLines[id] != modelState.Section.AppliedLine {
 			return fmt.Errorf("[model.%s] header changed while proxy was active", id)
 		}
 		if err := validateManagedTable(fmt.Sprintf("[model.%s]", id), model, []managedValueCheck{
 			{key: "base_url", state: modelState.BaseURL},
 			{key: "api_base_url", state: modelState.APIBaseURL},
-			{key: "api_backend", state: modelState.APIBackend},
+			{key: "api_backend", state: legacyManagedState(modelState.APIBackend)},
 			{key: "supports_backend_search", state: modelState.BackendSearch},
 		}); err != nil {
 			return err
@@ -1363,8 +1429,14 @@ func restoreModelBlock(block []string, modelState ModelState, restored int, fina
 	}{
 		{baseURLLine, baseURLAnyLine, modelState.BaseURL},
 		{apiBaseURLLine, apiBaseURLAnyLine, modelState.APIBaseURL},
-		{apiBackendLine, apiBackendAnyLine, modelState.APIBackend},
 		{backendSearchLine, backendSearchAnyLine, modelState.BackendSearch},
+	}
+	if modelState.APIBackend != nil {
+		fields = append(fields, struct {
+			pattern    *regexp.Regexp
+			anyPattern *regexp.Regexp
+			state      ManagedLineState
+		}{apiBackendLine, apiBackendAnyLine, *modelState.APIBackend})
 	}
 	for _, field := range fields {
 		if !field.state.Managed {
@@ -1392,9 +1464,16 @@ func restoreModelBlock(block []string, modelState ModelState, restored int, fina
 		block = next
 	}
 	if finalBlock {
-		restoreTerminalBlockEnding(block, modelState.BaseURL, modelState.APIBaseURL, modelState.APIBackend, modelState.BackendSearch)
+		restoreTerminalBlockEnding(block, modelState.BaseURL, modelState.APIBaseURL, legacyManagedState(modelState.APIBackend), modelState.BackendSearch)
 	}
 	return block, restored
+}
+
+func legacyManagedState(state *ManagedLineState) ManagedLineState {
+	if state == nil {
+		return ManagedLineState{}
+	}
+	return *state
 }
 
 func restoreTerminalBlockEnding(lines []string, states ...ManagedLineState) {

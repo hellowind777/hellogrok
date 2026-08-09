@@ -23,7 +23,7 @@ const maxFacadeBodyBytes int64 = 64 << 20
 
 var errBodyTooLarge = errors.New("body exceeds size limit")
 
-func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, route config.Route) {
+func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, route config.Route, incomingProtocol wireProtocol) {
 	defer s.flushReasoningProvenance()
 	if incoming.Method != http.MethodPost {
 		writeJSONError(w, http.StatusMethodNotAllowed, "custom channel facade accepts POST only")
@@ -37,11 +37,6 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 		writeJSONError(w, http.StatusRequestEntityTooLarge, "request body exceeds 64 MiB")
 		return
 	}
-	target, protocol, err := upstreamTarget(route, incoming.URL.RawQuery)
-	if err != nil {
-		writeJSONError(w, http.StatusBadGateway, err.Error())
-		return
-	}
 	body, err := readBodyLimited(incoming.Body, maxFacadeBodyBytes)
 	_ = incoming.Body.Close()
 	if err != nil {
@@ -52,13 +47,14 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 		writeJSONError(w, http.StatusBadRequest, "read request: "+err.Error())
 		return
 	}
-	request, err := adaptFacadeRequestWithReasoning(body, route, s.replays, s.reasoning, keepUnknownReasoning)
+	request, err := adaptFacadeRequestWithReasoning(body, route, incomingProtocol, s.reasoning, keepUnknownReasoning)
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if request.Protocol != protocol {
-		writeJSONError(w, http.StatusInternalServerError, "internal backend mismatch")
+	target, err := upstreamTarget(route, request.Protocol, incoming.URL.RawQuery)
+	if err != nil {
+		writeJSONError(w, http.StatusBadGateway, err.Error())
 		return
 	}
 	if !routeHasCredential(route, incoming.Header) && !routeIsLoopback(route) {
@@ -69,9 +65,11 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 
 	tools, webSearch, hostedSearch, functionSearch, xSearch := summarizeBody(request.Body)
 	logTarget := safeDiagnosticTarget(target)
-	s.log.Printf("UP channel=%s backend=%s %s body=%dB model=%s tools=%d web_search=%d hosted_web_search=%d function_web_search=%d x_search=%d build_hosted_web_search=%d build_x_search=%d proxy_added_web_search=%t client_web_search_prepared=%t client_web_search_aliased=%t",
-		route.ChannelID, route.APIBackend, logTarget, len(request.Body), route.WireModel, tools, webSearch, hostedSearch, functionSearch, xSearch,
-		request.BuildHostedWebSearch, request.BuildXSearch, request.ProxyAddedWebSearch, request.ClientSearchPrepared, request.ClientSearchAlias != "")
+	s.log.Printf("UP channel=%s incoming=%s upstream=%s kind=%s %s body=%dB model=%s tools=%d web_search=%d hosted_web_search=%d function_web_search=%d x_search=%d build_hosted_web_search=%d build_x_search=%d proxy_added_web_search=%t client_web_search_prepared=%t client_web_search_aliased=%t",
+		route.ChannelID, request.IncomingProtocol, request.Protocol, requestKindLabel(request.Kind), logTarget,
+		len(request.Body), route.WireModel, tools, webSearch, hostedSearch, functionSearch, xSearch,
+		request.BuildHostedWebSearch, request.BuildXSearch, request.ProxyAddedWebSearch,
+		request.ClientSearchPrepared, request.ClientSearchAlias != "")
 	if request.Reasoning.Opaque > 0 {
 		s.log.Printf("UP channel=%s reasoning projection opaque=%d compatible=%d unknown=%d dropped=%d recovery=%t",
 			route.ChannelID, request.Reasoning.Opaque, request.Reasoning.Compatible,
@@ -113,42 +111,40 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 		if req.Header.Get("User-Agent") == "" {
 			req.Header.Set("User-Agent", appinfo.Name+"/"+appinfo.Version)
 		}
-		applyRouteHeaders(req.Header, route, incoming.Header)
-		if request.Protocol == wireMessages {
-			if req.Header.Get("Anthropic-Version") == "" {
-				req.Header.Set("Anthropic-Version", "2023-06-01")
-			}
+		applyRouteHeaders(req.Header, route, request.Protocol, incoming.Header)
+		if request.Protocol == wireMessages && req.Header.Get("Anthropic-Version") == "" {
+			req.Header.Set("Anthropic-Version", "2023-06-01")
 		}
 		req.ContentLength = int64(len(payload))
 		return s.client.Do(req)
 	}
 
-	var resp *http.Response
+	var response *http.Response
 	for {
-		resp, err = doRequest(request.Body)
+		response, err = doRequest(request.Body)
 		if err != nil {
 			detail := safeUpstreamError(err)
 			s.log.Printf("UP channel=%s request failed: %s", route.ChannelID, detail)
 			writeRetryableJSONError(w, http.StatusBadGateway, "upstream: "+detail)
 			return
 		}
-		s.log.Printf("UP channel=%s status=%d ct=%s %s", route.ChannelID, resp.StatusCode, resp.Header.Get("Content-Type"), time.Since(started).Round(time.Millisecond))
-		if encoding := strings.TrimSpace(resp.Header.Get("Content-Encoding")); encoding != "" && !strings.EqualFold(encoding, "identity") {
-			_ = resp.Body.Close()
+		s.log.Printf("UP channel=%s status=%d ct=%s %s", route.ChannelID, response.StatusCode, response.Header.Get("Content-Type"), time.Since(started).Round(time.Millisecond))
+		if encoding := strings.TrimSpace(response.Header.Get("Content-Encoding")); encoding != "" && !strings.EqualFold(encoding, "identity") {
+			_ = response.Body.Close()
 			writeJSONError(w, http.StatusBadGateway, "upstream returned unsupported content encoding "+encoding)
 			return
 		}
-		if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
+		if response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices {
 			break
 		}
-		if resp.StatusCode >= http.StatusMultipleChoices && resp.StatusCode < http.StatusBadRequest {
-			_ = resp.Body.Close()
+		if response.StatusCode >= http.StatusMultipleChoices && response.StatusCode < http.StatusBadRequest {
+			_ = response.Body.Close()
 			writeJSONError(w, http.StatusBadGateway, "upstream redirects are not accepted")
 			return
 		}
 
-		data, readErr := readBodyLimited(resp.Body, maxFacadeBodyBytes)
-		_ = resp.Body.Close()
+		data, readErr := readBodyLimited(response.Body, maxFacadeBodyBytes)
+		_ = response.Body.Close()
 		if readErr != nil {
 			if errors.Is(readErr, errBodyTooLarge) {
 				writeJSONError(w, http.StatusBadGateway, "upstream error body exceeds 64 MiB")
@@ -158,13 +154,13 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 			return
 		}
 
-		reasoningRejected := isOpaqueReasoningRejection(resp.StatusCode, data)
+		reasoningRejected := isOpaqueReasoningRejection(response.StatusCode, data)
 		keptOpaqueReasoning := request.Reasoning.Opaque - request.Reasoning.Dropped
 		if reasoningRejected && keptOpaqueReasoning > 0 && !request.ReasoningRecovery {
-			retryRequest, retryErr := adaptFacadeRequestWithReasoning(body, route, s.replays, s.reasoning, dropAllOpaqueReasoning)
+			retryRequest, retryErr := adaptFacadeRequestWithReasoning(body, route, incomingProtocol, s.reasoning, dropAllOpaqueReasoning)
 			if retryErr == nil && retryRequest.Reasoning.Dropped > request.Reasoning.Dropped {
 				s.log.Printf("UP channel=%s reasoning recovery retry once removed=%d after status=%d",
-					route.ChannelID, retryRequest.Reasoning.Dropped, resp.StatusCode)
+					route.ChannelID, retryRequest.Reasoning.Dropped, response.StatusCode)
 				request = retryRequest
 				saveLastRequestMeta(logTarget, route.WireModel, len(request.Body), tools, webSearch, hostedSearch, functionSearch, xSearch, request)
 				continue
@@ -174,95 +170,46 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 			}
 		}
 
-		copySafeResponseHeaders(w.Header(), resp.Header)
+		copySafeResponseHeaders(w.Header(), response.Header)
+		setRetryDisposition(w.Header(), response.StatusCode)
 		if reasoningRejected {
 			w.Header().Set("X-Should-Retry", "false")
 		}
-		w.WriteHeader(resp.StatusCode)
+		w.WriteHeader(response.StatusCode)
 		_, _ = w.Write(data)
 		return
 	}
-	defer resp.Body.Close()
+	defer response.Body.Close()
 
-	options := patch.Options{GPTResponses: true, WebSearch: true, RequestModel: route.WireModel}
-	upstreamSSE := strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream")
+	upstreamSSE := strings.Contains(strings.ToLower(response.Header.Get("Content-Type")), "text/event-stream")
 	if upstreamSSE && !request.Stream {
 		writeJSONError(w, http.StatusBadGateway, "upstream ignored stream=false; cannot return an event stream")
 		return
 	}
 	if upstreamSSE {
+		if request.Kind == clientSearchRequest {
+			writeJSONError(w, http.StatusBadGateway, "WebSearchClient requires one non-streaming Responses response")
+			return
+		}
+		if request.IncomingProtocol != wireResponses {
+			s.streamNativeSSE(w, response, route, request, started)
+			return
+		}
 		switch request.Protocol {
 		case wireResponses:
-			s.streamResponsesSSE(w, resp, route, request, options, started)
+			options := patch.Options{GPTResponses: true, WebSearch: true, RequestModel: route.WireModel}
+			s.streamResponsesSSE(w, response, route, request, options, started)
 		case wireMessages:
-			s.streamMessagesSSE(w, resp, route, request, started)
+			s.streamMessagesSSE(w, response, route, request, started)
 		case wireChatCompletions:
-			s.streamChatSSE(w, resp, route, request, started)
+			s.streamChatSSE(w, response, route, request, started)
 		default:
 			writeJSONError(w, http.StatusInternalServerError, "unsupported streaming backend")
 		}
 		return
 	}
 
-	if request.Protocol == wireResponses {
-		data, readErr := readBodyLimited(resp.Body, maxFacadeBodyBytes)
-		if readErr != nil {
-			if errors.Is(readErr, errBodyTooLarge) {
-				writeJSONError(w, http.StatusBadGateway, "upstream response body exceeds 64 MiB")
-			} else {
-				writeRetryableJSONError(w, http.StatusBadGateway, "read upstream response: "+readErr.Error())
-			}
-			return
-		}
-		if isHTMLContentType(resp.Header.Get("Content-Type")) {
-			writeJSONError(w, http.StatusBadGateway, upstreamHTMLResponseMessage(route.APIBackend))
-			return
-		}
-		data, readErr = restoreClientWebSearchAliasJSON(data, request.ClientSearchAlias)
-		if readErr != nil {
-			writeJSONError(w, http.StatusBadGateway, "invalid upstream Responses body while restoring client search: "+readErr.Error())
-			return
-		}
-		data, readErr = patch.PatchJSONBytesStrict(data, options)
-		if readErr != nil {
-			writeJSONError(w, http.StatusBadGateway, "invalid upstream Responses body: "+readErr.Error())
-			return
-		}
-		canonical, decodeErr := decodeJSONMap(data)
-		if decodeErr != nil {
-			writeJSONError(w, http.StatusBadGateway, "invalid upstream Responses body: "+decodeErr.Error())
-			return
-		}
-		backfillResponseSearchSources(canonical, request.HostedWebSearch, request.SearchQuery)
-		if validateErr := validateResponsesEnvelope(canonical); validateErr != nil {
-			writeJSONError(w, http.StatusBadGateway, "invalid upstream Responses body: "+validateErr.Error())
-			return
-		}
-		s.captureReasoningProvenance(route, canonical)
-		data, readErr = json.Marshal(canonical)
-		if readErr != nil {
-			writeJSONError(w, http.StatusBadGateway, "encode upstream Responses body: "+readErr.Error())
-			return
-		}
-		evidence := newSearchEvidence()
-		evidence.observeJSON(data)
-		s.logSearchEvidence(route.ChannelID, request, evidence)
-		s.replays.captureJSON(route.ChannelID, request.ReplayScope, data)
-		if request.Stream {
-			s.log.Printf("UP channel=%s backend=responses ignored stream=true; emitting buffered JSON fallback", route.ChannelID)
-			if writeErr := writeCanonicalResponse(w, canonical, true); writeErr != nil {
-				writeJSONError(w, http.StatusBadGateway, "invalid non-stream Responses body: "+writeErr.Error())
-			}
-			return
-		}
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(data)))
-		w.WriteHeader(resp.StatusCode)
-		_, _ = w.Write(data)
-		return
-	}
-
-	data, readErr := readBodyLimited(resp.Body, maxFacadeBodyBytes)
+	data, readErr := readBodyLimited(response.Body, maxFacadeBodyBytes)
 	if readErr != nil {
 		if errors.Is(readErr, errBodyTooLarge) {
 			writeJSONError(w, http.StatusBadGateway, "upstream response body exceeds 64 MiB")
@@ -271,37 +218,266 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 		}
 		return
 	}
-	if isHTMLContentType(resp.Header.Get("Content-Type")) {
+	if isHTMLContentType(response.Header.Get("Content-Type")) {
 		writeJSONError(w, http.StatusBadGateway, upstreamHTMLResponseMessage(route.APIBackend))
 		return
 	}
+
+	if request.Kind == clientSearchRequest {
+		s.writeClientSearchResponse(w, data, route, request)
+		return
+	}
+
+	if request.IncomingProtocol == wireResponses {
+		switch request.Protocol {
+		case wireResponses:
+			canonical, normalized, normalizeErr := s.normalizeResponsesJSON(data, route, request)
+			if normalizeErr != nil {
+				writeJSONError(w, http.StatusBadGateway, "invalid upstream Responses body: "+normalizeErr.Error())
+				return
+			}
+			if request.Stream {
+				s.log.Printf("UP channel=%s backend=responses ignored stream=true; emitting buffered JSON fallback", route.ChannelID)
+				if err := writeCanonicalResponse(w, canonical, true); err != nil {
+					writeJSONError(w, http.StatusBadGateway, "invalid non-stream Responses body: "+err.Error())
+				}
+				return
+			}
+			copySafeResponseHeaders(w.Header(), response.Header)
+			writeJSONBody(w, response.StatusCode, normalized)
+		case wireMessages, wireChatCompletions:
+			s.writeTranslatedResponse(w, data, route, request)
+		default:
+			writeJSONError(w, http.StatusInternalServerError, "unsupported upstream protocol")
+		}
+		return
+	}
+
+	switch request.Protocol {
+	case wireResponses:
+		canonical, normalized, normalizeErr := s.normalizeResponsesJSON(data, route, request)
+		if normalizeErr != nil {
+			writeJSONError(w, http.StatusBadGateway, "invalid upstream Responses body: "+normalizeErr.Error())
+			return
+		}
+		if request.Stream {
+			s.log.Printf("UP channel=%s backend=responses ignored stream=true; emitting buffered JSON fallback", route.ChannelID)
+			if err := writeCanonicalResponse(w, canonical, true); err != nil {
+				writeJSONError(w, http.StatusBadGateway, "invalid non-stream Responses body: "+err.Error())
+			}
+			return
+		}
+		copySafeResponseHeaders(w.Header(), response.Header)
+		writeJSONBody(w, response.StatusCode, normalized)
+	case wireMessages:
+		root, normalized, normalizeErr := s.normalizeNativeJSON(data, route, request, validateMessagesEnvelope)
+		if normalizeErr != nil {
+			writeJSONError(w, http.StatusBadGateway, "invalid upstream Messages body: "+normalizeErr.Error())
+			return
+		}
+		if request.Stream {
+			s.log.Printf("UP channel=%s backend=messages ignored stream=true; emitting buffered native SSE fallback", route.ChannelID)
+			if err := writeMessagesSSEFallback(w, root); err != nil {
+				writeJSONError(w, http.StatusBadGateway, "invalid non-stream Messages body: "+err.Error())
+			}
+			return
+		}
+		copySafeResponseHeaders(w.Header(), response.Header)
+		writeJSONBody(w, response.StatusCode, normalized)
+	case wireChatCompletions:
+		root, normalized, normalizeErr := s.normalizeNativeJSON(data, route, request, validateChatEnvelope)
+		if normalizeErr != nil {
+			writeJSONError(w, http.StatusBadGateway, "invalid upstream Chat Completions body: "+normalizeErr.Error())
+			return
+		}
+		if request.Stream {
+			s.log.Printf("UP channel=%s backend=chat_completions ignored stream=true; emitting buffered native SSE fallback", route.ChannelID)
+			if err := writeChatSSEFallback(w, root); err != nil {
+				writeJSONError(w, http.StatusBadGateway, "invalid non-stream Chat Completions body: "+err.Error())
+			}
+			return
+		}
+		copySafeResponseHeaders(w.Header(), response.Header)
+		writeJSONBody(w, response.StatusCode, normalized)
+	}
+}
+
+func (s *Server) writeTranslatedResponse(w http.ResponseWriter, data []byte, route config.Route, request facadeRequest) {
 	evidence := newSearchEvidence()
 	evidence.observeJSON(data)
 	s.logSearchEvidence(route.ChannelID, request, evidence)
+
 	var result canonicalResult
-	if request.Protocol == wireMessages {
+	var err error
+	switch request.Protocol {
+	case wireMessages:
 		result, err = canonicalFromMessages(data, request.HostedWebSearch, request.SearchQuery)
-	} else {
+	case wireChatCompletions:
 		result, err = canonicalFromChat(data, request.HostedWebSearch, request.SearchQuery)
+	default:
+		err = fmt.Errorf("unsupported translated protocol %q", request.Protocol)
 	}
 	if err != nil {
 		s.log.Printf("UP channel=%s canonical response error: %v", route.ChannelID, err)
 		writeJSONError(w, http.StatusBadGateway, "invalid upstream response: "+err.Error())
 		return
 	}
-	if request.Protocol == wireMessages {
-		s.replays.captureMessages(route.ChannelID, request.ReplayScope, data)
-	}
 	canonical := canonicalResponse(route, request, result)
-	restoreClientWebSearchAlias(canonical, request.ClientSearchAlias)
+	restoreClientWebSearchAlias(canonical, request.ClientSearchAlias, wireResponses)
 	backfillResponseSearchSources(canonical, request.HostedWebSearch, request.SearchQuery)
+	if err := validateResponsesEnvelope(canonical); err != nil {
+		writeJSONError(w, http.StatusBadGateway, "canonical response error: "+err.Error())
+		return
+	}
 	s.captureReasoningProvenance(route, canonical)
 	if request.Stream {
-		s.log.Printf("UP channel=%s backend=%s ignored stream=true; emitting buffered JSON fallback", route.ChannelID, route.APIBackend)
+		s.log.Printf("UP channel=%s backend=%s ignored stream=true; emitting buffered Responses fallback", route.ChannelID, protocolLabel(request.Protocol))
 	}
-	if writeErr := writeCanonicalResponse(w, canonical, request.Stream); writeErr != nil {
-		writeJSONError(w, http.StatusBadGateway, "canonical response error: "+writeErr.Error())
+	if err := writeCanonicalResponse(w, canonical, request.Stream); err != nil {
+		writeJSONError(w, http.StatusBadGateway, "canonical response error: "+err.Error())
 	}
+}
+
+func requestKindLabel(kind facadeRequestKind) string {
+	if kind == clientSearchRequest {
+		return "client_search"
+	}
+	return "native_session"
+}
+
+func setRetryDisposition(header http.Header, status int) {
+	if strings.TrimSpace(header.Get("X-Should-Retry")) != "" {
+		return
+	}
+	retry := status == http.StatusTooManyRequests || status == http.StatusInternalServerError ||
+		status == http.StatusBadGateway || status == http.StatusServiceUnavailable || status == http.StatusGatewayTimeout
+	header.Set("X-Should-Retry", fmt.Sprintf("%t", retry))
+}
+
+func (s *Server) normalizeResponsesJSON(data []byte, route config.Route, request facadeRequest) (map[string]any, []byte, error) {
+	data, err := restoreClientWebSearchAliasJSON(data, request.ClientSearchAlias, wireResponses)
+	if err != nil {
+		return nil, nil, fmt.Errorf("restore client search alias: %w", err)
+	}
+	options := patch.Options{GPTResponses: true, WebSearch: true, RequestModel: route.WireModel}
+	data, err = patch.PatchJSONBytesStrict(data, options)
+	if err != nil {
+		return nil, nil, err
+	}
+	root, err := decodeJSONMap(data)
+	if err != nil {
+		return nil, nil, err
+	}
+	backfillResponseSearchSources(root, request.HostedWebSearch, request.SearchQuery)
+	if err := validateResponsesEnvelope(root); err != nil {
+		return nil, nil, err
+	}
+	s.captureReasoningProvenance(route, root)
+	normalized, err := json.Marshal(root)
+	if err != nil {
+		return nil, nil, err
+	}
+	evidence := newSearchEvidence()
+	evidence.observeJSON(normalized)
+	s.logSearchEvidence(route.ChannelID, request, evidence)
+	return root, normalized, nil
+}
+
+func (s *Server) normalizeNativeJSON(
+	data []byte,
+	route config.Route,
+	request facadeRequest,
+	validate func(map[string]any) error,
+) (map[string]any, []byte, error) {
+	root, err := decodeJSONMap(data)
+	if err != nil {
+		return nil, nil, err
+	}
+	evidence := newSearchEvidence()
+	evidence.observeJSON(data)
+	if request.Protocol == wireMessages && request.HostedWebSearch {
+		stripMessagesHostedSearchBlocks(root)
+	}
+	if err := validate(root); err != nil {
+		return nil, nil, err
+	}
+	restoreClientWebSearchAlias(root, request.ClientSearchAlias, request.Protocol)
+	s.captureReasoningProvenance(route, root)
+	normalized, err := json.Marshal(root)
+	s.logSearchEvidence(route.ChannelID, request, evidence)
+	return root, normalized, err
+}
+
+func (s *Server) writeClientSearchResponse(w http.ResponseWriter, data []byte, route config.Route, request facadeRequest) {
+	var canonical map[string]any
+	var err error
+	if request.Protocol == wireResponses {
+		canonical, _, err = s.normalizeResponsesJSON(data, route, request)
+	} else {
+		var result canonicalResult
+		if request.Protocol == wireMessages {
+			result, err = canonicalFromMessages(data, true, request.SearchQuery)
+		} else {
+			result, err = canonicalFromChat(data, true, request.SearchQuery)
+		}
+		if err == nil {
+			canonical = canonicalResponse(route, request, result)
+			restoreClientWebSearchAlias(canonical, request.ClientSearchAlias, wireResponses)
+			backfillResponseSearchSources(canonical, true, request.SearchQuery)
+			err = validateResponsesEnvelope(canonical)
+		}
+		if err == nil {
+			s.captureReasoningProvenance(route, canonical)
+			evidence := newSearchEvidence()
+			encoded, _ := json.Marshal(canonical)
+			evidence.observeJSON(encoded)
+			s.logSearchEvidence(route.ChannelID, request, evidence)
+		}
+	}
+	if err == nil {
+		err = validateClientSearchOutput(canonical)
+	}
+	if err != nil {
+		s.log.Printf("UP channel=%s client search response error: %v", route.ChannelID, err)
+		writeJSONError(w, http.StatusBadGateway, "invalid upstream client search response: "+err.Error())
+		return
+	}
+	if err := writeCanonicalResponse(w, canonical, false); err != nil {
+		writeJSONError(w, http.StatusBadGateway, "canonical client search response: "+err.Error())
+	}
+}
+
+func validateClientSearchOutput(response map[string]any) error {
+	hasCompletedSearch := false
+	hasOutputText := false
+	for _, raw := range anySlice(response["output"]) {
+		item, _ := raw.(map[string]any)
+		switch stringValue(item["type"]) {
+		case "web_search_call":
+			hasCompletedSearch = hasCompletedSearch || stringValue(item["status"]) == "completed"
+		case "message":
+			for _, rawPart := range anySlice(item["content"]) {
+				part, _ := rawPart.(map[string]any)
+				if stringValue(part["type"]) == "output_text" && strings.TrimSpace(stringValue(part["text"])) != "" {
+					hasOutputText = true
+				}
+			}
+		}
+	}
+	if !hasCompletedSearch {
+		return fmt.Errorf("response contains no completed web_search_call; upstream may have ignored the search extension")
+	}
+	if !hasOutputText {
+		return fmt.Errorf("response contains no non-empty output_text")
+	}
+	return nil
+}
+
+func writeJSONBody(w http.ResponseWriter, status int, data []byte) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(data)))
+	w.WriteHeader(status)
+	_, _ = w.Write(data)
 }
 
 func readBodyLimited(reader io.Reader, limit int64) ([]byte, error) {
@@ -357,8 +533,6 @@ func routeHasCredential(route config.Route, incoming http.Header) bool {
 		headerValue(route.ExtraHeaders, "X-Api-Key") != "" {
 		return true
 	}
-	// Only an explicitly configured auth_provider may own an incoming token.
-	// A custom channel without that declaration must never inherit login OAuth.
 	_, ok := incomingProviderCredential(route, incoming)
 	return ok
 }
@@ -369,11 +543,17 @@ func routeUsesIncomingProviderAuth(route config.Route) bool {
 		headerValue(route.ExtraHeaders, "X-Api-Key") == ""
 }
 
-func applyRouteHeaders(header http.Header, route config.Route, incoming http.Header) {
+func applyRouteHeaders(header http.Header, route config.Route, protocol wireProtocol, incoming http.Header) {
 	header.Del("Authorization")
 	header.Del("X-Api-Key")
+	authScheme := route.AuthScheme
+	if protocol == wireMessages {
+		if native, _ := routeProtocol(route); native == wireChatCompletions && isOfficialDeepSeekHost(route.Host) {
+			authScheme = "x_api_key"
+		}
+	}
 	if route.APIKey != "" {
-		if route.AuthScheme == "x_api_key" {
+		if authScheme == "x_api_key" {
 			header.Set("X-Api-Key", route.APIKey)
 		} else {
 			header.Set("Authorization", "Bearer "+route.APIKey)
@@ -384,11 +564,20 @@ func applyRouteHeaders(header http.Header, route config.Route, incoming http.Hea
 	}
 	if token, ok := incomingProviderCredential(route, incoming); ok &&
 		header.Get("Authorization") == "" && header.Get("X-Api-Key") == "" {
-		if route.AuthScheme == "x_api_key" {
+		if authScheme == "x_api_key" {
 			header.Set("X-Api-Key", token)
 		} else {
 			header.Set("Authorization", "Bearer "+token)
 		}
+	}
+	if authScheme == "x_api_key" && header.Get("X-Api-Key") == "" {
+		if authorization := strings.TrimSpace(header.Get("Authorization")); authorization != "" {
+			token := strings.TrimSpace(strings.TrimPrefix(authorization, "Bearer "))
+			if token != "" {
+				header.Set("X-Api-Key", token)
+			}
+		}
+		header.Del("Authorization")
 	}
 }
 

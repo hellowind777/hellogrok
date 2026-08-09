@@ -244,13 +244,13 @@ func TestApplyTargetsAndRestoreExactConfig(t *testing.T) {
 	}
 
 	result, err := ApplyTargets(configPath, statePath, []Target{
-		{ID: "chat", APIBaseURL: true},
-		{ID: "inherited"},
+		{ID: "chat", APIBaseURL: true, APIBackend: "chat_completions"},
+		{ID: "inherited", APIBackend: "messages"},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.BaseURLs != 2 || result.APIBaseURLs != 1 || result.APIBackends != 2 ||
+	if result.BaseURLs != 2 || result.APIBaseURLs != 1 ||
 		result.BackendSearch != 1 || result.BackendTools != 1 || result.WebFetch != 1 || result.ValidatedTargets != 2 {
 		t.Fatalf("unexpected result: %#v", result)
 	}
@@ -263,7 +263,8 @@ func TestApplyTargetsAndRestoreExactConfig(t *testing.T) {
 		`base_url = "http://127.0.0.1:18787/c/chat"`,
 		`api_base_url = "http://127.0.0.1:18787/c/chat"`,
 		`base_url = "http://127.0.0.1:18787/c/inherited"`,
-		`api_backend = "responses"`,
+		`api_backend = "chat_completions"`,
+		`api_backend = "messages"`,
 		`supports_backend_search = false # user value`,
 		`backend_tools = true`,
 		`web_fetch = true # user value`,
@@ -288,7 +289,7 @@ func TestApplyTargetsAndRestoreExactConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if restored != 9 {
+	if restored != 7 {
 		t.Fatalf("restored fields = %d", restored)
 	}
 	finalBytes, _ := os.ReadFile(configPath)
@@ -669,7 +670,7 @@ func TestApplyTargetsPlacesBackendSearchAfterChannelConfiguration(t *testing.T) 
 	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ApplyTargets(configPath, statePath, []Target{{ID: "one", APIBaseURL: true}}); err != nil {
+	if _, err := ApplyTargets(configPath, statePath, []Target{{ID: "one", APIBaseURL: true, APIBackend: "chat_completions"}}); err != nil {
 		t.Fatal(err)
 	}
 	patched, err := os.ReadFile(configPath)
@@ -680,7 +681,7 @@ func TestApplyTargetsPlacesBackendSearchAfterChannelConfiguration(t *testing.T) 
 	if end := strings.Index(one, "\n[model.two]"); end >= 0 {
 		one = one[:end]
 	}
-	backend := strings.Index(one, `api_backend = "responses"`)
+	backend := strings.Index(one, `api_backend = "chat_completions"`)
 	key := strings.Index(one, `api_key = "test-key"`)
 	search := strings.Index(one, "supports_backend_search = false")
 	comment := strings.Index(one, "# keep this trailing channel comment")
@@ -733,7 +734,7 @@ func TestApplyTargetsPreservesExistingOrderAndAppendsMissingFields(t *testing.T)
 		t.Fatal(err)
 	}
 
-	if _, err := ApplyTargets(configPath, statePath, []Target{{ID: "one", APIBaseURL: true}}); err != nil {
+	if _, err := ApplyTargets(configPath, statePath, []Target{{ID: "one", APIBaseURL: true, APIBackend: "chat_completions"}}); err != nil {
 		t.Fatal(err)
 	}
 	patchedBytes, err := os.ReadFile(configPath)
@@ -766,7 +767,6 @@ func TestApplyTargetsPreservesExistingOrderAndAppendsMissingFields(t *testing.T)
 		`api_key = "test-key"`,
 		`base_url = "http://127.0.0.1:18787/c/one"`,
 		`api_base_url = "http://127.0.0.1:18787/c/one"`,
-		`api_backend = "responses"`,
 		"# keep model footer",
 	)
 
@@ -842,14 +842,14 @@ func TestApplyTargetsAppendsBelowFinalLineWithoutEndingAndRestoresExactly(t *tes
 		{
 			name: "features field",
 			original: "[model.one]\nbase_url = \"http://127.0.0.1:18787/c/one\"\n" +
-				"api_backend = \"responses\"\nsupports_backend_search = false\n\n[features]\nother = true",
+				"api_backend = \"chat_completions\"\nsupports_backend_search = false\n\n[features]\nother = true",
 			wantSequence: "other = true\nbackend_tools = true\nweb_fetch = true",
 		},
 		{
 			name: "subagent field",
 			original: "[features]\nbackend_tools = true\nweb_fetch = true\n\n" +
 				"[model.one]\nbase_url = \"http://127.0.0.1:18787/c/one\"\n" +
-				"api_backend = \"responses\"\nsupports_backend_search = false\n\n" +
+				"api_backend = \"chat_completions\"\nsupports_backend_search = false\n\n" +
 				"[subagents]\nmodel = \"one\"",
 			wantSequence: "model = \"one\"\nenabled = true",
 		},
@@ -982,7 +982,7 @@ func TestApplyTargetsFailsWhenModelSectionIsMissing(t *testing.T) {
 	}
 }
 
-func TestApplyTargetsNormalizesWrongTypedManagedValues(t *testing.T) {
+func TestApplyTargetsNormalizesWrongTypedManagedValuesWithoutChangingBackend(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.toml")
 	statePath := filepath.Join(dir, "state.json")
@@ -993,14 +993,14 @@ web_fetch = 1
 [model.one]
 base_url = "https://one.example/v1"
 api_base_url = 7 # invalid type
-api_backend = 42
+api_backend = "messages"
 supports_backend_search = false
 `
 	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
-	result, err := ApplyTargets(configPath, statePath, []Target{{ID: "one", APIBaseURL: true}})
+	result, err := ApplyTargets(configPath, statePath, []Target{{ID: "one", APIBaseURL: true, APIBackend: "messages"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1013,7 +1013,7 @@ supports_backend_search = false
 		"web_fetch = true",
 		`base_url = "http://127.0.0.1:18787/c/one"`,
 		`api_base_url = "http://127.0.0.1:18787/c/one"`,
-		`api_backend = "responses"`,
+		`api_backend = "messages"`,
 		"supports_backend_search = false",
 	} {
 		if !strings.Contains(string(patched), want) {
@@ -1100,7 +1100,7 @@ func TestRestoreAcceptsVersionFiveRewriteState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	encoded = bytes.Replace(encoded, []byte(`"version": 6`), []byte(`"version": 5`), 1)
+	encoded = bytes.Replace(encoded, []byte(`"version": 8`), []byte(`"version": 5`), 1)
 	if err := os.WriteFile(statePath, encoded, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -1113,6 +1113,83 @@ func TestRestoreAcceptsVersionFiveRewriteState(t *testing.T) {
 	}
 	if string(restored) != original {
 		t.Fatalf("version 5 state did not restore exactly: %q", restored)
+	}
+}
+
+func TestRestoreAcceptsVersionSevenRewriteState(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	statePath := filepath.Join(dir, "state.json")
+	original := "[model.one]\nbase_url = \"https://one.example/v1\"\napi_backend = \"messages\"\n"
+	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ApplyTargets(configPath, statePath, []Target{{ID: "one", APIBackend: "messages"}}); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded = bytes.Replace(encoded, []byte(`"version": 8`), []byte(`"version": 7`), 1)
+	if err := os.WriteFile(statePath, encoded, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Restore(configPath, statePath); err != nil {
+		t.Fatal(err)
+	}
+	restored, _ := os.ReadFile(configPath)
+	if string(restored) != original {
+		t.Fatalf("version 7 state did not restore exactly: %q", restored)
+	}
+}
+
+func TestApplyTargetsProjectsOnlyCapableNonResponsesBackends(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	statePath := filepath.Join(dir, "state.json")
+	original := strings.Join([]string{
+		"[model.messages]",
+		`base_url = "https://messages.example/v1"`,
+		`api_backend = "messages"`,
+		"supports_backend_search = true",
+		"",
+		"[model.chat]",
+		`base_url = "https://chat.example/v1"`,
+		`api_backend = "chat_completions"`,
+		"supports_backend_search = false",
+		"",
+	}, "\n")
+	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := ApplyTargets(configPath, statePath, []Target{
+		{ID: "messages", APIBackend: "messages", BuildAPIBackend: "responses", SupportsBackendSearch: true},
+		{ID: "chat", APIBackend: "chat_completions", BuildAPIBackend: "chat_completions"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.APIBackends != 1 {
+		t.Fatalf("api backend changes=%d, want 1", result.APIBackends)
+	}
+	patched, _ := os.ReadFile(configPath)
+	messages := sectionText(t, string(patched), "model.messages")
+	chat := sectionText(t, string(patched), "model.chat")
+	if !strings.Contains(messages, `api_backend = "responses"`) ||
+		!strings.Contains(messages, "supports_backend_search = true") {
+		t.Fatalf("capable Messages projection failed: %s", messages)
+	}
+	if !strings.Contains(chat, `api_backend = "chat_completions"`) ||
+		!strings.Contains(chat, "supports_backend_search = false") {
+		t.Fatalf("non-capable Chat backend changed: %s", chat)
+	}
+	if _, err := Restore(configPath, statePath); err != nil {
+		t.Fatal(err)
+	}
+	restored, _ := os.ReadFile(configPath)
+	if string(restored) != original {
+		t.Fatalf("projection restore was not exact\nwant: %q\ngot:  %q", original, restored)
 	}
 }
 
@@ -1274,6 +1351,52 @@ func TestRestoreRefusesToOverwriteManagedUserEdit(t *testing.T) {
 	}
 	if _, err := ApplyTargets(configPath, statePath, []Target{{ID: "one"}}); err == nil || !strings.Contains(err.Error(), "conflicts with config") {
 		t.Fatalf("reapply managed edit error = %v", err)
+	}
+}
+
+func TestRestorePreservesModelDeletedWhileProxyIsActive(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	statePath := filepath.Join(dir, "state.json")
+	original := "[features]\nbackend_tools = false\nweb_fetch = false\n\n" +
+		"[model.one]\nbase_url = \"https://one.example/v1\"\nsupports_backend_search = true\n\n" +
+		"[model.two]\nbase_url = \"https://two.example/v1\"\nsupports_backend_search = true\n"
+	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	targets := []Target{{ID: "one"}, {ID: "two"}}
+	if _, err := ApplyTargets(configPath, statePath, targets); err != nil {
+		t.Fatal(err)
+	}
+	patched, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := strings.Index(string(patched), "[model.one]\n")
+	if start < 0 {
+		t.Fatalf("patched model blocks not found: %q", patched)
+	}
+	endOffset := strings.Index(string(patched)[start:], "[model.two]\n")
+	if endOffset < 0 {
+		t.Fatalf("patched model blocks not found: %q", patched)
+	}
+	withoutOne := string(patched[:start]) + string(patched[start+endOffset:])
+	if err := os.WriteFile(configPath, []byte(withoutOne), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Restore(configPath, statePath); err != nil {
+		t.Fatal(err)
+	}
+	restored, _ := os.ReadFile(configPath)
+	expectedStart := strings.Index(original, "[model.one]\n")
+	expectedEndOffset := strings.Index(original[expectedStart:], "[model.two]\n")
+	expected := original[:expectedStart] + original[expectedStart+expectedEndOffset:]
+	if string(restored) != expected {
+		t.Fatalf("deleted model was reintroduced or remaining config was not restored\nwant: %q\ngot:  %q", expected, restored)
+	}
+	if _, err := os.Stat(statePath); !os.IsNotExist(err) {
+		t.Fatalf("rewrite state remains after safe partial restore: %v", err)
 	}
 }
 
