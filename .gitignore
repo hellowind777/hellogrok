@@ -35,6 +35,11 @@ secrets*.json
 /.grok/
 /.hellogrok/
 /config.toml
+/config.toml.*
+/auth.json
+/tokens.json
+/session.json
+/*.token
 /config_rewrite_state.json
 /reasoning_provenance.json
 /last_request.json

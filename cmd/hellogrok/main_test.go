@@ -604,7 +604,7 @@ func TestAppStopPreservesDeletedChannelAndRefreshesOnlyRemainingRoutes(t *testin
 	}
 }
 
-func TestAppStopKeepsServingWhenConflictStillReferencesHellogrok(t *testing.T) {
+func TestAppStopPreservesManagedConfigEdit(t *testing.T) {
 	dir := t.TempDir()
 	grokHome := filepath.Join(dir, "grok")
 	dataDir := filepath.Join(dir, "data")
@@ -628,8 +628,51 @@ func TestAppStopKeepsServingWhenConflictStillReferencesHellogrok(t *testing.T) {
 	if err := os.WriteFile(configPath, []byte(conflicted), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	if err := app.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	if app.IsRunning() {
+		t.Fatal("proxy remained active after its route was safely restored")
+	}
+	current, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := original + "supports_backend_search = true\n"
+	if string(current) != want {
+		t.Fatalf("managed edit was not preserved while stopping\nwant: %q\ngot:  %q", want, current)
+	}
+}
+
+func TestAppStopKeepsServingWhenRenamedModelStillReferencesHellogrok(t *testing.T) {
+	dir := t.TempDir()
+	grokHome := filepath.Join(dir, "grok")
+	dataDir := filepath.Join(dir, "data")
+	if err := os.MkdirAll(grokHome, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GROK_HOME", grokHome)
+	configPath := filepath.Join(grokHome, "config.toml")
+	original := "[model.one]\nbase_url = \"https://one.example/v1\"\napi_key = \"test-key\"\n"
+	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	server := proxy.New(log.New(io.Discard, "", 0))
+	server.PathAddr = "127.0.0.1:0"
+	app := &App{logger: log.New(io.Discard, "", 0), dataDir: dataDir, server: server}
+	if err := app.Start(); err != nil {
+		t.Fatal(err)
+	}
+	patched, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	renamed := strings.Replace(string(patched), "[model.one]", "[model.renamed]", 1)
+	if err := os.WriteFile(configPath, []byte(renamed), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if err := app.Stop(); err == nil {
-		t.Fatal("stop succeeded while an unresolved hellogrok route remained")
+		t.Fatal("stop succeeded while a renamed model still referenced hellogrok")
 	}
 	if !app.IsRunning() {
 		t.Fatal("proxy stopped while config still referenced it")

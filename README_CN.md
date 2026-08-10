@@ -6,7 +6,7 @@
 
 跨平台 Grok Build 本地代理，让自定义模型渠道兼容常见 API 格式、Build 原生 Web 工具、独立鉴权和自动配置恢复。
 
-[![Version](https://img.shields.io/badge/version-0.1.6-2f6feb.svg)](./internal/appinfo/appinfo.go)
+[![Version](https://img.shields.io/badge/version-0.1.7-2f6feb.svg)](./internal/appinfo/appinfo.go)
 [![Go](https://img.shields.io/badge/Go-1.26.5-00ADD8.svg)](./go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#平台支持)
@@ -79,7 +79,7 @@ hellogrok 为这些自定义渠道提供统一的本地兼容层。运行时准�
 - 避免把 Grok 官方登录令牌发送给无关的自定义渠道。
 - 加载配置时校验渠道请求头名称和值；请求分帧、内容和连接请求头仍由代理控制。
 - 代理启动时检查并临时补全 Grok 必需设置。
-- 正常停止、退出托盘、Ctrl+C、SIGTERM 或启动失败时恢复原始值。
+- 正常停止、退出托盘、Ctrl+C、SIGTERM 或启动失败时恢复未被用户改动的临时值，并通过字段级三方合并保留代理运行期间的用户修改。
 - 异常退出后可以使用 `hellogrok restore` 恢复代理管理的设置。
 
 ### 桌面与运维
@@ -255,7 +255,7 @@ Windows 的“状态与日志”分割工具条提供自动清理天数选择和
 
 **退出保护：** 当供应商管理工具仍持有 Grok Build 配置所有权时，托盘会推迟退出以避免留下孤立代理地址——先解决配置冲突再退出。
 
-代理运行期间删除整个模型渠道会被视为明确的用户操作：停止时保留该删除，同时恢复其余受管渠道和全局开关。只修改现有渠道中的单个代理受管字段仍会触发退出保护。
+代理运行期间产生的配置修改会在停止时按字段合并：仍等于 hellogrok 临时值的字段恢复为启动前值，用户改过的字段和已删除的模型渠道则原样保留。若合并后仍残留本次接管产生的 hellogrok 临时路由，或配置已无法安全解析，退出保护仍会生效。
 
 ### 与 CC Switch 兼容
 
@@ -394,6 +394,10 @@ Grok Build 在 `/model` 切换后会重放全部历史推理项，其中可能�
 ### 强制退出后配置仍指向 localhost
 
 先确认没有 hellogrok 进程正在运行，再执行 `hellogrok restore`。不要对正在运行的代理执行 `restore`。
+
+### 修改运行中的配置后仍无法停止或退出
+
+从 0.1.7 起，hellogrok 会在停止时逐字段合并代理受管配置，因此修改 `supports_backend_search` 等字段后无需手动回滚。若仍推迟退出，说明修改后的 TOML 无法解析，或改名/移动后的模型仍保留本次接管产生的 `127.0.0.1:18787` 临时路由。恢复有效的模型结构，或把该临时 URL 改成预期的上游 URL 后再停止；Grok Build 仍指向代理时不要强制结束进程。
 
 ### 端口 `18787` 已占用
 

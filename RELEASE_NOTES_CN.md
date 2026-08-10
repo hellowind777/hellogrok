@@ -1,13 +1,11 @@
-# 发布说明 — v0.1.6
+# 发布说明 — v0.1.7
 
-## Responses 托管搜索现在返回完整来源
+## 运行期间修改配置不再阻止安全退出
 
-当 Responses 渠道使用自身的托管 `web_search` 时，hellogrok 现在会请求供应商返回完整的 `web_search_call.action.sources` 元数据。原有 `include` 项会被保留，来源请求也只会追加一次，因此供应商专用的响应字段仍可正常使用。
+停止代理或退出托盘时，hellogrok 现在会对代理受管配置执行字段级三方合并。仍为 hellogrok 临时值的字段会恢复到启动前状态，代理运行期间被修改的值则原样保留。
 
-这些来源会进入 Grok Build 原生的去重站点数量统计，不再局限于回答正文中明确引用或实际打开的页面。
+这修复了代理运行期间修改 `supports_backend_search`、渠道 URL、功能开关或子代理设置后，托盘无法停止代理或退出的问题。删除整个模型渠道仍会被视为明确的用户操作并得到保留。
 
-## 所有受支持协议统一归一化来源元数据
+## 临时路由保护仍然生效
 
-Responses 供应商可能在响应顶层返回引用，Chat Completions 中转则可能使用 `annotations`、`citations`、`search_results` 或 `web_search_results`。hellogrok 现在会在流式和非流式响应中识别这些结构，并把已验证 URL 同时转换为 `web_search_call.action.sources` 与 `output_text.annotations`。
-
-因此，Responses、Messages 和 Chat Completions 渠道可以继续使用各自的托管搜索格式，同时向 Grok Build 输出一致的搜索调用、引用和来源数量。三种格式中的任意一种被设为 Grok Build 客户端搜索模型时，也会使用相同的来源归一化逻辑。
+停止服务器前，hellogrok 会检查合并后的配置是否残留本次接管产生的临时路由。若改名或移动后的模型仍指向 `127.0.0.1:18787`，代理会继续运行，避免 Grok Build 连接到已经停止的端点。TOML 无法解析或外部工具仍持有配置所有权时，退出也会继续推迟。

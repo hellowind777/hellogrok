@@ -267,6 +267,10 @@ func ActiveProxyReferences(configPath string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	return activeProxyReferences(raw)
+}
+
+func activeProxyReferences(raw []byte) ([]string, error) {
 	var root map[string]any
 	if err := toml.Unmarshal(raw, &root); err != nil {
 		return nil, fmt.Errorf("parse TOML: %w", err)
@@ -1001,8 +1005,9 @@ func Restore(configPath, statePath string) (int, error) {
 		}
 		return 0, nil
 	}
-	if err := validateRestorableConfig(raw, state); err != nil {
-		return 0, fmt.Errorf("config changed in a proxy-managed field; refusing to overwrite it: %w", err)
+	state, err = prepareRestoreState(raw, state)
+	if err != nil {
+		return 0, fmt.Errorf("prepare config restore: %w", err)
 	}
 	lines := splitKeepNL(string(raw))
 	structural := tomlStructuralLines(lines)
@@ -1039,6 +1044,13 @@ func Restore(configPath, statePath string) (int, error) {
 	restored += featureRestored
 	text, subagentRestored := restoreSubagentEnabled(text, state.Subagents)
 	restored += subagentRestored
+	remaining, err := unexpectedProxyReferences([]byte(text), state)
+	if err != nil {
+		return 0, fmt.Errorf("validate restored config: %w", err)
+	}
+	if len(remaining) != 0 {
+		return 0, fmt.Errorf("config still contains temporary hellogrok routes after preserving concurrent edits: %s", strings.Join(remaining, ", "))
+	}
 	if err := writeFileAtomic(configPath, []byte(text), existingFileMode(configPath, 0o600)); err != nil {
 		return 0, err
 	}
@@ -1151,6 +1163,141 @@ func managedSemanticValue(rendered string) string {
 		return decoded
 	}
 	return strings.TrimSpace(rendered)
+}
+
+// prepareRestoreState performs a field-level three-way merge. Values still at
+// hellogrok's applied value remain managed and are restored; values changed
+// while the proxy was active become user-owned and are preserved as written.
+func prepareRestoreState(raw []byte, state State) (State, error) {
+	var root map[string]any
+	if err := toml.Unmarshal(raw, &root); err != nil {
+		return State{}, fmt.Errorf("parse TOML: %w", err)
+	}
+
+	features, _ := root["features"].(map[string]any)
+	var err error
+	state.Features.BackendTools, _, err = managedStateForRestore("[features]", features, "backend_tools", state.Features.BackendTools)
+	if err != nil {
+		return State{}, err
+	}
+	state.Features.WebFetch, _, err = managedStateForRestore("[features]", features, "web_fetch", state.Features.WebFetch)
+	if err != nil {
+		return State{}, err
+	}
+
+	subagents, _ := root["subagents"].(map[string]any)
+	var preserveSubagentEdit bool
+	state.Subagents.Enabled, preserveSubagentEdit, err = managedStateForRestore("[subagents]", subagents, "enabled", state.Subagents.Enabled)
+	if err != nil {
+		return State{}, err
+	}
+	if preserveSubagentEdit {
+		state.Subagents.DottedLineCreated = false
+	}
+
+	models := ModelTables(root)
+	sectionLines := modelSectionLines(raw)
+	ids := make([]string, 0, len(state.Models))
+	for id := range state.Models {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		model := models[id]
+		if model == nil && sectionLines[id] == "" {
+			continue
+		}
+		modelState := state.Models[id]
+		if modelState.Section.Managed && sectionLines[id] != modelState.Section.AppliedLine {
+			modelState.Section.Managed = false
+		}
+		section := fmt.Sprintf("[model.%s]", id)
+		modelState.BaseURL, _, err = managedStateForRestore(section, model, "base_url", modelState.BaseURL)
+		if err != nil {
+			return State{}, err
+		}
+		modelState.APIBaseURL, _, err = managedStateForRestore(section, model, "api_base_url", modelState.APIBaseURL)
+		if err != nil {
+			return State{}, err
+		}
+		if modelState.APIBackend != nil {
+			apiBackend, _, fieldErr := managedStateForRestore(section, model, "api_backend", *modelState.APIBackend)
+			if fieldErr != nil {
+				return State{}, fieldErr
+			}
+			modelState.APIBackend = &apiBackend
+		}
+		modelState.BackendSearch, _, err = managedStateForRestore(section, model, "supports_backend_search", modelState.BackendSearch)
+		if err != nil {
+			return State{}, err
+		}
+		state.Models[id] = modelState
+	}
+	return state, nil
+}
+
+func unexpectedProxyReferences(raw []byte, state State) ([]string, error) {
+	var root map[string]any
+	if err := toml.Unmarshal(raw, &root); err != nil {
+		return nil, fmt.Errorf("parse TOML: %w", err)
+	}
+	models := ModelTables(root)
+	refs := make([]string, 0)
+	for id, model := range models {
+		modelState, recorded := state.Models[id]
+		for _, field := range []struct {
+			key   string
+			state ManagedLineState
+		}{
+			{key: "base_url", state: modelState.BaseURL},
+			{key: "api_base_url", state: modelState.APIBaseURL},
+		} {
+			endpoint, _ := model[field.key].(string)
+			if !IsProxyURL(endpoint) {
+				continue
+			}
+			if recorded && field.state.Present && field.state.OriginalLine != "" {
+				original, err := originalManagedValue(field.key, field.state.OriginalLine)
+				if err != nil {
+					return nil, err
+				}
+				originalEndpoint, _ := original.(string)
+				if endpoint == originalEndpoint {
+					continue
+				}
+			}
+			refs = append(refs, id+"."+field.key)
+		}
+	}
+	sort.Strings(refs)
+	return refs, nil
+}
+
+func managedStateForRestore(section string, table map[string]any, key string, state ManagedLineState) (ManagedLineState, bool, error) {
+	if !state.Managed {
+		return state, false, nil
+	}
+	if state.AppliedValue == "" {
+		return state, false, fmt.Errorf("rewrite state for %s.%s has no applied value", section, key)
+	}
+	current, exists := table[key]
+	if exists {
+		var value string
+		switch typed := current.(type) {
+		case string:
+			value = typed
+		case bool:
+			value = fmt.Sprintf("%t", typed)
+		default:
+			state.Managed = false
+			return state, true, nil
+		}
+		if value == state.AppliedValue {
+			return state, false, nil
+		}
+	}
+	state.Managed = false
+	return state, true, nil
 }
 
 func validateRestorableConfig(raw []byte, state State) error {

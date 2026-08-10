@@ -523,7 +523,7 @@ func TestApplyTargetsRejectsInlineSubagentTableWithoutWriting(t *testing.T) {
 	}
 }
 
-func TestSubagentRepairCrashRecoveryAndManagedEditConflict(t *testing.T) {
+func TestSubagentRepairCrashRecoveryAndManagedEditMerge(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.toml")
 	statePath := filepath.Join(dir, "state.json")
@@ -564,12 +564,15 @@ func TestSubagentRepairCrashRecoveryAndManagedEditConflict(t *testing.T) {
 	if err := os.WriteFile(configPath, []byte(userEdited), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Restore(configPath, statePath); err == nil || !strings.Contains(err.Error(), "refusing to overwrite") {
-		t.Fatalf("managed subagent edit restore error = %v", err)
+	if _, err := Restore(configPath, statePath); err != nil {
+		t.Fatal(err)
 	}
 	current, _ = os.ReadFile(configPath)
-	if string(current) != userEdited {
-		t.Fatalf("managed subagent edit was overwritten: %q", current)
+	if !strings.Contains(string(current), "[subagents]\nenabled = false\n") {
+		t.Fatalf("managed subagent edit was not preserved: %q", current)
+	}
+	if !strings.Contains(string(current), `base_url = "https://one.example/v1"`) || strings.Contains(string(current), "127.0.0.1:18787") {
+		t.Fatalf("proxy route was not restored after preserving subagent edit: %q", current)
 	}
 }
 
@@ -1317,7 +1320,7 @@ func TestApplyTargetsIsIdempotentAndStillRestoresOriginal(t *testing.T) {
 	}
 }
 
-func TestRestoreRefusesToOverwriteManagedUserEdit(t *testing.T) {
+func TestRestorePreservesManagedUserEdit(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.toml")
 	statePath := filepath.Join(dir, "state.json")
@@ -1339,18 +1342,74 @@ func TestRestoreRefusesToOverwriteManagedUserEdit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := Restore(configPath, statePath); err == nil || !strings.Contains(err.Error(), "refusing to overwrite") {
-		t.Fatalf("managed edit restore error = %v", err)
-	}
-	current, _ := os.ReadFile(configPath)
-	if string(current) != userEdited {
-		t.Fatalf("managed user edit was overwritten: %q", current)
-	}
-	if _, err := os.Stat(statePath); err != nil {
-		t.Fatalf("state must remain after restore conflict: %v", err)
-	}
 	if _, err := ApplyTargets(configPath, statePath, []Target{{ID: "one"}}); err == nil || !strings.Contains(err.Error(), "conflicts with config") {
 		t.Fatalf("reapply managed edit error = %v", err)
+	}
+	if _, err := Restore(configPath, statePath); err != nil {
+		t.Fatal(err)
+	}
+	current, _ := os.ReadFile(configPath)
+	want := "[model.one]\nbase_url = \"https://new-user-value.example/v1\"\n"
+	if string(current) != want {
+		t.Fatalf("managed user edit was not preserved while other fields were restored\nwant: %q\ngot:  %q", want, current)
+	}
+	if _, err := os.Stat(statePath); !os.IsNotExist(err) {
+		t.Fatalf("state remains after merged restore: %v", err)
+	}
+}
+
+func TestRestorePreservesBackendSearchEditWhileRestoringProxyRoute(t *testing.T) {
+	tests := []struct {
+		name     string
+		original string
+		want     string
+	}{
+		{
+			name:     "new user setting",
+			original: "[model.one]\nbase_url = \"https://one.example/v1\"\n",
+			want:     "[model.one]\nbase_url = \"https://one.example/v1\"\nsupports_backend_search = true\n",
+		},
+		{
+			name:     "restored original setting",
+			original: "[model.one]\nbase_url = \"https://one.example/v1\"\nsupports_backend_search = true\n",
+			want:     "[model.one]\nbase_url = \"https://one.example/v1\"\nsupports_backend_search = true\n",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			configPath := filepath.Join(dir, "config.toml")
+			statePath := filepath.Join(dir, "state.json")
+			if err := os.WriteFile(configPath, []byte(test.original), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := ApplyTargets(configPath, statePath, []Target{{ID: "one"}}); err != nil {
+				t.Fatal(err)
+			}
+			patched, err := os.ReadFile(configPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			userEdited := strings.Replace(string(patched), "supports_backend_search = false", "supports_backend_search = true", 1)
+			if userEdited == string(patched) {
+				t.Fatalf("backend search projection was not applied: %q", patched)
+			}
+			if err := os.WriteFile(configPath, []byte(userEdited), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := Restore(configPath, statePath); err != nil {
+				t.Fatal(err)
+			}
+			current, _ := os.ReadFile(configPath)
+			if string(current) != test.want {
+				t.Fatalf("merged restore mismatch\nwant: %q\ngot:  %q", test.want, current)
+			}
+			refs, err := ActiveProxyReferences(configPath)
+			if err != nil || len(refs) != 0 {
+				t.Fatalf("proxy references after merged restore: refs=%v err=%v", refs, err)
+			}
+		})
 	}
 }
 

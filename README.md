@@ -6,7 +6,7 @@
 
 A cross-platform local proxy that makes Grok Build custom model channels work with common API formats, native Web tools, isolated authentication, and automatic configuration recovery.
 
-[![Version](https://img.shields.io/badge/version-0.1.6-2f6feb.svg)](./internal/appinfo/appinfo.go)
+[![Version](https://img.shields.io/badge/version-0.1.7-2f6feb.svg)](./internal/appinfo/appinfo.go)
 [![Go](https://img.shields.io/badge/Go-1.26.5-00ADD8.svg)](./go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#platform-support)
@@ -79,7 +79,7 @@ It is intended for users who maintain multiple third-party model channels and wa
 - Prevents an official Grok login token from being sent to an unrelated custom channel.
 - Validates channel-owned header names and values while loading configuration. Request framing, content, and connection headers remain controlled by the proxy.
 - Checks and temporarily completes required Grok settings when the proxy starts.
-- Restores original values on normal stop, tray exit, Ctrl+C, SIGTERM, or failed startup.
+- On normal stop, tray exit, Ctrl+C, SIGTERM, or failed startup, restores untouched temporary values while preserving concurrent user edits through a field-level three-way merge.
 - Recovers proxy-managed settings after an unclean exit with `hellogrok restore`.
 
 ### Desktop and operations
@@ -255,7 +255,7 @@ On Windows, the divider in **Status and logs** contains a retention selector and
 
 **Quit protection**: When a provider manager still owns Grok Build's configuration, the tray defers exit to avoid leaving an orphaned proxy route — resolve the configuration conflict first, then quit.
 
-Deleting an entire model channel while the proxy is active is treated as an explicit user action: shutdown preserves that deletion and restores the remaining managed channels and global flags. Editing only a proxy-managed field inside an existing channel still triggers quit protection.
+Configuration edits made while the proxy is active are merged field by field during shutdown. Values still matching hellogrok's temporary projection are restored to their startup values, while user-edited values and deleted model channels are preserved. Shutdown remains deferred when the merged configuration would leave one of the current takeover's temporary hellogrok routes behind or cannot be parsed safely.
 
 ### Compatibility with CC Switch
 
@@ -394,6 +394,10 @@ Grok Build replays all historical reasoning items, including provider-encrypted 
 ### The configuration still points to localhost after a forced exit
 
 Ensure no hellogrok process is running, then execute `hellogrok restore`. Do not run `restore` against an active proxy.
+
+### Stop or exit is deferred after editing the active configuration
+
+Version 0.1.7 and later merge proxy-managed fields individually during shutdown, so an edit such as changing `supports_backend_search` no longer needs to be rolled back. If shutdown is still deferred, the edited TOML is invalid or a renamed/moved model still contains one of the current takeover's temporary `127.0.0.1:18787` routes. Restore a valid model structure or replace that temporary URL with the intended upstream URL, then stop again; do not force-terminate the process while Grok Build still points at it.
 
 ### Port `18787` is already in use
 

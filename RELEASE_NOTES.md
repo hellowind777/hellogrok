@@ -1,13 +1,11 @@
-# Release Notes — v0.1.6
+# Release Notes — v0.1.7
 
-## Responses hosted search now returns complete sources
+## Active configuration edits no longer block safe shutdown
 
-When a Responses channel uses its own hosted `web_search`, hellogrok now requests the provider's complete `web_search_call.action.sources` metadata. Existing `include` entries are preserved and the source request is added only once, so provider-specific response fields continue to work unchanged.
+Stopping the proxy or exiting the tray now performs a field-level three-way merge of proxy-managed configuration. Fields that still contain hellogrok's temporary values are restored to their startup state, while values changed during the active session are preserved.
 
-This supplies the source list that Grok Build consumes for its native deduplicated site count, rather than limiting the interface to pages explicitly cited or opened in the answer.
+This fixes the case where changing `supports_backend_search`, a channel URL, a feature flag, or the subagent setting while the proxy was running could leave the tray unable to stop or exit. Deleting an entire model channel remains an explicit user change and is also preserved.
 
-## Source metadata is normalized across every supported protocol
+## Temporary route protection remains enforced
 
-Responses providers may return citations at the response level, while Chat Completions relays may use `annotations`, `citations`, `search_results`, or `web_search_results`. hellogrok now recognizes these structures in both streaming and non-streaming responses and converts their verified URLs into `web_search_call.action.sources` and `output_text.annotations`.
-
-Responses, Messages, and Chat Completions channels therefore retain their own hosted-search format while producing the same Grok Build search-call, citation, and source-count representation. The same normalization also applies when any of the three formats is selected as Grok Build's client-search model.
+Before stopping the server, hellogrok validates the merged configuration for temporary routes introduced by the current takeover. A renamed or moved model that still points to `127.0.0.1:18787` keeps the proxy active instead of leaving Grok Build connected to a stopped endpoint. Invalid TOML and active external configuration ownership continue to defer shutdown.

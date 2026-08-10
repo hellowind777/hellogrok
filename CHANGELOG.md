@@ -6,6 +6,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.1.7] — 2026-08-10
+
+### Fixed
+
+- Stopping or quitting now three-way merges proxy-managed configuration fields, preserving edits such as `supports_backend_search`, channel URLs, feature flags, subagent settings, and deleted model channels while restoring untouched temporary values.
+- Shutdown now validates the merged configuration and keeps the proxy active if a renamed or moved model would retain a temporary route from the current takeover.
+
 ## [0.1.6] — 2026-08-10
 
 ### Changed
@@ -142,7 +149,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - CC Switch compatibility detection and conflict warnings.
 - Builds for Windows, Linux, and macOS on amd64 and arm64.
 
-[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.6...HEAD
+[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.7...HEAD
+[0.1.7]: https://github.com/hellowind777/hellogrok/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/hellowind777/hellogrok/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/hellowind777/hellogrok/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/hellowind777/hellogrok/compare/v0.1.3...v0.1.4
