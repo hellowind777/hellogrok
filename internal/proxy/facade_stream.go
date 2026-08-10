@@ -1411,7 +1411,7 @@ func urlsFromJSON(value any) []string {
 		case map[string]any:
 			for key, child := range typed {
 				key = strings.ToLower(key)
-				nextContext := urlContext || key == "url" || key == "uri" || key == "citations" || key == "annotations" || key == "sources" || key == "search_results" || key == "results"
+				nextContext := urlContext || key == "url" || key == "uri" || isSearchSourceContainer(key)
 				walk(child, nextContext)
 			}
 		case []any:

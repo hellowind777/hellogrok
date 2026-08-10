@@ -6,7 +6,7 @@
 
 跨平台 Grok Build 本地代理，让自定义模型渠道兼容常见 API 格式、Build 原生 Web 工具、独立鉴权和自动配置恢复。
 
-[![Version](https://img.shields.io/badge/version-0.1.5-2f6feb.svg)](./internal/appinfo/appinfo.go)
+[![Version](https://img.shields.io/badge/version-0.1.6-2f6feb.svg)](./internal/appinfo/appinfo.go)
 [![Go](https://img.shields.io/badge/Go-1.26.5-00ADD8.svg)](./go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#平台支持)
@@ -65,7 +65,7 @@ hellogrok 为这些自定义渠道提供统一的本地兼容层。运行时准�
 
 - 支持 hosted 和客户端搜索两种 Grok Build 原生 `web_search` 工作流。
 - 当 `supports_backend_search = true` 时，三种格式都使用当前渠道自身的 hosted 搜索：Responses 直接转发，Messages 使用 `web_search_20250305`，Chat 使用配置的搜索方言或协议桥接。
-- 对启用能力的渠道，Grok Build 始终收到规范的 Responses 搜索事件，包括已完成的 `web_search_call`、已验证来源、引用、用量和原生去重站点数。
+- 对启用能力的渠道，Grok Build 始终收到规范的 Responses 搜索事件，包括已完成的 `web_search_call`、已验证来源、引用、用量和原生去重站点数。对于 Responses 供应商，代理会请求完整的 `web_search_call.action.sources` 元数据，同时保留已有的 `include` 项；供应商顶层引用及 Chat 的注解/搜索结果容器会归一化到同一套规范来源字段。
 - 当 `supports_backend_search = false` 时，Grok Build 改用客户端 `web_search`。三种后端仍都可被选为客户端搜索模型；代理只适配 Grok Build 固定的非流式 WebSearchClient 请求。
 - 将适配后搜索结果中的真实 URL 同时写入 `web_search_call.action.sources` 与 `output_text.annotations`；只有响应能独立证明已执行搜索时，才会使用最终回答中的有效链接。Grok Build 因此可显示原生去重站点数。
 - 只有上游能独立证明搜索已完成并同时返回非空回答文本时，适配后的客户端搜索才会成功。静默忽略搜索扩展的供应商会收到不可重试的 `502`；hellogrok 无法为此类渠道凭空生成搜索能力。
@@ -369,7 +369,7 @@ Responses 供应商继续使用 Responses。Messages 供应商接收 Messages �
 
 对于流式请求，hellogrok 会向选定的供应商 API 发送 `stream=true`。未启用能力的渠道保持原生 SSE；启用能力的 Messages 和 Chat 渠道会被增量转换成 Responses 事件，使 Grok Build 能消费推理、文本、函数调用、`web_search_call`、来源和终止状态。日志若提示缓冲回退，说明上游只返回了一次性完整 JSON，本次请求无法实现真正流式。
 
-当前 Grok Build 有两条 Responses 来源展示路径：hosted 搜索读取 `web_search_call.action.sources`，客户端 `web_search` 工具读取 `output_text.annotations` 中的 URL 引用。WebSearchClient 适配器会把任一支持搜索后端的已验证 URL 写入两种结构：优先使用结构化结果和引用；只有响应能独立证明已执行搜索时，才从最终回答恢复有效 HTTP(S) 链接。普通回答链接不会凭空创建搜索调用。如果供应商没有返回真实 URL，仍可显示搜索活动，但不能伪造可信站点数。
+当前 Grok Build 有两条 Responses 来源展示路径：hosted 搜索读取 `web_search_call.action.sources`，客户端 `web_search` 工具读取 `output_text.annotations` 中的 URL 引用。转发 Responses hosted 搜索前，hellogrok 会在不覆盖调用方现有内容的前提下把 `web_search_call.action.sources` 加入 `include`，让兼容供应商返回所有实际参考的 URL，而不只是在正文中引用或实际打开的页面。Responses 顶层 `citations`、Messages 搜索结果/引用块，以及 Chat 的 `annotations`、`citations`、`search_results` 或 `web_search_results` 都会归一化到 Grok Build 的两条展示路径。WebSearchClient 适配器复用相同逻辑；只有响应能独立证明已执行搜索时，才从最终回答恢复有效 HTTP(S) 链接。普通回答链接不会凭空创建搜索调用。如果供应商没有返回真实 URL，仍可显示搜索活动，但不能伪造可信站点数。
 
 ### 出现 `unknown variant keepalive` 或持续 `Waiting for response...`
 

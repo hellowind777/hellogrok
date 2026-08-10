@@ -6,7 +6,7 @@
 
 A cross-platform local proxy that makes Grok Build custom model channels work with common API formats, native Web tools, isolated authentication, and automatic configuration recovery.
 
-[![Version](https://img.shields.io/badge/version-0.1.5-2f6feb.svg)](./internal/appinfo/appinfo.go)
+[![Version](https://img.shields.io/badge/version-0.1.6-2f6feb.svg)](./internal/appinfo/appinfo.go)
 [![Go](https://img.shields.io/badge/Go-1.26.5-00ADD8.svg)](./go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#platform-support)
@@ -65,7 +65,7 @@ It is intended for users who maintain multiple third-party model channels and wa
 
 - Supports Grok Build's native `web_search` workflow for hosted and client-search modes.
 - With `supports_backend_search = true`, every supported format uses the current channel's own hosted search: Responses passes through, Messages receives `web_search_20250305`, and Chat uses its configured search dialect or protocol bridge.
-- The Grok Build side always receives canonical Responses search events for a capable channel, including completed `web_search_call` items, verified sources, citations, usage, and the native deduplicated site count.
+- The Grok Build side always receives canonical Responses search events for a capable channel, including completed `web_search_call` items, verified sources, citations, usage, and the native deduplicated site count. Responses providers are asked for complete `web_search_call.action.sources` metadata while existing `include` entries are preserved; provider-level citations and Chat annotations/search-result containers are normalized into the same canonical source fields.
 - With `supports_backend_search = false`, Grok Build uses client `web_search` instead. Any of the three backends can still be selected as that client-search model; the proxy adapts only Grok Build's fixed non-streaming WebSearchClient request.
 - Preserves real search URLs from adapted search results in both `web_search_call.action.sources` and `output_text.annotations`, including valid final-answer links only when the response independently confirms that search ran. This lets Grok Build display its native deduplicated site count.
 - Accepts an adapted client-search response only when the upstream independently proves that search completed and also returns non-empty answer text. Providers that silently ignore their search extension receive a non-retryable `502`; hellogrok cannot manufacture search capability for such a channel.
@@ -369,7 +369,7 @@ Restart the proxy with the current build. Some Messages-compatible relays omit t
 
 For a streaming request, hellogrok sends `stream=true` to the selected provider API. Non-capable channels keep native SSE. Capable Messages and Chat channels are translated incrementally into Responses events so Grok Build can consume reasoning, text, function calls, `web_search_call`, sources, and terminal status. If the log reports a buffered fallback, the upstream returned one complete JSON response and true streaming was unavailable for that request.
 
-Current Grok Build has two Responses source paths: hosted search reads `web_search_call.action.sources`, while its client `web_search` tool reads URL citations from `output_text.annotations`. The WebSearchClient adapter writes verified URLs from any supported search backend to both forms, first using structured results and citations and, only when search execution is independently confirmed, recovering valid HTTP(S) links from the final answer. A normal answer link does not create a search call. If a provider returns no real URL, search activity can still be shown but a trustworthy site count cannot be fabricated.
+Current Grok Build has two Responses source paths: hosted search reads `web_search_call.action.sources`, while its client `web_search` tool reads URL citations from `output_text.annotations`. Before forwarding Responses hosted search, hellogrok adds `web_search_call.action.sources` to `include` without replacing caller entries, so compatible providers return every consulted URL rather than only cited or opened pages. Responses-level `citations`, Messages search-result/citation blocks, and Chat `annotations`, `citations`, `search_results`, or `web_search_results` are normalized into both Grok Build paths. The WebSearchClient adapter uses the same normalization and, only when search execution is independently confirmed, recovers valid HTTP(S) links from the final answer. A normal answer link does not create a search call. If a provider returns no real URL, search activity can still be shown but a trustworthy site count cannot be fabricated.
 
 ### `unknown variant keepalive` or an endless `Waiting for response...`
 

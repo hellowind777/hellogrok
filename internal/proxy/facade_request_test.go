@@ -216,6 +216,48 @@ func TestResponsesHostedSearchIsProtocolLocal(t *testing.T) {
 	if request.BuildXSearch != 0 || summarizeXSearch(root) != 0 {
 		t.Fatalf("non-xAI route gained x_search: %#v", root)
 	}
+	includes := anySlice(root["include"])
+	if len(includes) != 1 || includes[0] != responsesWebSearchSourcesInclude {
+		t.Fatalf("Responses hosted search did not request source metadata: %#v", root)
+	}
+}
+
+func TestResponsesHostedSearchPreservesExistingIncludes(t *testing.T) {
+	body := []byte(`{
+		"input":"search current news",
+		"tools":[{"type":"web_search"}],
+		"include":["reasoning.encrypted_content"]
+	}`)
+	request, err := adaptFacadeRequest(body, config.Route{
+		ChannelID: "responses", APIBackend: "responses", WireModel: "wire",
+		SupportsBackendSearch: true,
+	}, wireResponses)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, _ := decodeRequestObject(request.Body)
+	includes := anySlice(root["include"])
+	if len(includes) != 2 || includes[0] != "reasoning.encrypted_content" ||
+		includes[1] != responsesWebSearchSourcesInclude {
+		t.Fatalf("Responses include list changed: %#v", includes)
+	}
+	if includeResponsesWebSearchSources(root) {
+		t.Fatal("Responses source metadata was appended twice")
+	}
+	if includes = anySlice(root["include"]); len(includes) != 2 {
+		t.Fatalf("Responses include list contains duplicates: %#v", includes)
+	}
+
+	ordinary, err := adaptFacadeRequest([]byte(`{"input":"hello"}`), config.Route{
+		ChannelID: "responses", APIBackend: "responses", WireModel: "wire",
+	}, wireResponses)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ordinaryRoot, _ := decodeRequestObject(ordinary.Body)
+	if ordinaryRoot["include"] != nil {
+		t.Fatalf("ordinary Responses request gained search metadata: %#v", ordinaryRoot)
+	}
 }
 
 func TestCapableMessagesConsumesResponsesAndUsesHostedSearch(t *testing.T) {

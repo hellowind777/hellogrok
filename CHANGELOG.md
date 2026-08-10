@@ -6,6 +6,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.1.6] — 2026-08-10
+
+### Changed
+
+- The local Windows build helper now leaves `dist/` with only `hellogrok.exe` and `hellogrok-cli.exe`; tagged GitHub releases continue to publish platform-specific artifacts and their verification files.
+
+### Fixed
+
+- Responses hosted search now requests complete `web_search_call.action.sources` metadata without replacing or duplicating existing `include` entries.
+- Responses-level citations and Chat `annotations`, `citations`, `search_results`, and `web_search_results` containers are normalized in streaming and non-streaming output to both Grok Build source paths, allowing hosted and configured client search across all three supported protocols to report native deduplicated site counts.
+
 ## [0.1.5] — 2026-08-10
 
 ### Added
@@ -131,7 +142,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - CC Switch compatibility detection and conflict warnings.
 - Builds for Windows, Linux, and macOS on amd64 and arm64.
 
-[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.5...HEAD
+[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.6...HEAD
+[0.1.6]: https://github.com/hellowind777/hellogrok/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/hellowind777/hellogrok/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/hellowind777/hellogrok/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/hellowind777/hellogrok/compare/v0.1.1...v0.1.3

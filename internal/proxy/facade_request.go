@@ -202,6 +202,7 @@ func adaptFacadeRequestWithReasoning(
 		}
 		switch request.Protocol {
 		case wireResponses:
+			includeResponsesWebSearchSources(root)
 			request.Body, err = encodeRequestObject(root)
 		case wireMessages:
 			var converted map[string]any
@@ -450,6 +451,43 @@ func hasHostedSearchTool(root map[string]any) bool {
 		}
 	}
 	return false
+}
+
+const responsesWebSearchSourcesInclude = "web_search_call.action.sources"
+
+// includeResponsesWebSearchSources asks a Responses provider for every URL
+// consulted by hosted search, which lets Grok Build render native site counts.
+func includeResponsesWebSearchSources(root map[string]any) bool {
+	if root == nil {
+		return false
+	}
+	hasWebSearch := false
+	for _, raw := range anySlice(root["tools"]) {
+		tool, _ := raw.(map[string]any)
+		if tool != nil && isHostedWebSearchType(stringValue(tool["type"])) {
+			hasWebSearch = true
+			break
+		}
+	}
+	if !hasWebSearch {
+		return false
+	}
+
+	var includes []any
+	if raw, exists := root["include"]; exists && raw != nil {
+		var ok bool
+		includes, ok = raw.([]any)
+		if !ok {
+			return false
+		}
+	}
+	for _, value := range includes {
+		if stringValue(value) == responsesWebSearchSourcesInclude {
+			return false
+		}
+	}
+	root["include"] = append(includes, responsesWebSearchSourcesInclude)
+	return true
 }
 
 func responsesToMessagesRequest(root map[string]any) (map[string]any, error) {

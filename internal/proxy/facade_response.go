@@ -436,8 +436,8 @@ func chatSearchExecuted(root, choice, message map[string]any, urls []string) boo
 		return true
 	}
 	for _, values := range []map[string]any{root, choice, message} {
-		for _, key := range []string{"search_results", "web_search_results", "sources", "citations", "annotations"} {
-			if nonEmptyJSONValue(values[key]) {
+		for key, value := range values {
+			if isSearchSourceContainer(key) && nonEmptyJSONValue(value) {
 				return true
 			}
 		}
@@ -755,14 +755,15 @@ func collectCitationURLs(values ...map[string]any) []string {
 		switch v := value.(type) {
 		case map[string]any:
 			for key, child := range v {
-				if (key == "url" || key == "uri") && stringValue(child) != "" {
+				normalizedKey := strings.ToLower(key)
+				if (normalizedKey == "url" || normalizedKey == "uri") && stringValue(child) != "" {
 					u := stringValue(child)
 					if strings.HasPrefix(u, "http") && !seen[u] {
 						seen[u] = true
 						urls = append(urls, u)
 					}
 				}
-				if key == "citations" || key == "annotations" || key == "search_results" || key == "sources" {
+				if isSearchSourceContainer(normalizedKey) {
 					walk(child)
 				}
 			}
@@ -782,6 +783,15 @@ func collectCitationURLs(values ...map[string]any) []string {
 	}
 	sort.Strings(urls)
 	return urls
+}
+
+func isSearchSourceContainer(key string) bool {
+	switch strings.ToLower(key) {
+	case "citations", "annotations", "sources", "search_results", "web_search_results", "results":
+		return true
+	default:
+		return false
+	}
 }
 
 func citationsToAnnotations(value any) []any {
@@ -818,7 +828,7 @@ func backfillResponseSearchSources(response map[string]any, hosted bool, query s
 	}
 
 	var calls []map[string]any
-	var structuredURLs []string
+	structuredURLs := collectCitationURLs(response)
 	var textURLs []string
 	firstMessage := len(output)
 	for index, raw := range output {

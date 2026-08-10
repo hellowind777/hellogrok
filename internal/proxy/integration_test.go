@@ -345,6 +345,64 @@ func TestMessagesHostedSearchStreamConvertsToResponsesSearchEvents(t *testing.T)
 	}
 }
 
+func TestResponsesAndChatSearchStreamsPreserveSourceMetadata(t *testing.T) {
+	t.Run("responses_top_level_citations", func(t *testing.T) {
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+			wire, _ := io.ReadAll(request.Body)
+			root, _ := decodeRequestObject(wire)
+			includes := anySlice(root["include"])
+			if len(includes) != 1 || includes[0] != responsesWebSearchSourcesInclude {
+				t.Errorf("Responses source include missing: %#v", root)
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w,
+				`data: {"type":"response.created","response":{"id":"resp_1","object":"response","status":"in_progress","model":"wire","output":[]}}`+"\n\n"+
+					`data: {"type":"response.completed","response":{"id":"resp_1","object":"response","status":"completed","model":"wire","output":[{"type":"web_search_call","id":"ws_1","status":"completed","action":{"type":"search","query":"news","sources":[]}},{"type":"message","id":"msg_1","status":"completed","role":"assistant","content":[{"type":"output_text","text":"answer","annotations":[]}]}],"citations":["https://responses.example/source"]}}`+"\n\n")
+		}))
+		defer upstream.Close()
+
+		route := facadeRoute("responses-source-stream", "responses", "wire", "key", upstream.URL)
+		route.SupportsBackendSearch = true
+		s := New(log.New(io.Discard, "", 0))
+		s.SetRoutes([]config.Route{route})
+		startPathTestServer(t, s)
+		data, status := postFacade(t, s, route.ChannelID, []byte(`{"input":"search news","stream":true}`), "")
+		if status != http.StatusOK || !bytes.Contains(data, []byte("response.completed")) ||
+			!bytes.Contains(data, []byte(`"sources":[{"type":"url","url":"https://responses.example/source"}]`)) ||
+			!bytes.Contains(data, []byte(`"annotations":[{"end_index":0,"start_index":0,"title":"https://responses.example/source","type":"url_citation","url":"https://responses.example/source"}]`)) {
+			t.Fatalf("status=%d stream=%s", status, data)
+		}
+	})
+
+	t.Run("chat_web_search_results", func(t *testing.T) {
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+			wire, _ := io.ReadAll(request.Body)
+			root, _ := decodeRequestObject(wire)
+			if root["web_search_options"] == nil {
+				t.Errorf("Chat hosted search options missing: %#v", root)
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w,
+				`data: {"id":"chat_1","object":"chat.completion.chunk","model":"wire","choices":[{"index":0,"delta":{"role":"assistant","content":"answer"},"finish_reason":null}]}`+"\n\n"+
+					`data: {"id":"chat_1","object":"chat.completion.chunk","model":"wire","choices":[{"index":0,"delta":{"web_search_results":[{"url":"https://chat.example/source"}]},"finish_reason":"stop"}]}`+"\n\n"+
+					`data: {"id":"chat_1","object":"chat.completion.chunk","model":"wire","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1,"web_search_requests":1}}`+"\n\n"+
+					"data: [DONE]\n\n")
+		}))
+		defer upstream.Close()
+
+		route := facadeRoute("chat-source-stream", "chat_completions", "wire", "key", upstream.URL)
+		route.SupportsBackendSearch = true
+		s := New(log.New(io.Discard, "", 0))
+		s.SetRoutes([]config.Route{route})
+		startPathTestServer(t, s)
+		data, status := postFacade(t, s, route.ChannelID, []byte(`{"input":"search news","stream":true}`), "")
+		if status != http.StatusOK || !bytes.Contains(data, []byte("response.web_search_call.completed")) ||
+			!bytes.Contains(data, []byte("https://chat.example/source")) || !bytes.Contains(data, []byte("url_citation")) {
+			t.Fatalf("status=%d stream=%s", status, data)
+		}
+	})
+}
+
 func TestWrongSessionProtocolIsRejectedWithoutCallingUpstream(t *testing.T) {
 	var calls atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {

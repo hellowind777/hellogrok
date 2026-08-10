@@ -328,6 +328,56 @@ func TestSearchEvidenceCountsWithoutLoggingQueriesOrURLs(t *testing.T) {
 	}
 }
 
+func TestSearchSourcesCoverResponsesAndChatMetadataVariants(t *testing.T) {
+	responses := map[string]any{
+		"output": []any{
+			webSearchItem("ws_1", "current news", nil, "completed"),
+			messageItem("answer", nil),
+		},
+		"citations": []any{"https://responses.example/source"},
+	}
+	backfillResponseSearchSources(responses, true, "current news")
+	if urls := urlsFromJSON(responses["output"]); len(urls) != 1 || urls[0] != "https://responses.example/source" {
+		t.Fatalf("Responses top-level citations were not normalized: %#v", responses)
+	}
+
+	chatVariants := []struct {
+		name     string
+		metadata string
+		wantURL  string
+	}{
+		{
+			name: "openai_annotations",
+			metadata: `"annotations":[{"type":"url_citation","url":"https://chat.example/annotation",` +
+				`"title":"Source","start_index":0,"end_index":6}]`,
+			wantURL: "https://chat.example/annotation",
+		},
+		{
+			name:     "top_level_citations",
+			metadata: `"citations":["https://chat.example/top"]`,
+			wantURL:  "https://chat.example/top",
+		},
+		{
+			name:     "web_search_results",
+			metadata: `"web_search_results":[{"url":"https://chat.example/result"}]`,
+			wantURL:  "https://chat.example/result",
+		},
+	}
+	for _, test := range chatVariants {
+		t.Run(test.name, func(t *testing.T) {
+			body := []byte(`{"id":"chat_1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"answer",` +
+				test.metadata + `},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+			result, err := canonicalFromChat(body, true, "current news")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if urls := urlsFromJSON(result.Output); len(urls) != 1 || urls[0] != test.wantURL {
+				t.Fatalf("Chat source metadata was not normalized: %#v", result.Output)
+			}
+		})
+	}
+}
+
 func TestReadBodyLimitedDetectsOverflow(t *testing.T) {
 	data, err := readBodyLimited(strings.NewReader("1234"), 4)
 	if err != nil || string(data) != "1234" {
