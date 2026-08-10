@@ -653,6 +653,8 @@ func (s *Server) streamMessagesSSE(w http.ResponseWriter, response *http.Respons
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	modelObserver := newUpstreamModelObserver(request.Protocol)
+	defer modelObserver.log(s.log, route)
 	state := newMessagesStreamState(writer, route, request)
 	if err := writer.emitStart(route, request, state.responseID, state.createdAt); err != nil {
 		return
@@ -664,6 +666,7 @@ func (s *Server) streamMessagesSSE(w http.ResponseWriter, response *http.Respons
 			heartbeats++
 			return writer.emitHeartbeat()
 		}
+		modelObserver.observeJSON(payload, false)
 		if strings.TrimSpace(string(payload)) != "[DONE]" {
 			evidence.observeJSON(payload)
 		}
@@ -681,7 +684,7 @@ func (s *Server) streamMessagesSSE(w http.ResponseWriter, response *http.Respons
 	}
 	if streamErr != nil {
 		s.log.Printf("UP channel=%s Messages SSE conversion error: %v", route.ChannelID, streamErr)
-		writer.emitStreamError("upstream Messages stream failed")
+		writer.emitStreamError(upstreamStreamFailureMessage("Messages", streamErr))
 	} else if !state.terminal {
 		s.log.Printf("UP channel=%s Messages SSE ended without message_stop", route.ChannelID)
 		writer.emitStreamError("upstream Messages stream ended without message_stop")
@@ -1020,6 +1023,8 @@ func (s *Server) streamChatSSE(w http.ResponseWriter, response *http.Response, r
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	modelObserver := newUpstreamModelObserver(request.Protocol)
+	defer modelObserver.log(s.log, route)
 	state := newChatStreamState(writer, route, request)
 	if err := writer.emitStart(route, request, state.responseID, state.createdAt); err != nil {
 		return
@@ -1031,6 +1036,7 @@ func (s *Server) streamChatSSE(w http.ResponseWriter, response *http.Response, r
 			heartbeats++
 			return writer.emitHeartbeat()
 		}
+		modelObserver.observeJSON(payload, false)
 		if strings.TrimSpace(string(payload)) != "[DONE]" {
 			evidence.observeJSON(payload)
 		}
@@ -1051,7 +1057,7 @@ func (s *Server) streamChatSSE(w http.ResponseWriter, response *http.Response, r
 	}
 	if streamErr != nil {
 		s.log.Printf("UP channel=%s Chat Completions SSE conversion error: %v", route.ChannelID, streamErr)
-		writer.emitStreamError("upstream Chat Completions stream failed")
+		writer.emitStreamError(upstreamStreamFailureMessage("Chat Completions", streamErr))
 	} else if !state.terminal {
 		s.log.Printf("UP channel=%s Chat Completions SSE ended without [DONE] or finish_reason", route.ChannelID)
 		writer.emitStreamError("upstream Chat Completions stream ended without a terminal chunk")
@@ -1066,6 +1072,8 @@ func (s *Server) streamNativeSSE(w http.ResponseWriter, response *http.Response,
 		writeJSONError(w, http.StatusInternalServerError, "stream unsupported")
 		return
 	}
+	modelObserver := newUpstreamModelObserver(request.Protocol)
+	defer modelObserver.log(s.log, route)
 	copySafeResponseHeaders(w.Header(), response.Header)
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -1102,6 +1110,7 @@ func (s *Server) streamNativeSSE(w http.ResponseWriter, response *http.Response,
 		if err != nil {
 			return fmt.Errorf("decode upstream %s SSE frame: %w", protocolLabel(request.Protocol), err)
 		}
+		modelObserver.observe(root, false)
 		evidence.observeJSON(payload)
 		if messagesSearchFilter != nil && !messagesSearchFilter.keep(root) {
 			return nil
@@ -1140,7 +1149,7 @@ func (s *Server) streamNativeSSE(w http.ResponseWriter, response *http.Response,
 	}
 	if streamErr != nil {
 		s.log.Printf("UP channel=%s %s SSE read error: %v", route.ChannelID, protocolLabel(request.Protocol), streamErr)
-		writeNativeStreamError(w, flusher, request.Protocol, "upstream "+protocolLabel(request.Protocol)+" stream failed")
+		writeNativeStreamError(w, flusher, request.Protocol, upstreamStreamFailureMessage(protocolLabel(request.Protocol), streamErr))
 	} else if !terminal {
 		s.log.Printf("UP channel=%s %s SSE ended without a terminal event", route.ChannelID, protocolLabel(request.Protocol))
 		writeNativeStreamError(w, flusher, request.Protocol, "upstream "+protocolLabel(request.Protocol)+" stream ended without a terminal event")

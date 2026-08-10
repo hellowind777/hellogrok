@@ -198,6 +198,99 @@ auth_scheme = "bearer"
 	}
 }
 
+func TestLoadModelsRejectsInvalidOrProtectedHTTPHeaders(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{
+			name: "protected protocol header",
+			raw: `[model.one]
+base_url = "https://one.example/v1"
+extra_headers = { "Content-Type" = "text/plain" }
+`,
+			want: "Content-Type",
+		},
+		{
+			name: "invalid name",
+			raw: `[model.one]
+base_url = "https://one.example/v1"
+extra_headers = { "Bad Header" = "value" }
+`,
+			want: "invalid HTTP header name",
+		},
+		{
+			name: "newline injection",
+			raw: `[model.one]
+base_url = "https://one.example/v1"
+extra_headers = { "X-Test" = "first\nInjected: second" }
+`,
+			want: "invalid HTTP header value",
+		},
+		{
+			name: "case insensitive duplicate",
+			raw: `[model.one]
+base_url = "https://one.example/v1"
+extra_headers = { "X-Tenant" = "one", "x-tenant" = "two" }
+`,
+			want: "duplicate HTTP header",
+		},
+		{
+			name: "non string value",
+			raw: `[model.one]
+base_url = "https://one.example/v1"
+extra_headers = { "X-Test" = 7 }
+`,
+			want: "must be a string",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.toml")
+			if err := os.WriteFile(path, []byte(test.raw), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := LoadModels(path)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error=%v, want text %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestRouteHeaderValidationAllowsChannelCredentials(t *testing.T) {
+	headers := map[string]string{
+		"Authorization": "Bearer channel-token",
+		"X-Api-Key":     "channel-key",
+		"X-Tenant":      "tenant",
+	}
+	if err := validateRouteHeaders(headers); err != nil {
+		t.Fatalf("valid channel headers rejected: %v", err)
+	}
+}
+
+func TestBuildRoutesRejectsInvalidEnvironmentHeaderValue(t *testing.T) {
+	t.Setenv("INJECTED_HEADER_VALUE", "valid\r\nInjected: true")
+	path := filepath.Join(t.TempDir(), "config.toml")
+	raw := `[model.one]
+base_url = "https://one.example/v1"
+env_http_headers = { "X-Tenant" = "INJECTED_HEADER_VALUE" }
+`
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	models, err := LoadModels(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = BuildRoutes(models)
+	if err == nil || !strings.Contains(err.Error(), "invalid HTTP header value") {
+		t.Fatalf("invalid environment header reached a route: %v", err)
+	}
+}
+
 func TestLoadModelsInheritsModelProviderConnectionAndAuth(t *testing.T) {
 	t.Setenv("PROVIDER_TEST_KEY", "provider-env-key")
 	t.Setenv("PROVIDER_HEADER_ENV", "provider-header")

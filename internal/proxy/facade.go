@@ -125,6 +125,10 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 		if err != nil {
 			detail := safeUpstreamError(err)
 			s.log.Printf("UP channel=%s request failed: %s", route.ChannelID, detail)
+			if isUpstreamTimeout(err) {
+				writeRetryableJSONError(w, http.StatusGatewayTimeout, "upstream timed out before returning response headers")
+				return
+			}
 			writeRetryableJSONError(w, http.StatusBadGateway, "upstream: "+detail)
 			return
 		}
@@ -191,6 +195,7 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 			writeJSONError(w, http.StatusBadGateway, "WebSearchClient requires one non-streaming Responses response")
 			return
 		}
+		response.Body = withStreamIdleTimeout(response.Body, s.streamIdleTimeout)
 		if request.IncomingProtocol != wireResponses {
 			s.streamNativeSSE(w, response, route, request, started)
 			return
@@ -222,6 +227,9 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 		writeJSONError(w, http.StatusBadGateway, upstreamHTMLResponseMessage(route.APIBackend))
 		return
 	}
+	modelObserver := newUpstreamModelObserver(request.Protocol)
+	modelObserver.observeJSON(data, true)
+	modelObserver.log(s.log, route)
 
 	if request.Kind == clientSearchRequest {
 		s.writeClientSearchResponse(w, data, route, request)

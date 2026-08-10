@@ -6,7 +6,7 @@
 
 A cross-platform local proxy that makes Grok Build custom model channels work with common API formats, native Web tools, isolated authentication, and automatic configuration recovery.
 
-[![Version](https://img.shields.io/badge/version-0.1.4-2f6feb.svg)](./internal/appinfo/appinfo.go)
+[![Version](https://img.shields.io/badge/version-0.1.5-2f6feb.svg)](./internal/appinfo/appinfo.go)
 [![Go](https://img.shields.io/badge/Go-1.26.5-00ADD8.svg)](./go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#platform-support)
@@ -54,6 +54,8 @@ It is intended for users who maintain multiple third-party model channels and wa
 - Exposes channel-scoped `/responses`, `/messages`, and `/chat/completions` routes and restores the original `api_backend` byte-for-byte when the proxy stops.
 - Validates protocol tool history before forwarding: Responses calls require matching `function_call_output` items, Messages `tool_use` blocks require `tool_result` blocks in the immediately following user message, and Chat tool calls require matching tool messages. Deterministic failures return a non-retryable `400` instead of entering Grok Build's retry loop.
 - Converts provider-private `keepalive`, `keep-alive`, `keep_alive`, `heartbeat`, and `ping` frames into standard SSE comments before they reach Grok Build, without consuming Responses sequence numbers, and closes each upstream stream as soon as its protocol terminal event arrives.
+- Bounds the wait for upstream response headers and gaps between SSE data at 180 seconds without imposing a total deadline on long-running model streams. Every upstream byte, including a normalized heartbeat, renews the stream idle window.
+- Logs the model declared by the raw upstream response before normalization, including terminal-frame precedence, case-insensitive mismatch detection, and conflicting declarations, without changing routing or response data.
 - Completes a missing empty `signature` on Messages `thinking` block starts while preserving the provider's later `signature_delta`, so Messages-compatible relays remain consumable by Grok Build's strict native decoder.
 - Preserves each configured upstream URL path and model identifier.
 - Prepares every explicit custom channel before use, avoiding first-request failures after `/model` switching.
@@ -75,6 +77,7 @@ It is intended for users who maintain multiple third-party model channels and wa
 
 - Uses channel-owned API keys, environment keys, authentication providers, and headers.
 - Prevents an official Grok login token from being sent to an unrelated custom channel.
+- Validates channel-owned header names and values while loading configuration. Request framing, content, and connection headers remain controlled by the proxy.
 - Checks and temporarily completes required Grok settings when the proxy starts.
 - Restores original values on normal stop, tray exit, Ctrl+C, SIGTERM, or failed startup.
 - Recovers proxy-managed settings after an unclean exit with `hellogrok restore`.
@@ -139,8 +142,8 @@ For any channel that should use its own hosted search in ordinary conversations,
 | `env_key` | One auth method | None | Environment variable name or ordered list of names containing the channel credential. |
 | `auth_provider` | One auth method | None | Grok command-based authentication provider. |
 | `auth_scheme` | No | `bearer` | Upstream authentication scheme. Set `x_api_key` only for providers that explicitly require `X-Api-Key`. |
-| `extra_headers` | No | Empty | Additional channel-owned HTTP headers. |
-| `env_http_headers` | No | Empty | HTTP headers populated from environment variables. |
+| `extra_headers` | No | Empty | Additional channel-owned HTTP headers, including provider-specific authentication. Proxy-controlled framing, content, and connection headers are rejected; names are case-insensitive. |
+| `env_http_headers` | No | Empty | HTTP headers populated from environment variables. Resolved values use the same header rules as `extra_headers`. |
 | `supports_backend_search` | No | `false` | When true, uses this channel's own hosted search and exposes canonical Responses search events to Grok Build for all three upstream formats. When false, Grok Build uses its configured or authenticated client-search route. |
 
 Model settings may be declared directly under `[model.<id>]` or inherited from a referenced `[model_providers.<id>]`. Model-level values take precedence.
@@ -373,6 +376,8 @@ Current Grok Build has two Responses source paths: hosted search reads `web_sear
 Upgrade both hellogrok executables to the same current release or build, then restart the proxy. Some relays inject private `keepalive`, `keep-alive`, `keep_alive`, `heartbeat`, or `ping` events into an SSE stream. Grok Build's strict Responses deserializer rejects such JSON events even while upstream generation continues. hellogrok absorbs these names from the SSE `event:` field, JSON `type` or `event`, raw data payloads, and empty-data heartbeat frames, then emits the standards-compatible `: keepalive` comment. A completed Responses event, Messages `message_stop`, or Chat Completions `[DONE]` also closes the upstream request immediately rather than waiting for the provider socket.
 
 The completion log includes `heartbeats=<count>`. If the same error remains while that counter stays zero, confirm that Grok Build is routed through the current proxy with `hellogrok routes`; the provider is likely emitting a different private event name that should be diagnosed from a credential-free stream capture rather than added as a model-specific workaround.
+
+hellogrok waits at most 180 seconds for upstream response headers and at most 180 seconds between SSE data reads. A heartbeat counts as data and renews that idle window. A timeout before response headers returns retryable `504`; after a `200` stream has begun, hellogrok emits the receiving protocol's `proxy_stream_error` and closes the upstream. There is no total request timeout, so an active long-running reasoning stream is not terminated. The `response_model` log line shows the upstream-declared and configured models; `mismatch=true` identifies a relay that silently substituted a model, while `conflict=true` means different response frames declared different models.
 
 ### A Claude Messages channel selects the wrong model or returns 404
 

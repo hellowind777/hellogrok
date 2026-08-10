@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -747,6 +748,214 @@ func TestTruncatedNativeStreamsEmitProtocolNativeErrors(t *testing.T) {
 				t.Fatalf("status=%d body=%s", status, data)
 			}
 		})
+	}
+}
+
+func TestUpstreamResponseHeaderTimeoutReturnsRetryableGatewayTimeout(t *testing.T) {
+	release := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		<-release
+	}))
+	defer func() {
+		close(release)
+		upstream.Close()
+	}()
+
+	route := facadeRoute("header-timeout", "responses", "wire", "key", upstream.URL)
+	s := New(log.New(io.Discard, "", 0))
+	s.transport.ResponseHeaderTimeout = 100 * time.Millisecond
+	s.SetRoutes([]config.Route{route})
+	startPathTestServer(t, s)
+	started := time.Now()
+	data, status, header := postFacadeResponse(t, s, route.ChannelID, nativeRequestBody("responses", false), "")
+	if status != http.StatusGatewayTimeout || header.Get("X-Should-Retry") != "true" || !bytes.Contains(data, []byte("timed out")) {
+		t.Fatalf("status=%d retry=%q body=%s", status, header.Get("X-Should-Retry"), data)
+	}
+	if elapsed := time.Since(started); elapsed >= time.Second {
+		t.Fatalf("response-header timeout returned too late: %s", elapsed)
+	}
+}
+
+func TestUpstreamStreamIdleTimeoutCoversEveryProtocolPath(t *testing.T) {
+	tests := []struct {
+		name             string
+		backend          string
+		incomingProtocol wireProtocol
+		requestBody      []byte
+		firstFrame       string
+	}{
+		{
+			name: "responses native", backend: "responses", incomingProtocol: wireResponses,
+			requestBody: nativeRequestBody("responses", true),
+			firstFrame:  `data: {"type":"response.created","response":{"id":"resp_idle","object":"response","status":"in_progress","model":"wire","output":[]}}` + "\n\n",
+		},
+		{
+			name: "messages translated", backend: "messages", incomingProtocol: wireResponses,
+			requestBody: nativeRequestBody("responses", true),
+			firstFrame:  `data: {"type":"message_start","message":{"id":"msg_idle","type":"message","role":"assistant","content":[],"model":"wire","usage":{"input_tokens":1,"output_tokens":0}}}` + "\n\n",
+		},
+		{
+			name: "chat translated", backend: "chat_completions", incomingProtocol: wireResponses,
+			requestBody: nativeRequestBody("responses", true),
+			firstFrame:  `data: {"id":"chat_idle","object":"chat.completion.chunk","model":"wire","choices":[{"index":0,"delta":{"role":"assistant","content":"partial"},"finish_reason":null}]}` + "\n\n",
+		},
+		{
+			name: "messages native", backend: "messages", incomingProtocol: wireMessages,
+			requestBody: nativeRequestBody("messages", true),
+			firstFrame:  `data: {"type":"message_start","message":{"id":"msg_idle","type":"message","role":"assistant","content":[],"model":"wire","usage":{"input_tokens":1,"output_tokens":0}}}` + "\n\n",
+		},
+		{
+			name: "chat native", backend: "chat_completions", incomingProtocol: wireChatCompletions,
+			requestBody: nativeRequestBody("chat_completions", true),
+			firstFrame:  `data: {"id":"chat_idle","object":"chat.completion.chunk","model":"wire","choices":[{"index":0,"delta":{"role":"assistant","content":"partial"},"finish_reason":null}]}` + "\n\n",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			upstreamCanceled := make(chan struct{})
+			release := make(chan struct{})
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = io.WriteString(w, test.firstFrame)
+				w.(http.Flusher).Flush()
+				select {
+				case <-request.Context().Done():
+					close(upstreamCanceled)
+				case <-release:
+				}
+			}))
+			defer func() {
+				close(release)
+				upstream.Close()
+			}()
+
+			route := facadeRoute("idle", test.backend, "wire", "key", upstream.URL)
+			route.SupportsBackendSearch = test.incomingProtocol == wireResponses
+			s := New(log.New(io.Discard, "", 0))
+			s.streamIdleTimeout = 100 * time.Millisecond
+			s.SetRoutes([]config.Route{route})
+			startPathTestServer(t, s)
+			data, status, _ := postFacadeProtocol(t, s, route.ChannelID, test.incomingProtocol, test.requestBody, "", nil)
+			if status != http.StatusOK || !bytes.Contains(data, []byte("proxy_stream_error")) || !bytes.Contains(data, []byte("timed out")) {
+				t.Fatalf("status=%d body=%s", status, data)
+			}
+			select {
+			case <-upstreamCanceled:
+			case <-time.After(time.Second):
+				t.Fatal("stream idle timeout did not close the upstream request")
+			}
+		})
+	}
+}
+
+func TestUpstreamHeartbeatsResetStreamIdleTimeout(t *testing.T) {
+	tests := []struct {
+		backend string
+		start   string
+		end     string
+		want    string
+	}{
+		{
+			backend: "responses",
+			start:   `data: {"type":"response.created","response":{"id":"resp_heartbeat","object":"response","status":"in_progress","model":"wire","output":[]}}` + "\n\n",
+			end:     `data: {"type":"response.completed","response":{"id":"resp_heartbeat","object":"response","status":"completed","model":"wire","output":[]}}` + "\n\n",
+			want:    "response.completed",
+		},
+		{
+			backend: "messages",
+			start:   `data: {"type":"message_start","message":{"id":"msg_heartbeat","type":"message","role":"assistant","content":[],"model":"wire","usage":{"input_tokens":1,"output_tokens":0}}}` + "\n\n",
+			end:     `data: {"type":"message_stop"}` + "\n\n",
+			want:    "response.completed",
+		},
+		{
+			backend: "chat_completions",
+			start:   `data: {"id":"chat_heartbeat","object":"chat.completion.chunk","model":"wire","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}` + "\n\n",
+			end:     `data: {"id":"chat_heartbeat","object":"chat.completion.chunk","model":"wire","choices":[{"index":0,"delta":{"content":"done"},"finish_reason":"stop"}]}` + "\n\n" + "data: [DONE]\n\n",
+			want:    "response.completed",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.backend, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = io.WriteString(w, test.start)
+				w.(http.Flusher).Flush()
+				for index := 0; index < 7; index++ {
+					time.Sleep(30 * time.Millisecond)
+					_, _ = io.WriteString(w, "event: ping\ndata: {\"type\":\"ping\"}\n\n")
+					w.(http.Flusher).Flush()
+				}
+				_, _ = io.WriteString(w, test.end)
+				w.(http.Flusher).Flush()
+			}))
+			defer upstream.Close()
+
+			route := facadeRoute("heartbeat", test.backend, "wire", "key", upstream.URL)
+			route.SupportsBackendSearch = true
+			s := New(log.New(io.Discard, "", 0))
+			s.streamIdleTimeout = 100 * time.Millisecond
+			s.SetRoutes([]config.Route{route})
+			startPathTestServer(t, s)
+			data, status, _ := postFacadeProtocol(t, s, route.ChannelID, wireResponses, nativeRequestBody("responses", true), "", nil)
+			if status != http.StatusOK || !bytes.Contains(data, []byte(test.want)) || bytes.Contains(data, []byte("proxy_stream_error")) {
+				t.Fatalf("status=%d body=%s", status, data)
+			}
+		})
+	}
+}
+
+func TestClientCancellationBeatsStreamIdleTimeout(t *testing.T) {
+	upstreamCanceled := make(chan struct{})
+	release := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, `data: {"type":"response.created","response":{"id":"resp_cancel","object":"response","status":"in_progress","model":"wire","output":[]}}`+"\n\n")
+		w.(http.Flusher).Flush()
+		select {
+		case <-request.Context().Done():
+			close(upstreamCanceled)
+		case <-release:
+		}
+	}))
+	defer func() {
+		close(release)
+		upstream.Close()
+	}()
+
+	route := facadeRoute("cancel", "responses", "wire", "key", upstream.URL)
+	s := New(log.New(io.Discard, "", 0))
+	s.streamIdleTimeout = 5 * time.Second
+	s.SetRoutes([]config.Route{route})
+	startPathTestServer(t, s)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+s.PathAddr+"/c/cancel/responses", bytes.NewReader(nativeRequestBody("responses", true)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	readDone := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(io.Discard, response.Body)
+		_ = response.Body.Close()
+		close(readDone)
+	}()
+	cancel()
+	select {
+	case <-readDone:
+	case <-time.After(time.Second):
+		t.Fatal("downstream read remained blocked after client cancellation")
+	}
+	select {
+	case <-upstreamCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("client cancellation did not cancel the upstream request")
 	}
 }
 

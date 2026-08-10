@@ -37,10 +37,11 @@ type Server struct {
 	requestCtx    context.Context
 	requestCancel context.CancelFunc
 
-	transport       *http.Transport
-	client          *http.Client
-	connections     *connectionTracker
-	shutdownTimeout time.Duration
+	transport         *http.Transport
+	client            *http.Client
+	connections       *connectionTracker
+	shutdownTimeout   time.Duration
+	streamIdleTimeout time.Duration
 
 	probedMu  sync.Mutex
 	probed    map[string]bool
@@ -86,11 +87,12 @@ func newServer(logger *log.Logger, reasoningPath string) *Server {
 				return http.ErrUseLastResponse
 			},
 		},
-		shutdownTimeout: 5 * time.Second,
-		requestCtx:      requestCtx,
-		requestCancel:   requestCancel,
-		probed:          map[string]bool{},
-		reasoning:       reasoning,
+		shutdownTimeout:   5 * time.Second,
+		streamIdleTimeout: defaultUpstreamStreamIdleTimeout,
+		requestCtx:        requestCtx,
+		requestCancel:     requestCancel,
+		probed:            map[string]bool{},
+		reasoning:         reasoning,
 	}
 }
 
@@ -258,7 +260,7 @@ func newUpstreamTransport(connections *connectionTracker) *http.Transport {
 		MaxIdleConnsPerHost:   16,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   20 * time.Second,
-		ResponseHeaderTimeout: 0,
+		ResponseHeaderTimeout: defaultUpstreamResponseHeaderTimeout,
 		TLSClientConfig: &tls.Config{
 			MinVersion: tls.VersionTLS12,
 			NextProtos: []string{"http/1.1"},
@@ -386,6 +388,8 @@ func (s *Server) streamResponsesSSE(w http.ResponseWriter, response *http.Respon
 		writeJSONError(w, http.StatusInternalServerError, "stream unsupported")
 		return
 	}
+	modelObserver := newUpstreamModelObserver(request.Protocol)
+	defer modelObserver.log(s.log, route)
 	copySafeResponseHeaders(w.Header(), response.Header)
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -483,6 +487,11 @@ func (s *Server) streamResponsesSSE(w http.ResponseWriter, response *http.Respon
 		if err != nil {
 			return fmt.Errorf("invalid upstream Responses SSE data: %w", err)
 		}
+		rawEvent, err := decodeJSONMap(restored)
+		if err != nil {
+			return fmt.Errorf("invalid upstream Responses SSE data: %w", err)
+		}
+		modelObserver.observe(rawEvent, false)
 		evidence.observeJSON(restored)
 		patchedData := patch.PatchSSEDataLineWithSequence("data: "+string(restored), options, events)
 		patchedPayload := strings.TrimSpace(strings.TrimPrefix(patchedData, "data:"))
@@ -571,7 +580,7 @@ func (s *Server) streamResponsesSSE(w http.ResponseWriter, response *http.Respon
 	if streamErr != nil {
 		s.log.Printf("UP channel=%s SSE read error: %v", channel, streamErr)
 		if !clientWriteFailed {
-			writeResponsesStreamError(w, flusher, events, "upstream Responses stream failed")
+			writeResponsesStreamError(w, flusher, events, upstreamStreamFailureMessage("Responses", streamErr))
 		}
 	}
 	s.log.Printf("UP channel=%s SSE done events=%d heartbeats=%d terminal=%s %s", channel, events, heartbeats, terminal, time.Since(started).Round(time.Millisecond))

@@ -130,7 +130,11 @@ func LoadModels(path string) ([]Model, error) {
 	}
 	globalHeaders := map[string]string{}
 	if models, _ := root["models"].(map[string]any); models != nil {
-		globalHeaders = stringMap(models["extra_headers"])
+		var headerErr error
+		globalHeaders, headerErr = configuredRouteHeaders(models["extra_headers"], "[models].extra_headers")
+		if headerErr != nil {
+			return nil, headerErr
+		}
 	}
 	ids := make([]string, 0, len(modelTable))
 	for id := range modelTable {
@@ -181,17 +185,29 @@ func LoadModels(path string) ([]Model, error) {
 			}
 		}
 
-		modelHeaders := stringMap(m["extra_headers"])
+		modelHeaders, err := configuredRouteHeaders(m["extra_headers"], fmt.Sprintf("[model.%s].extra_headers", id))
+		if err != nil {
+			return nil, err
+		}
 		if len(modelHeaders) == 0 {
-			modelHeaders = stringMap(provider["extra_headers"])
+			modelHeaders, err = configuredRouteHeaders(provider["extra_headers"], fmt.Sprintf("[model_providers.%s].extra_headers", providerID))
+			if err != nil {
+				return nil, err
+			}
 		}
 		extraHeaders := cloneStringMap(globalHeaders)
 		for key, value := range modelHeaders {
 			setStringMapCaseInsensitive(extraHeaders, key, value)
 		}
-		envHTTPHeaders := stringMap(m["env_http_headers"])
+		envHTTPHeaders, err := configuredEnvHTTPHeaders(m["env_http_headers"], fmt.Sprintf("[model.%s].env_http_headers", id))
+		if err != nil {
+			return nil, err
+		}
 		if len(envHTTPHeaders) == 0 {
-			envHTTPHeaders = stringMap(provider["env_http_headers"])
+			envHTTPHeaders, err = configuredEnvHTTPHeaders(provider["env_http_headers"], fmt.Sprintf("[model_providers.%s].env_http_headers", providerID))
+			if err != nil {
+				return nil, err
+			}
 		}
 		modelAuthScheme := normalizeAuthScheme(inheritedString(m, nil, "auth_scheme"))
 		upstreamAuthScheme := modelAuthScheme
@@ -303,23 +319,6 @@ func stringField(values map[string]any, key string) (string, bool) {
 	return text, ok
 }
 
-func stringMap(v any) map[string]string {
-	out := map[string]string{}
-	switch values := v.(type) {
-	case map[string]any:
-		for key, raw := range values {
-			if value, ok := raw.(string); ok {
-				out[key] = value
-			}
-		}
-	case map[string]string:
-		for key, value := range values {
-			out[key] = value
-		}
-	}
-	return out
-}
-
 func cloneStringMap(values map[string]string) map[string]string {
 	out := make(map[string]string, len(values))
 	for key, value := range values {
@@ -420,14 +419,17 @@ func ResolveAPIKey(m Model) string {
 	return ""
 }
 
-func resolveExtraHeaders(m Model) map[string]string {
+func resolveExtraHeaders(m Model) (map[string]string, error) {
 	headers := cloneStringMap(m.ExtraHeaders)
 	for header, envName := range m.EnvHTTPHeaders {
 		if value := strings.TrimSpace(os.Getenv(strings.TrimSpace(envName))); value != "" {
+			if err := validateRouteHeader(header, value); err != nil {
+				return nil, fmt.Errorf("environment variable %q: %w", strings.TrimSpace(envName), err)
+			}
 			setStringMapCaseInsensitive(headers, header, value)
 		}
 	}
-	return headers
+	return headers, nil
 }
 
 // EffectiveOriginBase returns a direct upstream URL. Per-channel proxy URLs do
@@ -512,6 +514,10 @@ func BuildRoutes(models []Model) ([]Route, error) {
 		if authScheme == "" {
 			authScheme = "bearer"
 		}
+		extraHeaders, err := resolveExtraHeaders(m)
+		if err != nil {
+			return nil, fmt.Errorf("model %q has invalid HTTP headers: %w", m.ID, err)
+		}
 		out = append(out, Route{
 			ChannelID:             m.ID,
 			Host:                  displayHost,
@@ -523,7 +529,7 @@ func BuildRoutes(models []Model) ([]Route, error) {
 			AuthScheme:            authScheme,
 			IncomingAuthScheme:    incomingAuthScheme,
 			DynamicAuth:           m.DynamicAuth && key == "",
-			ExtraHeaders:          resolveExtraHeaders(m),
+			ExtraHeaders:          extraHeaders,
 			SupportsBackendSearch: m.SupportsBackendSearch,
 		})
 	}

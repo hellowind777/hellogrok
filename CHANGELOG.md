@@ -6,11 +6,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.1.5] — 2026-08-10
+
 ### Added
 
 - Channel-scoped endpoints for every Grok Build backend: `/responses`, `/messages`, and `/chat/completions`, backed by one capability-aware protocol facade.
 - Protocol-specific tool-history validation for Responses `function_call` pairs, immediately adjacent Messages `tool_use`/`tool_result` batches, and Chat Completions tool calls/results. Invalid history returns a deterministic non-retryable `400` before reaching the provider.
 - `chat_search_dialect` channel setting for selecting Chat `web_search_options`, Chat `search_parameters`, or an explicit Messages/Responses search bridge.
+- A 180-second response-header wait and SSE idle timeout, without a total request deadline. Any upstream data, including heartbeats, renews the idle window.
+- Raw upstream response-model observation for Responses, Messages, and Chat Completions, with terminal declaration precedence and mismatch/conflict diagnostics that do not affect routing.
 
 ### Changed
 
@@ -19,6 +23,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Configuration rewrite state is version 8. It records the provider protocol separately from the protocol projected to Grok Build, preserves the effective search capability, and can restore version 5, 6, and 7 recovery transactions.
 - Client-search aliases are rewritten only in protocol-defined tool declarations, choices, and call-name fields; tool arguments, results, response text, URLs, and other business JSON are never traversed.
 - A provider that ignores `stream=true` now falls back to buffered SSE in the protocol Grok Build is consuming, including canonical Responses events for capability-projected Messages and Chat channels.
+- Channel-owned HTTP headers are parsed as strings and validated before routes are activated; authentication headers remain configurable while proxy-controlled request headers are reserved.
 
 ### Fixed
 
@@ -29,6 +34,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Official DeepSeek Chat channels use `/anthropic/messages` with `X-Api-Key` for hosted search, while official xAI Chat channels use Responses. Search calls, results, citations, and deduplicated sites are converted back without exposing provider credentials.
 - Parallel Responses function calls are converted into one assistant `tool_use` batch followed by one adjacent user `tool_result` batch, preventing valid concurrent tool history from becoming an invalid Messages sequence.
 - Configuration restore now preserves a model channel deleted while the proxy is active and still restores every remaining managed field; edits to individual proxy-owned fields continue to fail closed.
+- A stalled upstream now returns retryable `504` before response headers or emits the receiving protocol's stream error after streaming begins, instead of leaving Grok Build waiting indefinitely.
 
 ### Removed
 
@@ -125,7 +131,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - CC Switch compatibility detection and conflict warnings.
 - Builds for Windows, Linux, and macOS on amd64 and arm64.
 
-[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.5...HEAD
+[0.1.5]: https://github.com/hellowind777/hellogrok/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/hellowind777/hellogrok/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/hellowind777/hellogrok/compare/v0.1.1...v0.1.3
 [0.1.1]: https://github.com/hellowind777/hellogrok/compare/v0.1.0...v0.1.1
