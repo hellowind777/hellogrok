@@ -233,7 +233,7 @@ func normalizeHostedSearchRequestForCapabilities(body []byte, capabilities hoste
 }
 
 func normalizeHostedSearchObject(root map[string]any, capabilities hostedSearchCapabilities) bool {
-	changed := repairDeepSeekSearchHistory(root)
+	changed := false
 
 	tools, _ := root["tools"].([]any)
 	hasHosted := false
@@ -313,11 +313,9 @@ func normalizeHostedSearchObject(root map[string]any, capabilities hostedSearchC
 // DeepSeek Responses returns a non-standard action.queries field and requires
 // it when the completed web_search_call is replayed on the next turn. Build's
 // standard Responses model drops that field while deserializing the response.
+// The caller must scope this repair to the first-party Responses endpoint; the
+// payload alone cannot distinguish DeepSeek from a relay reusing its model ID.
 func repairDeepSeekSearchHistory(root map[string]any) bool {
-	model, _ := root["model"].(string)
-	if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(model)), "deepseek-") {
-		return false
-	}
 	input, ok := root["input"].([]any)
 	if !ok {
 		return false

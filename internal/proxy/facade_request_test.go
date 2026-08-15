@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -30,6 +31,178 @@ func TestChannelPathsExposeAllNativeProtocols(t *testing.T) {
 		if ok != test.valid || channel != test.channel || protocol != test.protocol {
 			t.Fatalf("path=%q got channel=%q protocol=%q ok=%t", test.path, channel, protocol, ok)
 		}
+	}
+}
+
+func TestGrokBuildLocalToolsSurviveEveryProviderBridge(t *testing.T) {
+	localNames := []string{"shell", "read_file", "apply_patch", "task", "mcp__example__lookup"}
+	tools := make([]any, 0, len(localNames))
+	for _, name := range localNames {
+		tools = append(tools, map[string]any{
+			"type": "function", "name": name, "description": "Grok Build local tool",
+			"parameters": map[string]any{"type": "object"},
+		})
+	}
+	body, err := json.Marshal(map[string]any{
+		"model":             "display",
+		"max_output_tokens": 4096,
+		"input": []any{
+			map[string]any{"type": "message", "role": "user", "content": "run the local tool"},
+			map[string]any{
+				"type": "function_call", "id": "fc_shell", "call_id": "call_shell",
+				"name": "shell", "arguments": `{"command":"pwd"}`, "status": "completed",
+			},
+			map[string]any{"type": "function_call_output", "call_id": "call_shell", "output": "D:/repo"},
+			map[string]any{"type": "message", "role": "user", "content": "continue"},
+		},
+		"tools":       tools,
+		"tool_choice": map[string]any{"type": "function", "name": "task"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name     string
+		backend  string
+		protocol wireProtocol
+		dialect  config.ChatSearchDialect
+	}{
+		{name: "responses", backend: "responses", protocol: wireResponses},
+		{name: "messages", backend: "messages", protocol: wireMessages},
+		{name: "chat", backend: "chat_completions", protocol: wireChatCompletions, dialect: config.ChatSearchDialectWebSearchOptions},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			route := config.Route{
+				ChannelID: "tools", WireModel: "wire", APIBackend: test.backend, APIBackendConfigured: true,
+				SupportsBackendSearch: true, ChatSearchDialect: test.dialect,
+			}
+			request, err := adaptFacadeRequest(body, route, wireResponses)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if request.Protocol != test.protocol {
+				t.Fatalf("provider protocol=%s want %s", request.Protocol, test.protocol)
+			}
+			root, err := decodeRequestObject(request.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			declared := map[string]bool{}
+			selected := ""
+			sawCall := false
+			sawResult := false
+			switch test.protocol {
+			case wireResponses:
+				for _, raw := range anySlice(root["tools"]) {
+					tool, _ := raw.(map[string]any)
+					if stringValue(tool["type"]) == "function" {
+						declared[functionToolName(tool)] = true
+					}
+				}
+				choice, _ := root["tool_choice"].(map[string]any)
+				selected = functionToolName(choice)
+				for _, raw := range anySlice(root["input"]) {
+					item, _ := raw.(map[string]any)
+					sawCall = sawCall || (stringValue(item["type"]) == "function_call" && stringValue(item["name"]) == "shell")
+					sawResult = sawResult || (stringValue(item["type"]) == "function_call_output" && stringValue(item["call_id"]) == "call_shell")
+				}
+			case wireMessages:
+				for _, raw := range anySlice(root["tools"]) {
+					tool, _ := raw.(map[string]any)
+					if tool["input_schema"] != nil {
+						declared[stringValue(tool["name"])] = true
+					}
+				}
+				choice, _ := root["tool_choice"].(map[string]any)
+				selected = stringValue(choice["name"])
+				for _, rawMessage := range anySlice(root["messages"]) {
+					message, _ := rawMessage.(map[string]any)
+					for _, rawBlock := range anySlice(message["content"]) {
+						block, _ := rawBlock.(map[string]any)
+						sawCall = sawCall || (stringValue(block["type"]) == "tool_use" && stringValue(block["name"]) == "shell")
+						sawResult = sawResult || (stringValue(block["type"]) == "tool_result" && stringValue(block["tool_use_id"]) == "call_shell")
+					}
+				}
+			case wireChatCompletions:
+				for _, raw := range anySlice(root["tools"]) {
+					tool, _ := raw.(map[string]any)
+					if stringValue(tool["type"]) == "function" {
+						declared[functionToolName(tool)] = true
+					}
+				}
+				choice, _ := root["tool_choice"].(map[string]any)
+				selected = functionToolName(choice)
+				for _, rawMessage := range anySlice(root["messages"]) {
+					message, _ := rawMessage.(map[string]any)
+					if stringValue(message["role"]) == "tool" && stringValue(message["tool_call_id"]) == "call_shell" {
+						sawResult = true
+					}
+					for _, rawCall := range anySlice(message["tool_calls"]) {
+						call, _ := rawCall.(map[string]any)
+						function, _ := call["function"].(map[string]any)
+						sawCall = sawCall || stringValue(function["name"]) == "shell"
+					}
+				}
+			}
+			for _, name := range localNames {
+				if !declared[name] {
+					t.Fatalf("local tool %q was not declared on %s wire: %s", name, test.name, request.Body)
+				}
+			}
+			if selected != "task" || !sawCall || !sawResult {
+				t.Fatalf("selection/call/replay lost on %s: selected=%q call=%t result=%t body=%s",
+					test.name, selected, sawCall, sawResult, request.Body)
+			}
+		})
+	}
+}
+
+func TestDeepSeekTargetsPreserveBasePathPrefixes(t *testing.T) {
+	tests := []struct {
+		name     string
+		origin   string
+		protocol wireProtocol
+		want     string
+	}{
+		{"Responses root", "https://api.deepseek.com", wireResponses, "https://api.deepseek.com/responses"},
+		{"Responses OpenAI root", "https://api.deepseek.com/v1", wireResponses, "https://api.deepseek.com/responses"},
+		{"Responses Anthropic root", "https://api.deepseek.com/anthropic", wireResponses, "https://api.deepseek.com/responses"},
+		{"Messages root", "https://api.deepseek.com", wireMessages, "https://api.deepseek.com/anthropic/v1/messages"},
+		{"Messages Anthropic root", "https://api.deepseek.com/anthropic/v1", wireMessages, "https://api.deepseek.com/anthropic/v1/messages"},
+		{"Chat Anthropic root", "https://api.deepseek.com/anthropic", wireChatCompletions, "https://api.deepseek.com/chat/completions"},
+		{"Responses custom prefix", "https://api.deepseek.com/gateway/tenant/v1", wireResponses, "https://api.deepseek.com/gateway/tenant/responses"},
+		{"Messages custom prefix", "https://api.deepseek.com/gateway/tenant/anthropic", wireMessages, "https://api.deepseek.com/gateway/tenant/anthropic/v1/messages"},
+		{"Chat versioned prefix", "https://api.deepseek.com/api/2026-08/anthropic/v1", wireChatCompletions, "https://api.deepseek.com/api/2026-08/chat/completions"},
+		{"Unknown future prefix", "https://api.deepseek.com/experimental/v2", wireResponses, "https://api.deepseek.com/experimental/v2/responses"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			target, err := upstreamTarget(config.Route{
+				Host:       "api.deepseek.com",
+				OriginBase: test.origin,
+			}, test.protocol, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if target != test.want {
+				t.Fatalf("target=%q want=%q", target, test.want)
+			}
+		})
+	}
+}
+
+func TestNonDeepSeekTargetKeepsProviderBasePath(t *testing.T) {
+	target, err := upstreamTarget(config.Route{
+		Host: "relay.example", OriginBase: "https://relay.example/tenant/v1",
+	}, wireMessages, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target != "https://relay.example/tenant/v1/messages" {
+		t.Fatalf("target=%q", target)
 	}
 }
 
@@ -74,6 +247,91 @@ func TestNativeSessionRequestsStayInTheirOwnProtocol(t *testing.T) {
 	}
 }
 
+func TestUnconfiguredBackendFollowsGrokBuildResolvedProtocol(t *testing.T) {
+	tests := []struct {
+		name     string
+		protocol wireProtocol
+		body     string
+	}{
+		{"remote Responses", wireResponses, `{"model":"catalog-model","input":"hi","stream":false}`},
+		{"remote Messages", wireMessages, `{"model":"catalog-model","messages":[{"role":"user","content":"hi"}],"max_tokens":64,"stream":false}`},
+		{"remote Chat Completions", wireChatCompletions, `{"model":"catalog-model","messages":[{"role":"user","content":"hi"}],"stream":false}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request, err := adaptFacadeRequest([]byte(test.body), config.Route{
+				ChannelID: "future", WireModel: "future-provider-model",
+			}, test.protocol)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if request.IncomingProtocol != test.protocol || request.Protocol != test.protocol {
+				t.Fatalf("remote protocol was not followed: %#v", request)
+			}
+			root, err := decodeRequestObject(request.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if root["model"] != "future-provider-model" {
+				t.Fatalf("wire model was not isolated: %#v", root)
+			}
+		})
+	}
+}
+
+func TestRemoteCatalogHostedSearchIsDetectedWithoutLocalModelKnowledge(t *testing.T) {
+	body := []byte(`{
+		"model":"catalog-alias",
+		"input":[{"role":"user","content":"find current docs"}],
+		"max_output_tokens":4096,
+		"tools":[
+			{"type":"web_search"},
+			{"type":"function","name":"skill","description":"load a skill","parameters":{"type":"object"}}
+		],
+		"reasoning":{"effort":"medium"},
+		"stream":false
+	}`)
+	for _, test := range []struct {
+		name     string
+		backend  string
+		protocol wireProtocol
+	}{
+		{name: "Responses upstream", backend: "responses", protocol: wireResponses},
+		{name: "Messages upstream", backend: "messages", protocol: wireMessages},
+		{name: "Chat Completions upstream", backend: "chat_completions", protocol: wireChatCompletions},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request, err := adaptFacadeRequest(body, config.Route{
+				ChannelID: "future-provider", Host: "relay.example",
+				OriginBase: "https://relay.example/v1", WireModel: "future-provider-model",
+				APIBackend: test.backend, APIBackendConfigured: true,
+			}, wireResponses)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if request.Kind != nativeSessionRequest || request.Protocol != test.protocol ||
+				!request.HostedWebSearch || request.ProxyAddedWebSearch {
+				t.Fatalf("remote hosted-search capability was not inferred from the request: %#v", request)
+			}
+			root, err := decodeRequestObject(request.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !nativeRequestHasSearchForTest(root, test.protocol) {
+				t.Fatalf("hosted web_search did not reach %s upstream: %#v", test.backend, root)
+			}
+			foundSkill := false
+			for _, raw := range anySlice(root["tools"]) {
+				tool, _ := raw.(map[string]any)
+				foundSkill = foundSkill || functionToolName(tool) == "skill"
+			}
+			if !foundSkill {
+				t.Fatalf("Grok Build function tool was lost during %s conversion: %#v", test.backend, root)
+			}
+		})
+	}
+}
+
 func TestCrossProtocolResponsesEndpointAcceptsOnlyBuildClientSearch(t *testing.T) {
 	for _, backend := range []string{"messages", "chat_completions"} {
 		t.Run(backend, func(t *testing.T) {
@@ -93,7 +351,7 @@ func TestCrossProtocolResponsesEndpointAcceptsOnlyBuildClientSearch(t *testing.T
 	}
 }
 
-func TestBuildClientSearchFingerprintRejectsNearMatches(t *testing.T) {
+func TestBuildClientSearchFingerprintUsesStableRequestShape(t *testing.T) {
 	base, err := decodeRequestObject(buildClientSearchBody("q"))
 	if err != nil {
 		t.Fatal(err)
@@ -107,10 +365,6 @@ func TestBuildClientSearchFingerprintRejectsNearMatches(t *testing.T) {
 		{"missing input", func(root map[string]any) { delete(root, "input") }},
 		{"array input", func(root map[string]any) { root["input"] = []any{map[string]any{"role": "user", "content": "q"}} }},
 		{"empty input", func(root map[string]any) { root["input"] = "  " }},
-		{"missing temperature", func(root map[string]any) { delete(root, "temperature") }},
-		{"wrong temperature", func(root map[string]any) { root["temperature"] = 1 }},
-		{"wrong top p", func(root map[string]any) { root["top_p"] = 1 }},
-		{"wrong max output", func(root map[string]any) { root["max_output_tokens"] = 4096 }},
 		{"missing store", func(root map[string]any) { delete(root, "store") }},
 		{"disabled tool choice", func(root map[string]any) { root["tool_choice"] = "none" }},
 		{"non-search tool", func(root map[string]any) {
@@ -127,6 +381,31 @@ func TestBuildClientSearchFingerprintRejectsNearMatches(t *testing.T) {
 			hosted, x := summarizeSearchCounts(root)
 			if prepareClientSearchExecution(root, hosted, x) {
 				t.Fatal("near-match request was classified as WebSearchClient")
+			}
+		})
+	}
+
+	for _, test := range []struct {
+		name   string
+		mutate func(map[string]any)
+	}{
+		{"sampling parameters omitted", func(root map[string]any) {
+			delete(root, "temperature")
+			delete(root, "top_p")
+			delete(root, "max_output_tokens")
+		}},
+		{"sampling parameters changed", func(root map[string]any) {
+			root["temperature"] = 0.2
+			root["top_p"] = 0.9
+			root["max_output_tokens"] = 16384
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := cloneMap(base)
+			test.mutate(root)
+			hosted, x := summarizeSearchCounts(root)
+			if !prepareClientSearchExecution(root, hosted, x) {
+				t.Fatal("WebSearchClient request stopped matching after an incidental sampling change")
 			}
 		})
 	}
@@ -179,6 +458,16 @@ func TestSearchAdapterMapsMessagesAndChatDialects(t *testing.T) {
 	}
 }
 
+func TestResponsesToMessagesDoesNotInventMaxOutputTokens(t *testing.T) {
+	_, err := responsesToMessagesRequest(map[string]any{
+		"model": "display",
+		"input": "search this",
+	})
+	if err == nil || !strings.Contains(err.Error(), "max_output_tokens must be a positive integer") {
+		t.Fatalf("missing max_output_tokens error=%v", err)
+	}
+}
+
 func TestChatSearchDialectUsesExplicitOrOfficialHostCapabilities(t *testing.T) {
 	for _, route := range []config.Route{
 		{ChannelID: "grok-channel", WireModel: "ordinary", Host: "relay.example"},
@@ -191,12 +480,113 @@ func TestChatSearchDialectUsesExplicitOrOfficialHostCapabilities(t *testing.T) {
 	if got := chatSearchDialect(config.Route{Host: "api.x.ai"}); got != config.ChatSearchDialectResponses {
 		t.Fatalf("official xAI host default=%q", got)
 	}
-	if got := chatSearchDialect(config.Route{Host: "api.deepseek.com"}); got != config.ChatSearchDialectMessages {
-		t.Fatalf("official DeepSeek host default=%q", got)
+	if got := chatSearchDialect(config.Route{Host: "api.deepseek.com", WireModel: "deepseek-v4-pro"}); got != config.ChatSearchDialectResponses {
+		t.Fatalf("official DeepSeek V4 host default=%q", got)
+	}
+	if got := chatSearchDialect(config.Route{Host: "api.deepseek.com", WireModel: "deepseek-future-model"}); got != config.ChatSearchDialectResponses {
+		t.Fatalf("future official DeepSeek model default=%q", got)
 	}
 	explicit := config.Route{Host: "api.deepseek.com", ChatSearchDialect: config.ChatSearchDialectWebSearchOptions}
 	if got := chatSearchDialect(explicit); got != config.ChatSearchDialectWebSearchOptions {
 		t.Fatalf("explicit dialect was ignored: %q", got)
+	}
+	if got := chatSearchDialect(config.Route{Host: "preview.deepseek.com", WireModel: "deepseek-v4-pro"}); got != config.ChatSearchDialectWebSearchOptions {
+		t.Fatalf("undocumented DeepSeek subdomain received first-party assumptions: %q", got)
+	}
+}
+
+func TestProviderSearchProtocolHonorsConfiguredNativeAPIAndExplicitChatDialect(t *testing.T) {
+	tests := []struct {
+		name  string
+		route config.Route
+		want  wireProtocol
+	}{
+		{
+			name:  "official Responses stays Responses",
+			route: config.Route{Host: "api.deepseek.com", APIBackend: "responses", WireModel: "deepseek-v4-pro"},
+			want:  wireResponses,
+		},
+		{
+			name:  "official Messages stays Messages",
+			route: config.Route{Host: "api.deepseek.com", APIBackend: "messages", WireModel: "deepseek-v4-pro[1m]"},
+			want:  wireMessages,
+		},
+		{
+			name:  "official Chat uses documented Responses default",
+			route: config.Route{Host: "api.deepseek.com", APIBackend: "chat_completions", WireModel: "deepseek-future-model"},
+			want:  wireResponses,
+		},
+		{
+			name: "explicit Chat dialect overrides host default",
+			route: config.Route{
+				Host: "api.deepseek.com", APIBackend: "chat_completions", WireModel: "deepseek-future-model",
+				ChatSearchDialect: config.ChatSearchDialectWebSearchOptions,
+			},
+			want: wireChatCompletions,
+		},
+		{
+			name: "explicit Messages bridge overrides host default",
+			route: config.Route{
+				Host: "api.deepseek.com", APIBackend: "chat_completions", WireModel: "deepseek-future-model",
+				ChatSearchDialect: config.ChatSearchDialectMessages,
+			},
+			want: wireMessages,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := providerSearchProtocol(test.route)
+			if err != nil || got != test.want {
+				t.Fatalf("protocol=%s want=%s err=%v", got, test.want, err)
+			}
+		})
+	}
+}
+
+func TestDeepSeekSearchHistoryRepairRequiresOfficialResponsesRoute(t *testing.T) {
+	body := []byte(`{
+		"input":[{"type":"web_search_call","id":"ws_1","status":"completed","action":{"type":"search","query":"current"}}],
+		"tools":[{"type":"web_search"}]
+	}`)
+	tests := []struct {
+		name       string
+		route      config.Route
+		wantRepair bool
+	}{
+		{
+			name: "official future model",
+			route: config.Route{
+				ChannelID: "future", Host: "api.deepseek.com", APIBackend: "responses",
+				WireModel: "deepseek-future-model", SupportsBackendSearch: true,
+			},
+			wantRepair: true,
+		},
+		{
+			name: "relay reusing DeepSeek model ID",
+			route: config.Route{
+				ChannelID: "relay", Host: "relay.example", APIBackend: "responses",
+				WireModel: "deepseek-v4-pro", SupportsBackendSearch: true,
+			},
+			wantRepair: false,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request, err := adaptFacadeRequest(body, test.route, wireResponses)
+			if err != nil {
+				t.Fatal(err)
+			}
+			root, err := decodeRequestObject(request.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			input := anySlice(root["input"])
+			action, _ := input[0].(map[string]any)["action"].(map[string]any)
+			_, repaired := action["queries"]
+			if repaired != test.wantRepair {
+				t.Fatalf("queries repaired=%t want=%t body=%s", repaired, test.wantRepair, request.Body)
+			}
+		})
 	}
 }
 
@@ -264,6 +654,7 @@ func TestCapableMessagesConsumesResponsesAndUsesHostedSearch(t *testing.T) {
 	body := []byte(`{
 		"model":"display",
 		"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"search current news"}]}],
+		"max_output_tokens":4096,
 		"stream":true,
 		"tools":[
 			{"type":"function","name":"web_fetch","parameters":{"type":"object"}},
@@ -372,9 +763,10 @@ func TestCapableHostedSearchRespectsStructuredToolChoice(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			root := map[string]any{
-				"input":       "do not search",
-				"tools":       []any{map[string]any{"type": "function", "name": "skill", "parameters": map[string]any{"type": "object"}}},
-				"tool_choice": test.choice,
+				"input":             "do not search",
+				"max_output_tokens": 4096,
+				"tools":             []any{map[string]any{"type": "function", "name": "skill", "parameters": map[string]any{"type": "object"}}},
+				"tool_choice":       test.choice,
 			}
 			body, _ := json.Marshal(root)
 			request, err := adaptFacadeRequest(body, config.Route{
@@ -426,7 +818,13 @@ func TestMessagesHostedSearchResponseBlocksAreKeptAwayFromBuildConsumer(t *testi
 		t.Fatalf("supported blocks changed: %#v", content)
 	}
 	if err := validateMessagesContentBlock(map[string]any{"type": "future_server_tool"}); err == nil {
-		t.Fatal("unknown block would still reach Grok Build's closed enum")
+		t.Fatal("strict cross-protocol validator accepted an unknown block")
+	}
+	if err := validateNativeMessagesContentBlock(map[string]any{"type": "future_server_tool", "future": true}); err != nil {
+		t.Fatalf("native validator rejected a future provider extension: %v", err)
+	}
+	if err := validateNativeMessagesContentBlock(map[string]any{"type": "text"}); err == nil {
+		t.Fatal("native validator stopped validating known block shapes")
 	}
 
 	filter := newMessagesHostedSearchStreamFilter(facadeRequest{Protocol: wireMessages, HostedWebSearch: true})
@@ -504,7 +902,8 @@ func TestResponsesToolHistoryValidation(t *testing.T) {
 
 func TestResponsesParallelToolsConvertToOneImmediateMessagesBatch(t *testing.T) {
 	root := map[string]any{
-		"model": "wire",
+		"model":             "wire",
+		"max_output_tokens": 4096,
 		"input": []any{
 			map[string]any{"type": "function_call", "call_id": "call_1", "name": "skill", "arguments": "{}"},
 			map[string]any{"type": "function_call", "call_id": "call_2", "name": "skill", "arguments": "{}"},
@@ -532,6 +931,32 @@ func TestResponsesParallelToolsConvertToOneImmediateMessagesBatch(t *testing.T) 
 	}
 }
 
+func TestResponsesUserIsolationSurvivesProtocolConversion(t *testing.T) {
+	root := map[string]any{
+		"model":             "wire",
+		"input":             "hello",
+		"user":              "tenant_user-42",
+		"max_output_tokens": 4096,
+	}
+
+	messages, err := responsesToMessagesRequest(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata, _ := messages["metadata"].(map[string]any)
+	if metadata["user_id"] != "tenant_user-42" {
+		t.Fatalf("Responses user was lost in Messages conversion: %#v", messages)
+	}
+
+	chat, err := responsesToChatRequest(root, config.Route{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if chat["user"] != "tenant_user-42" {
+		t.Fatalf("Responses user was lost in Chat conversion: %#v", chat)
+	}
+}
+
 func TestResponsesSearchHistoryRebuildsAdjacentMessagesBlocks(t *testing.T) {
 	blocks := responseWebSearchToMessagesBlocks(map[string]any{
 		"type": "web_search_call", "id": "ws_1",
@@ -539,7 +964,7 @@ func TestResponsesSearchHistoryRebuildsAdjacentMessagesBlocks(t *testing.T) {
 			"type": "search", "query": "current news",
 			"sources": []any{map[string]any{"type": "url", "url": "https://example.test", "title": "Example"}},
 		},
-	})
+	}, 4)
 	if len(blocks) != 2 || blocks[0]["type"] != "server_tool_use" ||
 		blocks[1]["type"] != "web_search_tool_result" || blocks[1]["tool_use_id"] != "ws_1" {
 		t.Fatalf("search history blocks=%#v", blocks)
@@ -547,6 +972,72 @@ func TestResponsesSearchHistoryRebuildsAdjacentMessagesBlocks(t *testing.T) {
 	results := anySlice(blocks[1]["content"])
 	if len(results) != 1 || results[0].(map[string]any)["url"] != "https://example.test" {
 		t.Fatalf("search sources were lost: %#v", blocks)
+	}
+	fallbackA := responseWebSearchToMessagesBlocks(map[string]any{
+		"type": "web_search_call", "action": map[string]any{"type": "search", "query": "stable"},
+	}, 4)
+	fallbackB := responseWebSearchToMessagesBlocks(map[string]any{
+		"type": "web_search_call", "action": map[string]any{"type": "search", "query": "stable"},
+	}, 4)
+	if fallbackA[0]["id"] != "srv_4" || fallbackB[0]["id"] != fallbackA[0]["id"] {
+		t.Fatalf("missing search id produced unstable history: %#v %#v", fallbackA, fallbackB)
+	}
+}
+
+func TestMessagesBridgeAppliesStableGrokBuildCacheBreakpoints(t *testing.T) {
+	root := map[string]any{
+		"system": "stable system",
+		"messages": []any{
+			map[string]any{"role": "user", "content": "first question"},
+			map[string]any{"role": "assistant", "content": []any{
+				map[string]any{"type": "thinking", "thinking": "private", "signature": "sig"},
+				map[string]any{"type": "text", "text": "first answer"},
+			}},
+			map[string]any{"role": "user", "content": []any{
+				map[string]any{"type": "tool_result", "tool_use_id": "call_1", "content": "done"},
+				map[string]any{"type": "text", "text": "second question"},
+			}},
+		},
+	}
+	applyMessagesCacheBreakpoints(root)
+	first, err := json.Marshal(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if countJSONCacheBreakpoints(root) != 3 {
+		t.Fatalf("cache breakpoints=%d body=%s", countJSONCacheBreakpoints(root), first)
+	}
+	applyMessagesCacheBreakpoints(root)
+	second, err := json.Marshal(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(first, second) {
+		t.Fatalf("cache breakpoint placement is not idempotent:\nfirst=%s\nsecond=%s", first, second)
+	}
+}
+
+func countJSONCacheBreakpoints(value any) int {
+	switch typed := value.(type) {
+	case map[string]any:
+		count := 0
+		if control, _ := typed["cache_control"].(map[string]any); stringValue(control["type"]) == "ephemeral" {
+			count++
+		}
+		for key, child := range typed {
+			if key != "cache_control" {
+				count += countJSONCacheBreakpoints(child)
+			}
+		}
+		return count
+	case []any:
+		count := 0
+		for _, child := range typed {
+			count += countJSONCacheBreakpoints(child)
+		}
+		return count
+	default:
+		return 0
 	}
 }
 

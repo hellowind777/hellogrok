@@ -170,7 +170,7 @@ func TestNormalizeHostedSearchDropsCollidingFunctionsAndDeduplicates(t *testing.
 	}
 }
 
-func TestNormalizeHostedSearchRequestRepairsDeepSeekHistory(t *testing.T) {
+func TestRepairDeepSeekSearchHistory(t *testing.T) {
 	body := []byte(`{
 		"model":"deepseek-v4-flash",
 		"input":[
@@ -181,13 +181,15 @@ func TestNormalizeHostedSearchRequestRepairsDeepSeekHistory(t *testing.T) {
 		],
 		"tools":[{"type":"web_search"}]
 	}`)
-	adapted, changed, err := normalizeHostedSearchRequest(body, false)
-	if err != nil || !changed {
-		t.Fatalf("changed=%v err=%v", changed, err)
-	}
-
 	var root map[string]any
-	if err := json.Unmarshal(adapted, &root); err != nil {
+	if err := json.Unmarshal(body, &root); err != nil {
+		t.Fatal(err)
+	}
+	if !repairDeepSeekSearchHistory(root) {
+		t.Fatal("DeepSeek Responses replay was not repaired")
+	}
+	adapted, err := json.Marshal(root)
+	if err != nil {
 		t.Fatal(err)
 	}
 	input := root["input"].([]any)
@@ -210,17 +212,20 @@ func TestNormalizeHostedSearchRequestRepairsDeepSeekHistory(t *testing.T) {
 		t.Fatalf("non-search action was modified: %s", adapted)
 	}
 
-	again, changedAgain, err := normalizeHostedSearchRequest(adapted, false)
-	if err != nil || changedAgain || !bytes.Equal(again, adapted) {
-		t.Fatalf("repair must be idempotent: changed=%v err=%v body=%s", changedAgain, err, again)
+	if repairDeepSeekSearchHistory(root) {
+		t.Fatal("repair must be idempotent")
+	}
+	again, err := json.Marshal(root)
+	if err != nil || !bytes.Equal(again, adapted) {
+		t.Fatalf("idempotent repair changed body: err=%v body=%s", err, again)
 	}
 }
 
-func TestNormalizeHostedSearchRequestDoesNotPatchOtherModels(t *testing.T) {
-	body := []byte(`{"model":"gpt-test","input":[{"type":"web_search_call","action":{"type":"search","query":""}}],"tools":[{"type":"web_search"}]}`)
+func TestHostedSearchNormalizationDoesNotGuessProviderFromModelName(t *testing.T) {
+	body := []byte(`{"model":"deepseek-v4-pro","input":[{"type":"web_search_call","action":{"type":"search","query":""}}],"tools":[{"type":"web_search"}]}`)
 	got, changed, err := normalizeHostedSearchRequest(body, false)
 	if err != nil || changed || !bytes.Equal(got, body) {
-		t.Fatalf("non-DeepSeek replay changed: changed=%v err=%v body=%s", changed, err, got)
+		t.Fatalf("host-neutral normalization guessed a provider: changed=%v err=%v body=%s", changed, err, got)
 	}
 }
 

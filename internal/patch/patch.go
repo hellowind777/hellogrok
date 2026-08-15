@@ -19,9 +19,10 @@ var (
 
 // Options controls how we rewrite upstream JSON for Grok Build.
 type Options struct {
-	GPTResponses bool
-	WebSearch    bool
-	RequestModel string
+	GPTResponses            bool
+	WebSearch               bool
+	RequestModel            string
+	ContextDetailsFromUsage bool
 }
 
 // Output-item types that Grok's Responses deserializer typically requires an id on.
@@ -233,8 +234,20 @@ func ensureResponse(m map[string]any, opt Options, ctx string) {
 			}
 		}
 	}
-	if usage, ok := m["usage"].(map[string]any); ok {
-		ensureUsageDetails(usage)
+	usage, ok := m["usage"].(map[string]any)
+	contextInput, contextOutput, addContextDetails := contextDetailsFromUsage(usage, opt.ContextDetailsFromUsage)
+	if !ok || !normalizeUsageTokenFields(usage) {
+		// Grok Build treats total_tokens as the current complete context size.
+		// An invented or partial value would corrupt that counter and postpone
+		// auto-compaction, so an unusable provider measurement stays unknown.
+		m["usage"] = nil
+		return
+	}
+	if addContextDetails {
+		usage["context_details"] = map[string]any{
+			"input_tokens":  contextInput,
+			"output_tokens": contextOutput,
+		}
 	}
 }
 
@@ -454,44 +467,116 @@ func missingOrEmpty(m map[string]any, key string) bool {
 	return false
 }
 
-func ensureUsageDetails(usage map[string]any) {
-	if _, ok := usage["input_tokens"]; !ok || usage["input_tokens"] == nil {
-		usage["input_tokens"] = 0
+const maxWireTokenCount = int64(^uint32(0))
+
+func contextDetailsFromUsage(usage map[string]any, enabled bool) (int64, int64, bool) {
+	if !enabled || usage == nil {
+		return 0, 0, false
 	}
-	if _, ok := usage["output_tokens"]; !ok || usage["output_tokens"] == nil {
-		usage["output_tokens"] = 0
+	// Never replace a first-party measurement, including a partial extension
+	// that Grok Build will deliberately ignore instead of guessing.
+	if _, exists := usage["context_details"]; exists {
+		return 0, 0, false
 	}
-	if _, ok := usage["total_tokens"]; !ok || usage["total_tokens"] == nil {
-		usage["total_tokens"] = numericTokenCount(usage["input_tokens"]) + numericTokenCount(usage["output_tokens"])
+	input, hasInput, validInput := optionalTokenCount(usage, "input_tokens")
+	output, hasOutput, validOutput := optionalTokenCount(usage, "output_tokens")
+	if !hasInput || !hasOutput || !validInput || !validOutput || input > maxWireTokenCount-output {
+		return 0, 0, false
 	}
-	otd, _ := usage["output_tokens_details"].(map[string]any)
-	if otd == nil {
-		usage["output_tokens_details"] = map[string]any{"reasoning_tokens": 0}
-	} else if _, ok := otd["reasoning_tokens"]; !ok {
-		otd["reasoning_tokens"] = 0
+	if input == 0 && output == 0 {
+		return 0, 0, false
 	}
-	itd, _ := usage["input_tokens_details"].(map[string]any)
-	if itd == nil {
-		usage["input_tokens_details"] = map[string]any{"cached_tokens": 0}
-	} else if _, ok := itd["cached_tokens"]; !ok {
-		itd["cached_tokens"] = 0
-	}
+	return input, output, true
 }
 
-func numericTokenCount(value any) int64 {
-	switch typed := value.(type) {
-	case float64:
-		return int64(typed)
-	case json.Number:
-		count, _ := typed.Int64()
-		return count
-	case int:
-		return int64(typed)
-	case int64:
-		return typed
-	default:
-		return 0
+// normalizeUsageTokenFields accepts only complete billing measurements. Grok
+// Build requires input/output fields for its usage ledger and uses total for
+// context tracking, so accepting total alone would require inventing ledger
+// values. A provider total is preserved when the complete pair is present;
+// otherwise the total is derived from that pair.
+func normalizeUsageTokenFields(usage map[string]any) bool {
+	input, hasInput, validInput := optionalTokenCount(usage, "input_tokens")
+	output, hasOutput, validOutput := optionalTokenCount(usage, "output_tokens")
+	total, hasTotal, validTotal := optionalTokenCount(usage, "total_tokens")
+	if !validInput || !validOutput || !validTotal || !hasInput || !hasOutput {
+		return false
 	}
+	if !hasTotal {
+		if input > maxWireTokenCount-output {
+			return false
+		}
+		total = input + output
+		usage["total_tokens"] = total
+	}
+	if input == 0 && output == 0 && total == 0 && !positiveContextDetails(usage) {
+		return false
+	}
+	if !normalizeUsageDetail(usage, "output_tokens_details", "reasoning_tokens") ||
+		!normalizeUsageDetail(usage, "input_tokens_details", "cached_tokens") {
+		return false
+	}
+	return total >= 0
+}
+
+func positiveContextDetails(usage map[string]any) bool {
+	details, _ := usage["context_details"].(map[string]any)
+	input, hasInput, validInput := optionalTokenCount(details, "input_tokens")
+	output, hasOutput, validOutput := optionalTokenCount(details, "output_tokens")
+	return hasInput && hasOutput && validInput && validOutput &&
+		input <= maxWireTokenCount-output && input+output > 0
+}
+
+func normalizeUsageDetail(usage map[string]any, detailKey, tokenKey string) bool {
+	raw, exists := usage[detailKey]
+	if !exists || raw == nil {
+		usage[detailKey] = map[string]any{tokenKey: int64(0)}
+		return true
+	}
+	details, ok := raw.(map[string]any)
+	if !ok {
+		return false
+	}
+	_, present, valid := optionalTokenCount(details, tokenKey)
+	if !valid {
+		return false
+	}
+	if !present {
+		details[tokenKey] = int64(0)
+	}
+	return true
+}
+
+func optionalTokenCount(values map[string]any, key string) (int64, bool, bool) {
+	value, exists := values[key]
+	if !exists || value == nil {
+		return 0, false, true
+	}
+	var count int64
+	switch number := value.(type) {
+	case json.Number:
+		parsed, err := number.Int64()
+		if err != nil {
+			return 0, true, false
+		}
+		count = parsed
+	case float64:
+		if number < 0 || number > float64(maxWireTokenCount) || number != float64(int64(number)) {
+			return 0, true, false
+		}
+		count = int64(number)
+	case int:
+		count = int64(number)
+	case int64:
+		count = number
+	case uint64:
+		if number > uint64(maxWireTokenCount) {
+			return 0, true, false
+		}
+		count = int64(number)
+	default:
+		return 0, true, false
+	}
+	return count, true, count >= 0 && count <= maxWireTokenCount
 }
 
 // PatchJSONBytes patches a full JSON document.

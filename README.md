@@ -6,7 +6,7 @@
 
 A cross-platform local proxy that makes Grok Build custom model channels work with common API formats, native Web tools, isolated authentication, and automatic configuration recovery.
 
-[![Version](https://img.shields.io/badge/version-0.1.7-2f6feb.svg)](./internal/appinfo/appinfo.go)
+[![Version](https://img.shields.io/badge/version-0.1.8-2f6feb.svg)](./internal/appinfo/appinfo.go)
 [![Go](https://img.shields.io/badge/Go-1.26.5-00ADD8.svg)](./go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#platform-support)
@@ -21,6 +21,7 @@ A cross-platform local proxy that makes Grok Build custom model channels work wi
 - [Why hellogrok](#why-hellogrok)
 - [Features](#features)
 - [Search and configuration](#search-and-configuration)
+- [DeepSeek](#deepseek)
 - [Download](#download)
 - [Quick start](#quick-start)
 - [Platform support](#platform-support)
@@ -50,11 +51,11 @@ It is intended for users who maintain multiple third-party model channels and wa
 - Supports upstream channels that use `responses`, `messages`, or `chat_completions`.
 - Keeps the provider's configured upstream protocol, URL path, model, credential, reasoning, and tool semantics at the provider boundary.
 - When `supports_backend_search = true`, temporarily exposes the channel to Grok Build as Responses, then translates requests, responses, and SSE events to and from the provider's real protocol. This lets Grok Build consume `web_search_call`, sources, and site counts for every supported upstream format.
-- When `supports_backend_search = false` or is omitted, keeps Grok Build on the configured native consumer so its client `web_search` uses `[models].web_search`, `GROK_WEB_SEARCH_MODEL`, or the authenticated official fallback.
+- When `supports_backend_search = false`, keeps Grok Build on the configured native consumer so its client `web_search` uses `[models].web_search`, `GROK_WEB_SEARCH_MODEL`, or the authenticated official fallback. Omission preserves Grok Build catalog behavior, except that models on the exact first-party DeepSeek endpoint enable its documented provider-hosted search by default. An explicit false still opts out unless that custom route is selected as the default search model.
 - Exposes channel-scoped `/responses`, `/messages`, and `/chat/completions` routes and restores the original `api_backend` byte-for-byte when the proxy stops.
 - Validates protocol tool history before forwarding: Responses calls require matching `function_call_output` items, Messages `tool_use` blocks require `tool_result` blocks in the immediately following user message, and Chat tool calls require matching tool messages. Deterministic failures return a non-retryable `400` instead of entering Grok Build's retry loop.
 - Converts provider-private `keepalive`, `keep-alive`, `keep_alive`, `heartbeat`, and `ping` frames into standard SSE comments before they reach Grok Build, without consuming Responses sequence numbers, and closes each upstream stream as soon as its protocol terminal event arrives.
-- Bounds the wait for upstream response headers and gaps between SSE data at 180 seconds without imposing a total deadline on long-running model streams. Every upstream byte, including a normalized heartbeat, renews the stream idle window.
+- Bounds ordinary upstream response-header waits and gaps between reads from every response body at 601 seconds, one second beyond Grok Build's 600-second shell default. First-party `api.deepseek.com` routes use 660 seconds to cover the provider's documented ten-minute queue. There is no total request deadline, and every upstream byte, including a non-streaming queue newline or normalized heartbeat, renews the idle window.
 - Logs the model declared by the raw upstream response before normalization, including terminal-frame precedence, case-insensitive mismatch detection, and conflicting declarations, without changing routing or response data.
 - Completes a missing empty `signature` on Messages `thinking` block starts while preserving the provider's later `signature_delta`, so Messages-compatible relays remain consumable by Grok Build's strict native decoder.
 - Preserves each configured upstream URL path and model identifier.
@@ -64,9 +65,9 @@ It is intended for users who maintain multiple third-party model channels and wa
 ### Native Web tools
 
 - Supports Grok Build's native `web_search` workflow for hosted and client-search modes.
-- With `supports_backend_search = true`, every supported format uses the current channel's own hosted search: Responses passes through, Messages receives `web_search_20250305`, and Chat uses its configured search dialect or protocol bridge.
-- The Grok Build side always receives canonical Responses search events for a capable channel, including completed `web_search_call` items, verified sources, citations, usage, and the native deduplicated site count. Responses providers are asked for complete `web_search_call.action.sources` metadata while existing `include` entries are preserved; provider-level citations and Chat annotations/search-result containers are normalized into the same canonical source fields.
-- With `supports_backend_search = false`, Grok Build uses client `web_search` instead. Any of the three backends can still be selected as that client-search model; the proxy adapts only Grok Build's fixed non-streaming WebSearchClient request.
+- With `supports_backend_search = true`, every supported format uses the current channel's own hosted search: Responses passes through, Messages receives `web_search_20250305`, and Chat uses its configured search dialect or protocol bridge. First-party DeepSeek keeps Responses and Messages on their configured native APIs; Chat defaults to the documented Responses Web Search surface unless `chat_search_dialect` explicitly selects another strategy.
+- For a channel marked `supports_backend_search = true`, the Grok Build side receives canonical Responses search events when the upstream actually executes search, including completed `web_search_call` items, verified sources, citations, usage, and the native deduplicated site count. The flag is a routing declaration, not a capability probe. Responses providers that support `include` are asked for complete `web_search_call.action.sources` metadata while existing entries are preserved. DeepSeek Responses is the documented exception: `include` is unsupported, so hellogrok does not inject it and instead consumes sources from the native search action. Provider-level citations and Chat annotations/search-result containers are normalized into the same canonical source fields.
+- Selecting a proxied custom route through `[models].web_search` or `GROK_WEB_SEARCH_MODEL` projects that route as `supports_backend_search = true` for the entire proxy lifetime, even when its original value is false. Grok Build can therefore discover hosted `web_search` in ordinary sessions and its fixed non-streaming WebSearchClient request; hellogrok translates both to the provider protocol and restores the original setting on stop.
 - Preserves real search URLs from adapted search results in both `web_search_call.action.sources` and `output_text.annotations`, including valid final-answer links only when the response independently confirms that search ran. This lets Grok Build display its native deduplicated site count.
 - Accepts an adapted client-search response only when the upstream independently proves that search completed and also returns non-empty answer text. Providers that silently ignore their search extension receive a non-retryable `502`; hellogrok cannot manufacture search capability for such a channel.
 - Keeps `web_fetch` available as an independent tool when allowed by the active agent configuration.
@@ -101,19 +102,19 @@ Search behavior follows the explicit search-model selection first, then the acti
 
 | Setting | Search behavior |
 |---------|-----------------|
-| `[models].web_search` or `GROK_WEB_SEARCH_MODEL` is set | Grok Build client `web_search` uses the selected model. That model may use `responses`, `messages`, or `chat_completions`; its WebSearchClient request is handled independently of `supports_backend_search`. The environment variable takes precedence, and selection is resolved without a startup request. |
+| `[models].web_search` or `GROK_WEB_SEARCH_MODEL` is set | If the selected model is a proxied custom route, hellogrok temporarily projects it as `supports_backend_search = true` and Responses-facing for both ordinary sessions and Grok Build's WebSearchClient. The route may use `responses`, `messages`, or `chat_completions` upstream. The environment variable takes precedence, selection overrides an original false only while the proxy runs, and no startup request is sent. |
 | Any channel with `supports_backend_search = true` | Grok Build uses Responses hosted tools while hellogrok calls that channel's own working search API: Responses, Messages `web_search_20250305`, or the selected Chat search dialect/bridge. |
-| Any channel with `supports_backend_search = false` or omitted | Grok Build uses client `web_search`: first `[models].web_search` or `GROK_WEB_SEARCH_MODEL`, otherwise its authenticated official fallback. |
+| Any channel with `supports_backend_search = false` | Grok Build uses client `web_search`: first `[models].web_search` or `GROK_WEB_SEARCH_MODEL`, otherwise its authenticated official fallback. A selected custom search route is temporarily overridden to true; models on the exact first-party DeepSeek endpoint also default to native hosted search when the field is omitted. |
 | No usable hosted or client search path | `web_search` is unavailable for that model. |
 | `web_fetch` | Remains independent of the search-model selection and follows the active tool permissions. |
 
-hellogrok never creates, selects, or replaces `[models].web_search`, and startup sends no search-capability probes. A Messages channel marked capable must actually support `web_search_20250305`. Chat defaults to `web_search_options`; official DeepSeek Chat bridges to its Messages API, and official xAI Chat bridges to Responses. Set `chat_search_dialect` to `web_search_options`, `search_parameters`, `messages`, or `responses` when a relay needs an explicit strategy. A provider without the selected capability cannot be made searchable by the proxy.
+hellogrok never creates, selects, or replaces `[models].web_search`, and startup sends no search-capability probes. A Messages channel marked enabled must actually support `web_search_20250305`. Chat defaults to `web_search_options`; first-party `api.deepseek.com` and official xAI Chat bridge to Responses. Set `chat_search_dialect` to `web_search_options`, `search_parameters`, `messages`, or `responses` when a relay needs an explicit strategy. The temporary flag is a routing declaration, not proof of provider capability. A real upstream HTTP rejection is preserved; if the fixed WebSearchClient request is silently answered without a completed search, hellogrok returns a non-retryable `502` stating that the selected search model did not complete backend `web_search`.
 
 For client search, hellogrok clarifies tool descriptions but never infers or forces tool use from prompt text. Mandatory selection comes only from structured `tool_choice`. Internal wire aliases are changed only in protocol-defined tool declarations, choices, and call-name fields; response text, URLs, tool arguments, tool results, and other business JSON remain unchanged.
 
 ### Example configuration
 
-This example uses a Chat Completions channel that supports `web_search_options` as Grok Build's client-search model:
+This example selects a Chat Completions channel that supports `web_search_options` as Grok Build's default search model:
 
 ```toml
 [models]
@@ -128,7 +129,7 @@ chat_search_dialect = "web_search_options"
 supports_backend_search = false
 ```
 
-For any channel that should use its own hosted search in ordinary conversations, set `supports_backend_search = true` only after confirming the selected provider API supports it. Messages uses `web_search_20250305`. Official DeepSeek Chat automatically uses `/anthropic/messages`; other Chat relays can select an explicit `chat_search_dialect`.
+The original false in this example remains user-owned, but selection temporarily overrides it to true while hellogrok runs and restores it on stop. The provider must still support the selected search dialect. For a channel not selected as the default search model, set `supports_backend_search = true` only after confirming its provider API supports hosted search. Messages uses `web_search_20250305`. First-party DeepSeek Messages stays native, while a first-party DeepSeek Chat channel defaults to `/responses`; other Chat relays can select an explicit `chat_search_dialect`.
 
 ### Supported channel settings
 
@@ -136,21 +137,70 @@ For any channel that should use its own hosted search in ordinary conversations,
 |---------|----------|---------|---------|
 | `model` | No | Model table ID | Model identifier sent to the upstream channel. |
 | `base_url` or `api_base_url` | Yes | None | Custom upstream endpoint. Models without a custom URL are not proxied. |
-| `api_backend` | No | `chat_completions` | Native upstream API format: `responses`, `messages`, or `chat_completions`. A capable non-Responses channel is temporarily projected as Responses only to Grok Build; the upstream format and restored config remain unchanged. |
-| `chat_search_dialect` | No | Host-based | Chat hosted-search strategy: `web_search_options`, `search_parameters`, `messages`, or `responses`. Defaults are `messages` for official DeepSeek, `responses` for official xAI, and `web_search_options` elsewhere. |
+| `api_backend` | No | Model catalog, then `chat_completions` | Native upstream API format: `responses`, `messages`, or `chat_completions`. A capable non-Responses channel is temporarily projected as Responses only to Grok Build; the upstream format and restored config remain unchanged. |
+| `chat_search_dialect` | No | Host-based | Chat hosted-search strategy: `web_search_options`, `search_parameters`, `messages`, or `responses`. Defaults are `responses` for first-party `api.deepseek.com` and official xAI, and `web_search_options` elsewhere. |
 | `api_key` | One auth method | None | Static channel credential. Prefer `env_key` for shared configurations. |
 | `env_key` | One auth method | None | Environment variable name or ordered list of names containing the channel credential. |
 | `auth_provider` | One auth method | None | Grok command-based authentication provider. |
 | `auth_scheme` | No | `bearer` | Upstream authentication scheme. Set `x_api_key` only for providers that explicitly require `X-Api-Key`. |
 | `extra_headers` | No | Empty | Additional channel-owned HTTP headers, including provider-specific authentication. Proxy-controlled framing, content, and connection headers are rejected; names are case-insensitive. |
 | `env_http_headers` | No | Empty | HTTP headers populated from environment variables. Resolved values use the same header rules as `extra_headers`. |
-| `supports_backend_search` | No | `false` | When true, uses this channel's own hosted search and exposes canonical Responses search events to Grok Build for all three upstream formats. When false, Grok Build uses its configured or authenticated client-search route. |
+| `supports_backend_search` | No | Catalog/provider default | When true, uses this channel's own hosted search and exposes canonical Responses search events to Grok Build for all three upstream formats. When false, Grok Build uses its configured or authenticated client-search route unless this custom model is selected by `[models].web_search` or `GROK_WEB_SEARCH_MODEL`, which temporarily overrides it to true. The exact first-party DeepSeek endpoint defaults to true independently of model ID. Other unknown models remain owned by explicit configuration or Grok Build's model catalog. |
 
-Model settings may be declared directly under `[model.<id>]` or inherited from a referenced `[model_providers.<id>]`. Model-level values take precedence.
+Model settings may be declared directly under `[model.<id>]` or inherited from a referenced `[model_providers.<id>]`. Model-level values take precedence. When `api_backend` is absent from both, hellogrok leaves it absent in Grok Build's active configuration and follows the concrete protocol Grok Build resolves from its current model catalog; a model unknown to that catalog falls back to Grok Build's `chat_completions` default. A hosted-search tool present on that resolved Responses request is treated as the capability signal, so a future catalog entry does not require a model-ID update in hellogrok.
 
 Quote the full ID when a channel ID contains a dot, for example `[model."provider.v1-beta"]`. Dashes do not require quoting. A value such as `name = "Provider.v1-beta"` is display-only and may use dots or dashes directly. While active, hellogrok also accepts a legacy unquoted dotted header and restores the original text on stop.
 
 Do not manually set a custom channel URL to hellogrok's local address. The application manages temporary local URLs only while the proxy is active.
+
+## DeepSeek
+
+DeepSeek compatibility is enabled by the exact first-party host `api.deepseek.com`, independently of model ID. Rolling aliases and future models therefore inherit authentication, endpoints, hosted search, protocol-level request normalization, queue keep-alives, usage handling, and SSE framing without a hellogrok release. Native same-protocol requests retain unknown fields; cross-protocol bridges map the fields Grok Build currently sends that the target protocol can express. Unknown future reasoning-effort values remain intact. As documented on 2026-08-15, the current production IDs are `deepseek-v4-pro` and `deepseek-v4-flash`; these names are examples, not a hellogrok allowlist. A relay that merely reuses a DeepSeek model name receives no first-party assumptions.
+
+### Recommended configuration
+
+Responses is the closest native match for Grok Build and is the recommended backend:
+
+```toml
+[model.deepseek-v4-pro]
+model = "deepseek-v4-pro"
+base_url = "https://api.deepseek.com"
+env_key = ["DEEPSEEK_API_KEY"]
+api_backend = "responses"
+context_window = 1000000
+max_completion_tokens = 384000
+inference_idle_timeout_secs = 660
+
+[model.deepseek-v4-flash]
+model = "deepseek-v4-flash"
+base_url = "https://api.deepseek.com"
+env_key = ["DEEPSEEK_API_KEY"]
+api_backend = "responses"
+context_window = 1000000
+max_completion_tokens = 384000
+inference_idle_timeout_secs = 660
+```
+
+Leave `supports_backend_search` unset to use DeepSeek's native hosted Web Search, or set it explicitly to `false` to use Grok Build client search instead. Responses and Messages use their configured native search APIs; a Chat configuration defaults to a Responses bridge because DeepSeek documents hosted search there, while an explicit `chat_search_dialect` remains authoritative. Responses and Chat authenticate with Bearer. Native Messages uses the documented `https://api.deepseek.com/anthropic` SDK base URL (the effective endpoint is `/anthropic/v1/messages`) and `X-Api-Key`; the `[1m]` suffix is accepted only as DeepSeek's documented Anthropic integration alias and must not be used with Responses.
+
+The two capacity limits above are current V4 documentation values, not hellogrok runtime constants; the 660-second value is an idle policy chosen to cover DeepSeek's documented ten-minute queue. A value set directly on `[model.*]` takes precedence over one inherited from `[model_providers.*]`. Grok Build already inherits provider `context_window`; while the proxy is active, hellogrok temporarily projects a provider-only `max_completion_tokens` onto the model because current Grok Build does not inherit that field, then restores the original file on stop. If a limit is omitted, hellogrok does not invent it or write a fallback: Grok Build's resolved model catalog or upstream `X-Grok-*` response metadata remains authoritative. DeepSeek's public API documentation does not define those Grok-private response headers, so explicitly configure the desired limits when Grok Build has no matching catalog entry. Future models and rolling aliases can change these values without a hellogrok release.
+
+The current DeepSeek reasoning menu has `High` selected by default. Grok Build exposes `None`, `Low`, `High`, and `Max` for all three protocols, including when the protocol is resolved by its catalog. The official effort mapping is applied consistently: `minimal`/`low` map to `low`, `medium`/`high`/`xhigh` map to `high`, `max` stays `max`, and `none` disables thinking. (`minimal` is a Responses-only input value.) These host-scoped endpoint rules apply to future model IDs too, while unknown future effort values pass through unchanged. An explicit `supports_reasoning_effort` or `reasoning_efforts` configuration remains authoritative.
+
+### Native capability mapping
+
+| DeepSeek surface | hellogrok behavior in Grok Build |
+|------------------|----------------------------------|
+| Responses | Preserves `instructions`, developer messages, reasoning, native `text.format` JSON Schema, function tools, and native Web Search. It does not invent unsupported `include` values and handles `response.completed`, `response.incomplete`, and `response.failed` as terminal events. |
+| Chat Completions | Preserves tool-call `reasoning_content`, requests the terminal streaming usage block, maps `max_completion_tokens` to `max_tokens` unless the latter is already explicit, converts developer messages to system messages, supplies non-null assistant tool content, and maps an explicit Responses `user` to DeepSeek `user_id`. DeepSeek rejects `tool_choice` while thinking is enabled, so the selector is removed while function declarations remain available for automatic use; an explicit non-thinking request keeps the documented selector forms. Grok Build `json_schema` becomes documented `json_object` mode plus a schema instruction, and Grok Build validates the returned JSON locally. |
+| Anthropic Messages | Uses `X-Api-Key`, preserves thinking/tool history, effort control, function tools, and native server Web Search blocks. An omitted Grok Build `None` selection becomes `thinking.type=disabled` instead of falling through to DeepSeek's default `high`; only the supported `output_config.effort` is sent, explicit Responses `user` maps to `metadata.user_id`, and the documented `deepseek-v4-pro[1m]` alias remains on the Messages wire. |
+| Queue and usage | Accepts non-streaming empty-line keep-alives and streaming `: keep-alive` comments. Real terminal usage is preserved so Grok Build can drive context accounting and auto-compaction. |
+
+Responses is the only DeepSeek surface here with native JSON Schema output. Chat supports only `json_object`, can occasionally return empty content, and relies on the injected schema instruction plus Grok Build's local validator. Chat function `strict: true` is a separate Beta feature: configure `base_url = "https://api.deepseek.com/beta"` when that exact Chat behavior is required. Messages structured output continues through Grok Build's validated `StructuredOutput` function because DeepSeek's Anthropic-compatible `output_config` supports effort only. Explicit caller-supplied user isolation IDs are preserved across protocol bridges, but hellogrok does not invent one or derive one from unrelated identity headers. A Chat `insufficient_system_resource` finish is surfaced as a structured failure, or as retryable HTTP `503` when the native non-streaming protocol can still return an HTTP error.
+
+The provider's API surface is broader than the part Grok Build can address. DeepSeek Responses does not support `include`, image/file input, previous responses, server-side conversations, background mode, truncation, or `stream_options`; native `file_search`, `code_interpreter`, `computer_use`, and `mcp` tool types are ignored. This does not disable Grok Build's local shell, MCP, task, file, or `apply_patch` tools: current Grok Build source sends them as supported function tools. DeepSeek also documents a custom tool shape named `apply_patch`; hellogrok leaves that shape intact when a caller supplies it, but current Grok Build source does not dispatch the resulting `custom_tool_call` to its local patch executor, so this passthrough is not presented as a local editing path. DeepSeek's Anthropic API does not support image/document input, code execution blocks, or native MCP blocks. Prefix continuation and FIM exist in DeepSeek's API, but hellogrok does not invent Grok Build UI or completion endpoints that the agent does not call.
+
+Caching stays provider-native. hellogrok preserves ordered conversation/tool/reasoning history and Grok Build's `x-grok-conv-id` on all three protocols; it keeps Responses cache keys stable, preserves native Messages `cache_control` markers, and adds the same system/current-tip/previous-turn markers when converting Responses to Messages. DeepSeek ignores Responses cache-key parameters and manages its prefix cache automatically, so those inert fields are left stable rather than treated as a cache switch. Cache usage fields are preserved or projected into the receiving protocol, but only a real provider response can prove a cache hit.
 
 ## Download
 
@@ -181,7 +231,7 @@ The final command must print `True`. On Linux use `sha256sum -c <file>.sha256`; 
 - A valid credential source for every custom channel.
 - Go **1.26.5** when building from source.
 
-Grok Build **1.0.0** is the current verified baseline. Newer versions should be checked with the included smoke tests because Grok Build's custom-model behavior may evolve.
+Compatibility is verified against the latest fetched Grok Build `origin/main`, not against an older release branch. The exact tested revision is reported with the test results because the local Grok Build checkout may update independently.
 
 Set `GROK_HOME` to use a Grok configuration directory other than `~/.grok`.
 
@@ -333,7 +383,7 @@ hellogrok local channel proxy
 Configured custom API channel
 ```
 
-At startup, hellogrok validates each custom channel and points its URL to a channel-scoped local route. Channels without backend search keep their configured Grok Build consumer and native stream format. Capable channels are temporarily projected as Responses because that is the Grok Build consumer that serializes hosted tools and renders structured search results; hellogrok then translates at the provider boundary and restores the original configuration on stop.
+At startup, hellogrok validates each custom channel and points its URL to a channel-scoped local route. Channels without backend search keep their configured Grok Build consumer and native stream format unless selected as the default search model. Capability-enabled and selected-search channels are temporarily projected as Responses because that is the Grok Build consumer that serializes hosted tools and renders structured search results; hellogrok then translates at the provider boundary and restores the original configuration on stop.
 
 Responses providers remain Responses. Messages providers receive Messages requests and return Responses events through a bidirectional converter. Chat providers use `web_search_options` or `search_parameters`, or bridge to Messages/Responses when configured. Grok Build's fixed non-streaming `WebSearchClient` request uses the same provider adapters when a custom channel is selected as the client-search model.
 
@@ -347,7 +397,7 @@ Confirm that the intended `[model.<id>]` or referenced provider has a valid `bas
 
 ### `web_search` is unavailable
 
-Check the startup log for the channel's Build and upstream protocols, then inspect the first failing search request. A capable Responses channel must implement the Responses hosted tool; Messages must support `web_search_20250305`; Chat must support its selected `chat_search_dialect`. A channel marked false instead needs a valid `[models].web_search` / `GROK_WEB_SEARCH_MODEL` selection or usable official xAI credentials. `web_fetch` is independent but can still be removed by active tool permissions.
+Check the startup log for the channel's Build and upstream protocols, then inspect the first failing search request. A Responses channel marked enabled must implement the Responses hosted tool; Messages must support `web_search_20250305`; Chat must support its selected `chat_search_dialect`. A channel marked false instead needs a valid `[models].web_search` / `GROK_WEB_SEARCH_MODEL` selection or usable official xAI credentials. Selecting that custom route temporarily makes it backend-search enabled, so a provider rejection or the non-retryable “did not complete backend web_search” error means the upstream capability is missing; the proxy will not hide it with another fallback. `web_fetch` is independent but can still be removed by active tool permissions.
 
 ### A request returns 401, 403, or 502
 
@@ -369,7 +419,7 @@ Restart the proxy with the current build. Some Messages-compatible relays omit t
 
 For a streaming request, hellogrok sends `stream=true` to the selected provider API. Non-capable channels keep native SSE. Capable Messages and Chat channels are translated incrementally into Responses events so Grok Build can consume reasoning, text, function calls, `web_search_call`, sources, and terminal status. If the log reports a buffered fallback, the upstream returned one complete JSON response and true streaming was unavailable for that request.
 
-Current Grok Build has two Responses source paths: hosted search reads `web_search_call.action.sources`, while its client `web_search` tool reads URL citations from `output_text.annotations`. Before forwarding Responses hosted search, hellogrok adds `web_search_call.action.sources` to `include` without replacing caller entries, so compatible providers return every consulted URL rather than only cited or opened pages. Responses-level `citations`, Messages search-result/citation blocks, and Chat `annotations`, `citations`, `search_results`, or `web_search_results` are normalized into both Grok Build paths. The WebSearchClient adapter uses the same normalization and, only when search execution is independently confirmed, recovers valid HTTP(S) links from the final answer. A normal answer link does not create a search call. If a provider returns no real URL, search activity can still be shown but a trustworthy site count cannot be fabricated.
+Current Grok Build has two Responses source paths: hosted search reads `web_search_call.action.sources`, while its client `web_search` tool reads URL citations from `output_text.annotations`. Before forwarding Responses hosted search, hellogrok adds `web_search_call.action.sources` to `include` without replacing caller entries for providers that support that field. DeepSeek Responses explicitly does not support `include`, so no value is injected there; its native search action is normalized directly. Responses-level `citations`, Messages search-result/citation blocks, and Chat `annotations`, `citations`, `search_results`, or `web_search_results` are normalized into both Grok Build paths. The WebSearchClient adapter uses the same normalization and, only when search execution is independently confirmed, recovers valid HTTP(S) links from the final answer. A normal answer link does not create a search call. If a provider returns no real URL, search activity can still be shown but a trustworthy site count cannot be fabricated.
 
 ### `unknown variant keepalive` or an endless `Waiting for response...`
 
@@ -377,7 +427,25 @@ Upgrade both hellogrok executables to the same current release or build, then re
 
 The completion log includes `heartbeats=<count>`. If the same error remains while that counter stays zero, confirm that Grok Build is routed through the current proxy with `hellogrok routes`; the provider is likely emitting a different private event name that should be diagnosed from a credential-free stream capture rather than added as a model-specific workaround.
 
-hellogrok waits at most 180 seconds for upstream response headers and at most 180 seconds between SSE data reads. A heartbeat counts as data and renews that idle window. A timeout before response headers returns retryable `504`; after a `200` stream has begun, hellogrok emits the receiving protocol's `proxy_stream_error` and closes the upstream. There is no total request timeout, so an active long-running reasoning stream is not terminated. The `response_model` log line shows the upstream-declared and configured models; `mismatch=true` identifies a relay that silently substituted a model, while `conflict=true` means different response frames declared different models.
+For ordinary channels, hellogrok waits at most 601 seconds for upstream response headers and at most 601 seconds between reads from any response body, including non-streaming JSON and error bodies. This stays one second beyond Grok Build's 600-second shell default, so Grok Build remains the owner of its native timeout classification. First-party `api.deepseek.com` routes use 660 seconds because DeepSeek can queue a request for up to ten minutes. A non-streaming queue newline or streaming heartbeat counts as data and renews that idle window. A timeout before response headers or while reading a non-streaming body returns retryable `504`; after a `200` stream has begun, hellogrok emits the receiving protocol's `proxy_stream_error` and closes the upstream. There is no total request timeout, so an active long-running response is not terminated. The `response_model` log line shows the upstream-declared and configured models; `mismatch=true` identifies a relay that silently substituted a model, while `conflict=true` means different response frames declared different models.
+
+### Automatic compaction never starts
+
+Grok Build does not add each response's `usage.total_tokens` to a running sum. On a terminal Responses event, the current public source first replaces the typed `total_tokens` with `usage.context_details.input_tokens + usage.context_details.output_tokens` when both private fields are valid; without that extension, the provider's `total_tokens` passes through. Chat state then treats the resulting value as the current complete-context measurement, replaces its token baseline with it, adds only locally estimated items produced since that response, and checks the configured auto-compaction threshold before the next model sample.
+
+Older hellogrok builds filled missing provider usage with zero-valued fields. That made a syntactically valid response report `total_tokens: 0`, so Grok Build repeatedly reset its baseline to zero and never reached the configured threshold. Current builds preserve trustworthy provider totals, derive a total only when complete input and output measurements exist, and emit `usage: null` for missing, partial, negative, fractional, all-zero placeholder, or otherwise untrustworthy accounting. A native Responses measurement with positive complete `context_details` remains usable even if its separate billing counters are zero.
+
+For first-party DeepSeek, hellogrok also requests streaming usage, preserves DeepSeek's billing `total_tokens`, and derives Grok Build's private `context_details` only from complete real input/output counts. Context-window metadata follows one rule across DeepSeek, GPT, Claude, Grok, Gemini, and other channels: an explicit `[model.*].context_window` (or inherited `[model_providers.*].context_window`) is returned in `X-Grok-Context-Window` and cannot be replaced by a different upstream header; when it is absent, provider metadata is passed through untouched. `max_completion_tokens` has the same priority, and a provider-only configured value is temporarily projected onto `[model.*]` because current Grok Build does not inherit it. The terminal usage block therefore updates the numerator while the selected local tier, or otherwise the provider/Grok Build model metadata, supplies the denominator. hellogrok does not rewrite `auto_compact_threshold_percent`; Grok Build checks `context_window * auto_compact_threshold_percent`.
+
+Current Grok Build deliberately ignores a context-window response-header downgrade. Therefore, if a model is absent from its catalog and the provider maximum is lower than Grok Build's fallback, no proxy can correct the denominator after the first response merely by forwarding that header; set `context_window` explicitly. A relay that omits usage also cannot be made exact without the provider's tokenizer and hidden prompt overhead. `usage: null` deliberately preserves Grok Build's prior baseline instead of corrupting it. After upgrading, start one new DeepSeek turn so its real terminal usage can replace any zero baseline already stored in the open session.
+
+Complete input/output usage gives an exact baseline for ordinary DeepSeek requests. Server-side Web Search is the one semantic boundary: DeepSeek's official Responses documentation exposes no `context_details` field and does not say whether a multi-step hosted-search response reports the final live context or cumulative billing usage. hellogrok can only project the complete returned counts into Grok Build's extension. Auto-compaction therefore no longer fails because of a zero baseline, but the exact hosted-search trigger point still depends on DeepSeek's wire semantics and requires validation against real API responses. The same rule applies to non-DeepSeek channels: trustworthy terminal usage plus a correct `context_window` supports exact triggering; a provider that omits usage can only retain the prior baseline and grow approximately.
+
+### The Grok Build window stops accepting clicks
+
+First distinguish an unresponsive interface from a long active task. If hellogrok and Grok Build logs continue to show requests, heartbeats, tool calls, or phase transitions, the agent is still running or waiting in the provider queue; DeepSeek may legally keep that request queued for ten minutes. The body-idle limits above now prevent a silent upstream from holding the proxy path forever.
+
+If the whole window truly stops processing input while logs also stop advancing, the HTTP proxy alone cannot establish a UI-thread deadlock. Record the exact timestamp, then preserve the matching Grok Build unified log, hellogrok log, Windows Application Hang/crash event, and a process dump if available. A `504` or `proxy_stream_error` identifies a bounded upstream wait; a renderer/process hang without either requires Grok Build-side evidence rather than a provider-specific network workaround.
 
 ### A Claude Messages channel selects the wrong model or returns 404
 
@@ -385,7 +453,7 @@ Use `api_backend = "messages"` (plural). Grok Build defines only `chat_completio
 
 ### An open window did not follow the proxy switch
 
-Check the **Grok session hot switch** line in **Status and logs**. Automatic switching applies to idle custom-model sessions on a shared leader and supports both current and legacy ACP model-switch method names. On Windows, a live named-pipe leader misreported as stale by Grok Build 1.0.0 is accepted only when its leader lock is actively held. A working or input-blocked session is skipped safely; reselect its current model in `/model` after the active operation finishes. A window started with `--no-leader` exposes no external IPC to hellogrok and also requires manual reselection or a new window.
+Check the **Grok session hot switch** line in **Status and logs**. Automatic switching applies to idle custom-model sessions on a shared leader and supports both current and legacy ACP model-switch method names. On Windows, a live named-pipe leader misreported as stale by Grok Build 1.0.x is accepted only when its leader lock is actively held. A working or input-blocked session is skipped safely; reselect its current model in `/model` after the active operation finishes. A window started with `--no-leader` exposes no external IPC to hellogrok and also requires manual reselection or a new window.
 
 ### A model switch asks to start a new conversation
 
@@ -397,7 +465,7 @@ Ensure no hellogrok process is running, then execute `hellogrok restore`. Do not
 
 ### Stop or exit is deferred after editing the active configuration
 
-Version 0.1.7 and later merge proxy-managed fields individually during shutdown, so an edit such as changing `supports_backend_search` no longer needs to be rolled back. If shutdown is still deferred, the edited TOML is invalid or a renamed/moved model still contains one of the current takeover's temporary `127.0.0.1:18787` routes. Restore a valid model structure or replace that temporary URL with the intended upstream URL, then stop again; do not force-terminate the process while Grok Build still points at it.
+hellogrok merges proxy-managed fields individually during shutdown, so an edit such as changing `supports_backend_search` does not need to be rolled back. If shutdown is still deferred, the edited TOML is invalid or a renamed/moved model still contains one of the current takeover's temporary `127.0.0.1:18787` routes. Restore a valid model structure or replace that temporary URL with the intended upstream URL, then stop again; do not force-terminate the process while Grok Build still points at it.
 
 ### Port `18787` is already in use
 
@@ -435,7 +503,7 @@ CI runs tests and default builds on Windows, Linux, Intel macOS, and Apple Silic
 ## Limitations
 
 - hellogrok cannot create provider-side search capability. A hosted-search channel must actually support search and return its results.
-- Responses-to-Messages/Chat conversation conversion is enabled only for channels explicitly marked `supports_backend_search = true`, plus Grok Build's fixed non-streaming WebSearchClient request. Other cross-protocol requests are rejected.
+- Responses-to-Messages/Chat conversation conversion is enabled only for capability-enabled channels (explicit `supports_backend_search = true`, a selected default search model, the first-party DeepSeek endpoint default, or a hosted-search request resolved from Grok Build's remote model catalog), plus Grok Build's fixed non-streaming WebSearchClient request. Other cross-protocol requests are rejected.
 - A relay that removes tool declarations, tool calls, citations, or result events cannot be fully repaired downstream.
 - A provider that ignores `stream=true` cannot be made truly streaming after its complete JSON response has already arrived; hellogrok logs and uses a buffered compatibility fallback.
 - Provider-encrypted hidden reasoning is scoped to its emitting signature domain. Cross-domain switching preserves visible conversation and tool history but intentionally omits incompatible private reasoning.

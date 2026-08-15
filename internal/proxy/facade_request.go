@@ -70,13 +70,33 @@ func routeProtocol(route config.Route) (wireProtocol, error) {
 	}
 }
 
+// effectiveRouteProtocol follows Grok Build's resolved request protocol when
+// neither the model/provider config nor a hellogrok-projected capability fixes
+// the upstream protocol. This lets remote catalog updates flow through without
+// teaching the proxy each future model ID.
+func effectiveRouteProtocol(route config.Route, incoming wireProtocol) (wireProtocol, error) {
+	if !route.APIBackendConfigured && strings.TrimSpace(route.APIBackend) == "" && !route.SupportsBackendSearch {
+		switch incoming {
+		case wireResponses, wireMessages, wireChatCompletions:
+			return incoming, nil
+		default:
+			return wireUnknown, fmt.Errorf("unsupported incoming protocol %q", incoming)
+		}
+	}
+	return routeProtocol(route)
+}
+
 // providerSearchProtocol selects the provider API that can actually execute
-// hosted search. Chat channels may explicitly bridge to Responses or Messages;
-// official xAI and DeepSeek endpoints use their known working search APIs.
+// hosted search. Responses and Messages remain on their configured native API.
+// Chat channels may explicitly bridge to Responses or Messages, with host-based
+// defaults used only when no dialect was configured.
 func providerSearchProtocol(route config.Route) (wireProtocol, error) {
 	native, err := routeProtocol(route)
-	if err != nil || native != wireChatCompletions {
+	if err != nil {
 		return native, err
+	}
+	if native != wireChatCompletions {
+		return native, nil
 	}
 	switch chatSearchDialect(route) {
 	case config.ChatSearchDialectResponses:
@@ -95,26 +115,26 @@ func upstreamTarget(route config.Route, protocol wireProtocol, rawQuery string) 
 	if err != nil || u.Host == "" {
 		return "", fmt.Errorf("invalid upstream base_url")
 	}
+	basePath := strings.TrimRight(u.Path, "/")
+	if isOfficialDeepSeekRoute(route) {
+		basePath = trimDeepSeekProtocolRoot(basePath)
+	}
 	var suffix string
 	switch protocol {
 	case wireResponses:
 		suffix = "/responses"
 	case wireMessages:
-		suffix = "/messages"
-		if native, _ := routeProtocol(route); native == wireChatCompletions && isOfficialDeepSeekHost(route.Host) {
-			basePath := strings.TrimRight(u.Path, "/")
-			basePath = strings.TrimSuffix(basePath, "/v1")
-			if !strings.HasSuffix(basePath, "/anthropic") {
-				basePath += "/anthropic"
-			}
-			u.Path = basePath
+		if isOfficialDeepSeekRoute(route) {
+			suffix = "/anthropic/v1/messages"
+		} else {
+			suffix = "/messages"
 		}
 	case wireChatCompletions:
 		suffix = "/chat/completions"
 	default:
 		return "", fmt.Errorf("unsupported upstream protocol %q", protocol)
 	}
-	u.Path = strings.TrimRight(u.Path, "/") + suffix
+	u.Path = basePath + suffix
 	u.RawPath = ""
 	if rawQuery != "" {
 		incoming, err := url.ParseQuery(rawQuery)
@@ -133,6 +153,15 @@ func upstreamTarget(route config.Route, protocol wireProtocol, rawQuery string) 
 	return u.String(), nil
 }
 
+func trimDeepSeekProtocolRoot(path string) string {
+	for _, suffix := range []string{"/anthropic/v1", "/anthropic", "/v1"} {
+		if strings.HasSuffix(path, suffix) {
+			return strings.TrimSuffix(path, suffix)
+		}
+	}
+	return path
+}
+
 func adaptFacadeRequest(body []byte, route config.Route, incoming wireProtocol) (facadeRequest, error) {
 	return adaptFacadeRequestWithReasoning(body, route, incoming, nil, keepUnknownReasoning)
 }
@@ -148,7 +177,7 @@ func adaptFacadeRequestWithReasoning(
 	if err != nil {
 		return facadeRequest{}, fmt.Errorf("decode %s request: %w", protocolLabel(incoming), err)
 	}
-	native, err := routeProtocol(route)
+	native, err := effectiveRouteProtocol(route, incoming)
 	if err != nil {
 		return facadeRequest{}, err
 	}
@@ -158,11 +187,16 @@ func adaptFacadeRequestWithReasoning(
 	if incoming == wireResponses {
 		preparedSearch = prepareClientSearchExecution(root, buildHostedSearch, buildXSearch)
 	}
+	// When supports_backend_search is absent locally, Grok Build may inherit it
+	// from a newer remote catalog. The concrete hosted tool on a Responses
+	// request is the authoritative capability signal available to the facade.
+	catalogHostedSearch := incoming == wireResponses && !preparedSearch &&
+		!route.SupportsBackendSearch && hasHostedSearchTool(root)
 	expected := native
 	if route.SupportsBackendSearch {
 		expected = wireResponses
 	}
-	if incoming != expected && !(incoming == wireResponses && preparedSearch) {
+	if incoming != expected && !(incoming == wireResponses && (preparedSearch || catalogHostedSearch)) {
 		return facadeRequest{}, fmt.Errorf("channel %q expects %s while the facade is active; received %s",
 			route.ChannelID, protocolLabel(expected), protocolLabel(incoming))
 	}
@@ -179,7 +213,7 @@ func adaptFacadeRequestWithReasoning(
 
 	// Capable sessions and Grok Build's dedicated WebSearchClient both arrive as
 	// Responses. Convert that canonical request only at the provider boundary.
-	if route.SupportsBackendSearch || preparedSearch {
+	if route.SupportsBackendSearch || catalogHostedSearch || preparedSearch {
 		root["model"] = route.WireModel
 		request.Reasoning = filterReasoningInput(root, route, provenance, filterMode)
 		request.SearchQuery = lastUserText(root["input"])
@@ -187,6 +221,11 @@ func adaptFacadeRequestWithReasoning(
 		if route.SupportsBackendSearch && !preparedSearch {
 			capabilities = routeHostedSearchCapabilities(route)
 			request.ProxyAddedWebSearch = ensureHostedSearch(root, capabilities)
+		} else if catalogHostedSearch {
+			capabilities = hostedSearchCapabilities{
+				Web: true,
+				X:   native == wireResponses && isOfficialXAIHost(route.Host),
+			}
 		}
 		normalizeHostedSearchObject(root, capabilities)
 		request.HostedWebSearch = hasHostedSearchTool(root)
@@ -196,24 +235,35 @@ func adaptFacadeRequestWithReasoning(
 		if preparedSearch {
 			request.Kind = clientSearchRequest
 		}
-		request.Protocol, err = providerSearchProtocol(route)
-		if err != nil {
-			return facadeRequest{}, err
+		if catalogHostedSearch {
+			request.Protocol = native
+		} else {
+			request.Protocol, err = providerSearchProtocol(route)
+			if err != nil {
+				return facadeRequest{}, err
+			}
 		}
 		switch request.Protocol {
 		case wireResponses:
-			includeResponsesWebSearchSources(root)
+			// DeepSeek documents include as unsupported and silently ignored. Its
+			// native web_search_call is normalized from the returned action instead.
+			if !isOfficialDeepSeekRoute(route) {
+				includeResponsesWebSearchSources(root)
+			}
+			normalizeDeepSeekRequest(root, route, request.Protocol)
 			request.Body, err = encodeRequestObject(root)
 		case wireMessages:
 			var converted map[string]any
 			converted, err = responsesToMessagesRequest(root)
 			if err == nil {
+				normalizeDeepSeekRequest(converted, route, request.Protocol)
 				request.Body, err = encodeRequestObject(converted)
 			}
 		case wireChatCompletions:
 			var converted map[string]any
 			converted, err = responsesToChatRequest(root, route)
 			if err == nil {
+				normalizeDeepSeekRequest(converted, route, request.Protocol)
 				request.Body, err = encodeRequestObject(converted)
 			}
 		}
@@ -232,6 +282,7 @@ func adaptFacadeRequestWithReasoning(
 	if !aliasClientWebSearchOnWire(root, request.ClientSearchAlias, native) {
 		request.ClientSearchAlias = ""
 	}
+	normalizeDeepSeekRequest(root, route, request.Protocol)
 	request.Body, err = encodeRequestObject(root)
 	return request, err
 }
@@ -295,14 +346,13 @@ func prepareClientSearchExecution(root map[string]any, buildHostedSearch, buildX
 		return false
 	}
 	tools := anySlice(root["tools"])
-	if len(tools) != 1 || !numberEquals(root["temperature"], 0.1) ||
-		!numberEquals(root["top_p"], 0.95) || numberInt(root["max_output_tokens"]) != 8192 {
+	if len(tools) != 1 {
 		return false
 	}
 	for _, raw := range tools {
 		tool, _ := raw.(map[string]any)
 		typ := strings.ToLower(strings.TrimSpace(stringValue(tool["type"])))
-		if typ != "x_search" && !isHostedWebSearchType(typ) {
+		if !isHostedWebSearchType(typ) {
 			return false
 		}
 	}
@@ -315,25 +365,6 @@ func prepareClientSearchExecution(root map[string]any, buildHostedSearch, buildX
 		root["tool_choice"] = map[string]any{"type": "web_search"}
 	}
 	return true
-}
-
-func numberEquals(value any, expected float64) bool {
-	var actual float64
-	switch number := value.(type) {
-	case json.Number:
-		parsed, err := number.Float64()
-		if err != nil {
-			return false
-		}
-		actual = parsed
-	case float64:
-		actual = number
-	case float32:
-		actual = float64(number)
-	default:
-		return false
-	}
-	return actual == expected
 }
 
 func setFunctionToolDescription(tool map[string]any, description string) {
@@ -495,19 +526,26 @@ func responsesToMessagesRequest(root map[string]any) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
+	maxTokens := positiveInt(root["max_output_tokens"], 0)
+	if maxTokens == 0 {
+		return nil, fmt.Errorf("Responses max_output_tokens must be a positive integer when converting to Messages; configure max_completion_tokens or use model metadata that supplies it")
+	}
 	if instructions := stringValue(root["instructions"]); instructions != "" {
 		system = append([]string{instructions}, system...)
 	}
 	out := map[string]any{
 		"model":      stringValue(root["model"]),
 		"messages":   messages,
-		"max_tokens": positiveInt(root["max_output_tokens"], 8192),
+		"max_tokens": maxTokens,
 		"stream":     root["stream"] == true,
 	}
 	if len(system) > 0 {
 		out["system"] = strings.Join(system, "\n\n")
 	}
 	copyIfPresent(out, root, "temperature", "top_p")
+	if user, exists := root["user"]; exists && user != nil {
+		out["metadata"] = map[string]any{"user_id": user}
+	}
 
 	if !toolChoiceDisablesTools(root["tool_choice"]) {
 		tools, hosted := messagesTools(root["tools"], root["tool_choice"])
@@ -542,10 +580,87 @@ func responsesToMessagesRequest(root map[string]any) (map[string]any, error) {
 			}
 		}
 	}
+	applyMessagesCacheBreakpoints(out)
 	if err := validateMessagesToolHistory(out["messages"]); err != nil {
 		return nil, fmt.Errorf("converted Messages request: %w", err)
 	}
 	return out, nil
+}
+
+// applyMessagesCacheBreakpoints mirrors Grok Build's Messages request builder:
+// cache the system prompt, the current tip, and the user turn where the prior
+// request ended. Keeping one provider slot free also avoids Anthropic's limit.
+func applyMessagesCacheBreakpoints(root map[string]any) {
+	if root == nil {
+		return
+	}
+	cacheControl := func() map[string]any { return map[string]any{"type": "ephemeral"} }
+	switch system := root["system"].(type) {
+	case string:
+		root["system"] = []any{map[string]any{
+			"type": "text", "text": system, "cache_control": cacheControl(),
+		}}
+	case []any:
+		for index := len(system) - 1; index >= 0; index-- {
+			block, _ := system[index].(map[string]any)
+			if block != nil && stringValue(block["type"]) == "text" {
+				block["cache_control"] = cacheControl()
+				break
+			}
+		}
+	}
+
+	messages, _ := root["messages"].([]any)
+	tip := -1
+	for index := len(messages) - 1; index >= 0; index-- {
+		message, _ := messages[index].(map[string]any)
+		if markMessagesCacheBreakpoint(message) {
+			tip = index
+			break
+		}
+	}
+	if tip < 0 {
+		return
+	}
+	previousAssistant := -1
+	for index := tip - 1; index >= 0; index-- {
+		message, _ := messages[index].(map[string]any)
+		if strings.EqualFold(strings.TrimSpace(stringValue(message["role"])), "assistant") {
+			previousAssistant = index
+			break
+		}
+	}
+	for index := previousAssistant - 1; index >= 0; index-- {
+		message, _ := messages[index].(map[string]any)
+		if strings.EqualFold(strings.TrimSpace(stringValue(message["role"])), "user") {
+			markMessagesCacheBreakpoint(message)
+			break
+		}
+	}
+}
+
+func markMessagesCacheBreakpoint(message map[string]any) bool {
+	if message == nil {
+		return false
+	}
+	cacheControl := map[string]any{"type": "ephemeral"}
+	switch content := message["content"].(type) {
+	case string:
+		message["content"] = []any{map[string]any{
+			"type": "text", "text": content, "cache_control": cacheControl,
+		}}
+		return true
+	case []any:
+		for index := len(content) - 1; index >= 0; index-- {
+			block, _ := content[index].(map[string]any)
+			switch stringValue(block["type"]) {
+			case "text", "tool_result", "image", "tool_use":
+				block["cache_control"] = cacheControl
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func responsesToChatRequest(root map[string]any, route config.Route) (map[string]any, error) {
@@ -569,7 +684,7 @@ func responsesToChatRequest(root map[string]any, route config.Route) (map[string
 	if n := positiveInt(root["max_output_tokens"], 0); n > 0 {
 		out["max_tokens"] = n
 	}
-	copyIfPresent(out, root, "temperature", "top_p")
+	copyIfPresent(out, root, "temperature", "top_p", "user")
 
 	var tools []any
 	hosted := hasHostedSearchTool(root) && toolChoiceAllowsHostedSearch(root["tool_choice"])
@@ -647,10 +762,17 @@ func responsesInputToMessages(input any, anthropic bool) ([]any, []string, error
 	var pendingReasoning []string
 	chatAssistantIndex := -1
 	if text, ok := input.(string); ok {
-		return []any{map[string]any{"role": "user", "content": text}}, nil, nil
+		content := any(text)
+		if anthropic {
+			// Grok Build's Messages builder always represents conversation text as
+			// blocks. Keeping that shape even before a cache breakpoint is attached
+			// prevents old history from changing representation when breakpoints move.
+			content = []any{map[string]any{"type": "text", "text": text}}
+		}
+		return []any{map[string]any{"role": "user", "content": content}}, nil, nil
 	}
 	items := anySlice(input)
-	for _, raw := range items {
+	for itemIndex, raw := range items {
 		item, _ := raw.(map[string]any)
 		if item == nil {
 			continue
@@ -719,7 +841,7 @@ func responsesInputToMessages(input any, anthropic bool) ([]any, []string, error
 			}
 		case "web_search_call":
 			if anthropic {
-				for _, block := range responseWebSearchToMessagesBlocks(item) {
+				for _, block := range responseWebSearchToMessagesBlocks(item, itemIndex) {
 					appendBlockToRole(&messages, "assistant", block)
 				}
 				continue
@@ -750,7 +872,7 @@ func responsesInputToMessages(input any, anthropic bool) ([]any, []string, error
 // history carried by a Responses web_search_call. Keeping the tool-use block
 // adjacent to its result avoids relying on process-local replay state and makes
 // continued Messages conversations deterministic after restarts.
-func responseWebSearchToMessagesBlocks(item map[string]any) []map[string]any {
+func responseWebSearchToMessagesBlocks(item map[string]any, itemIndex int) []map[string]any {
 	action, _ := item["action"].(map[string]any)
 	if action == nil {
 		return nil
@@ -761,7 +883,7 @@ func responseWebSearchToMessagesBlocks(item map[string]any) []map[string]any {
 	}
 	id := firstString(item, "id")
 	if id == "" {
-		id = compatID("srv")
+		id = fmt.Sprintf("srv_%d", itemIndex)
 	}
 	use := map[string]any{
 		"type": "server_tool_use", "id": id, "name": "web_search",
@@ -1107,6 +1229,9 @@ func firstSearchQuery(value any) string {
 
 func convertMessageContent(value any, anthropic bool) any {
 	if text, ok := value.(string); ok {
+		if anthropic {
+			return []any{map[string]any{"type": "text", "text": text}}
+		}
 		return text
 	}
 	var blocks []any
@@ -1131,7 +1256,7 @@ func convertMessageContent(value any, anthropic bool) any {
 			}
 		}
 	}
-	if len(blocks) == 1 {
+	if !anthropic && len(blocks) == 1 {
 		if block, _ := blocks[0].(map[string]any); block != nil && stringValue(block["type"]) == "text" {
 			return stringValue(block["text"])
 		}
@@ -1238,8 +1363,8 @@ func chatSearchDialect(route config.Route) config.ChatSearchDialect {
 	if route.ChatSearchDialect != "" {
 		return route.ChatSearchDialect
 	}
-	if isOfficialDeepSeekHost(route.Host) {
-		return config.ChatSearchDialectMessages
+	if isOfficialDeepSeekRoute(route) {
+		return config.ChatSearchDialectResponses
 	}
 	if isOfficialXAIHost(route.Host) {
 		return config.ChatSearchDialectResponses
@@ -1258,11 +1383,6 @@ func normalizedHostname(value string) string {
 func isOfficialXAIHost(value string) bool {
 	host := normalizedHostname(value)
 	return host == "x.ai" || strings.HasSuffix(host, ".x.ai")
-}
-
-func isOfficialDeepSeekHost(value string) bool {
-	host := normalizedHostname(value)
-	return host == "deepseek.com" || strings.HasSuffix(host, ".deepseek.com")
 }
 
 func messagesToolChoice(value any, hosted bool) any {

@@ -131,7 +131,7 @@ func nativeRequestBody(backend string, stream bool) []byte {
 	var body string
 	switch backend {
 	case "responses":
-		body = fmt.Sprintf(`{"model":"display","input":"hi","stream":%t}`, stream)
+		body = fmt.Sprintf(`{"model":"display","input":"hi","max_output_tokens":128,"stream":%t}`, stream)
 	case "messages":
 		body = fmt.Sprintf(`{"model":"display","messages":[{"role":"user","content":"hi"}],"max_tokens":128,"stream":%t}`, stream)
 	default:
@@ -151,6 +151,12 @@ func nativeSuccessBody(backend, model, text string) string {
 	}
 }
 
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return fn(request)
+}
+
 func TestServerCanRestartAfterStop(t *testing.T) {
 	s := New(log.New(io.Discard, "", 0))
 	s.PathAddr = "127.0.0.1:0"
@@ -162,6 +168,84 @@ func TestServerCanRestartAfterStop(t *testing.T) {
 		t.Fatalf("restart failed: %v", err)
 	}
 	s.Stop()
+}
+
+func TestStopCancelsActiveUpstreamAndWaitsForHandler(t *testing.T) {
+	upstreamStarted := make(chan struct{})
+	upstreamCanceled := make(chan struct{})
+	blockingTransport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		close(upstreamStarted)
+		<-request.Context().Done()
+		close(upstreamCanceled)
+		return nil, request.Context().Err()
+	})
+
+	route := facadeRoute("stop-active", "responses", "wire", "key", "https://upstream.invalid")
+	s := New(log.New(io.Discard, "", 0))
+	s.client = &http.Client{Transport: blockingTransport}
+	s.shutdownTimeout = time.Second
+	s.SetRoutes([]config.Route{route})
+	s.PathAddr = "127.0.0.1:0"
+	if err := s.ReservePath(); err != nil {
+		t.Fatal(err)
+	}
+	s.PathAddr = s.pathLn.Addr().String()
+	if err := s.ServePath(); err != nil {
+		s.Stop()
+		t.Fatal(err)
+	}
+	stopped := false
+	defer func() {
+		if !stopped {
+			s.Stop()
+		}
+	}()
+
+	requestDone := make(chan error, 1)
+	go func() {
+		request, err := http.NewRequest(http.MethodPost,
+			"http://"+s.PathAddr+"/c/stop-active/responses",
+			bytes.NewReader(nativeRequestBody("responses", false)))
+		if err != nil {
+			requestDone <- err
+			return
+		}
+		request.Header.Set("Content-Type", "application/json")
+		response, err := (&http.Client{Timeout: 3 * time.Second}).Do(request)
+		if response != nil {
+			_, _ = io.Copy(io.Discard, response.Body)
+			_ = response.Body.Close()
+		}
+		requestDone <- err
+	}()
+
+	select {
+	case <-upstreamStarted:
+	case <-time.After(time.Second):
+		t.Fatal("request did not reach the blocking upstream")
+	}
+
+	stopDone := make(chan struct{})
+	go func() {
+		s.Stop()
+		close(stopDone)
+	}()
+	select {
+	case <-stopDone:
+		stopped = true
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop remained blocked with an active upstream request")
+	}
+	select {
+	case <-upstreamCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("Stop did not cancel the active upstream request")
+	}
+	select {
+	case <-requestDone:
+	case <-time.After(time.Second):
+		t.Fatal("downstream handler remained blocked after Stop returned")
+	}
 }
 
 func TestNativeSessionsUseNativePathsBodiesAndResponses(t *testing.T) {
@@ -272,7 +356,7 @@ func TestBackendSearchUsesCurrentChannelAndReturnsResponsesForEveryProviderProto
 			s := New(log.New(io.Discard, "", 0))
 			s.SetRoutes([]config.Route{route})
 			startPathTestServer(t, s)
-			body := []byte(`{"model":"display","input":"search current news","stream":false}`)
+			body := []byte(`{"model":"display","input":"search current news","max_output_tokens":4096,"stream":false}`)
 			data, status := postFacade(t, s, route.ChannelID, body, "")
 			if status != http.StatusOK {
 				t.Fatalf("status=%d body=%s", status, data)
@@ -296,6 +380,50 @@ func TestBackendSearchUsesCurrentChannelAndReturnsResponsesForEveryProviderProto
 			}
 			if calls != 1 || len(urls) != 1 {
 				t.Fatalf("search call/source count mismatch calls=%d urls=%d body=%s", calls, len(urls), data)
+			}
+		})
+	}
+}
+
+func TestBackendSearchFlagAttemptsEveryProviderProtocolAndSurfacesUnsupportedUpstream(t *testing.T) {
+	for _, backend := range []string{"responses", "messages", "chat_completions"} {
+		t.Run(backend, func(t *testing.T) {
+			var receivedSearch bool
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				wire, _ := io.ReadAll(request.Body)
+				root, err := decodeRequestObject(wire)
+				if err != nil {
+					t.Errorf("wire decode: %v", err)
+				} else {
+					switch backend {
+					case "responses":
+						receivedSearch = hasHostedSearchTool(root)
+					case "messages":
+						receivedSearch = containsMessagesHostedSearch(anySlice(root["tools"]))
+					case "chat_completions":
+						receivedSearch = root["web_search_options"] != nil
+					}
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = io.WriteString(w, `{"error":{"message":"backend web_search is not supported by this upstream"}}`)
+			}))
+			defer upstream.Close()
+
+			route := facadeRoute("unsupported-search", backend, "wire", "key", upstream.URL+"/v1")
+			route.SupportsBackendSearch = true
+			s := New(log.New(io.Discard, "", 0))
+			s.SetRoutes([]config.Route{route})
+			startPathTestServer(t, s)
+
+			data, status, header := postFacadeProtocol(t, s, route.ChannelID, wireResponses,
+				[]byte(`{"model":"display","input":"search current news","max_output_tokens":4096,"stream":false}`), "", nil)
+			if !receivedSearch {
+				t.Fatalf("%s upstream did not receive its native backend-search shape", backend)
+			}
+			if status != http.StatusBadRequest || header.Get("X-Should-Retry") != "false" ||
+				!bytes.Contains(data, []byte("backend web_search is not supported")) {
+				t.Fatalf("status=%d retry=%q body=%s", status, header.Get("X-Should-Retry"), data)
 			}
 		})
 	}
@@ -332,7 +460,7 @@ func TestMessagesHostedSearchStreamConvertsToResponsesSearchEvents(t *testing.T)
 	s := New(log.New(io.Discard, "", 0))
 	s.SetRoutes([]config.Route{route})
 	startPathTestServer(t, s)
-	body := []byte(`{"input":"search news","stream":true}`)
+	body := []byte(`{"input":"search news","max_output_tokens":4096,"stream":true}`)
 	data, status := postFacade(t, s, route.ChannelID, body, "")
 	if status != http.StatusOK || !bytes.Contains(data, []byte("response.web_search_call.completed")) ||
 		!bytes.Contains(data, []byte("response.completed")) || !bytes.Contains(data, []byte("https://example.test")) {
@@ -420,7 +548,7 @@ func TestWrongSessionProtocolIsRejectedWithoutCallingUpstream(t *testing.T) {
 	}
 }
 
-func TestDeepSeekChatSearchBridgesToMessagesWithNativeSearchAndXAPIKey(t *testing.T) {
+func TestDeepSeekV4ChatSearchUsesNativeResponsesSearch(t *testing.T) {
 	var gotPath, gotAuthorization, gotAPIKey string
 	var gotBody []byte
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
@@ -429,11 +557,11 @@ func TestDeepSeekChatSearchBridgesToMessagesWithNativeSearchAndXAPIKey(t *testin
 		gotAPIKey = request.Header.Get("X-Api-Key")
 		gotBody, _ = io.ReadAll(request.Body)
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"id":"msg_ds","type":"message","role":"assistant","content":[{"type":"server_tool_use","id":"ws_ds","name":"web_search","input":{"query":"DeepSeek V4"}},{"type":"web_search_tool_result","tool_use_id":"ws_ds","content":[{"type":"web_search_result","url":"https://docs.deepseek.com/v4","title":"DeepSeek V4"}]},{"type":"text","text":"answer","citations":[{"type":"web_search_result_location","url":"https://docs.deepseek.com/v4"}]}],"model":"deepseek-v4-chat","stop_reason":"end_turn","usage":{"input_tokens":3,"output_tokens":4,"server_tool_use":{"web_search_requests":1}}}`)
+		_, _ = io.WriteString(w, `{"id":"resp_ds","object":"response","created_at":1,"status":"completed","model":"deepseek-v4-pro","output":[{"type":"web_search_call","id":"ws_ds","status":"completed","action":{"type":"search","query":"DeepSeek V4","sources":[{"type":"url","url":"https://api-docs.deepseek.com/zh-cn/quick_start/pricing/","title":"DeepSeek V4"}]}},{"type":"message","id":"msg_ds","status":"completed","role":"assistant","content":[{"type":"output_text","text":"answer","annotations":[]}]}],"usage":{"input_tokens":3,"output_tokens":4,"total_tokens":7}}`)
 	}))
 	defer upstream.Close()
 
-	route := facadeRoute("deepseek-v4-chat", "chat_completions", "deepseek-v4-chat", "channel-key", upstream.URL+"/v1")
+	route := facadeRoute("deepseek-v4-pro", "chat_completions", "deepseek-v4-pro", "channel-key", upstream.URL)
 	route.Host = "api.deepseek.com"
 	route.SupportsBackendSearch = true
 	s := New(log.New(io.Discard, "", 0))
@@ -444,22 +572,229 @@ func TestDeepSeekChatSearchBridgesToMessagesWithNativeSearchAndXAPIKey(t *testin
 	if status != http.StatusOK {
 		t.Fatalf("status=%d body=%s", status, data)
 	}
-	if gotPath != "/anthropic/messages" || gotAuthorization != "" || gotAPIKey != "channel-key" {
+	if gotPath != "/responses" || gotAuthorization != "Bearer channel-key" || gotAPIKey != "" {
 		t.Fatalf("path=%q authorization=%q x-api-key=%q", gotPath, gotAuthorization, gotAPIKey)
 	}
 	wire, err := decodeRequestObject(gotBody)
-	if err != nil || wire["messages"] == nil {
-		t.Fatalf("DeepSeek bridge body=%s err=%v", gotBody, err)
+	if err != nil || wire["input"] == nil {
+		t.Fatalf("DeepSeek Responses body=%s err=%v", gotBody, err)
 	}
 	tools := anySlice(wire["tools"])
-	if len(tools) != 1 || tools[0].(map[string]any)["type"] != "web_search_20250305" {
+	if len(tools) != 1 || tools[0].(map[string]any)["type"] != "web_search" {
 		t.Fatalf("DeepSeek hosted search tool missing: %#v", wire)
 	}
 	response, err := decodeJSONMap(data)
 	if err != nil || response["object"] != "response" ||
-		!bytes.Contains(data, []byte("https://docs.deepseek.com/v4")) ||
+		!bytes.Contains(data, []byte("https://api-docs.deepseek.com/zh-cn/quick_start/pricing/")) ||
 		!bytes.Contains(data, []byte("web_search_call")) {
 		t.Fatalf("DeepSeek search was not converted for Build: body=%s err=%v", data, err)
+	}
+}
+
+func TestDeepSeekV4AnthropicAliasUsesNativeMessagesHostedSearch(t *testing.T) {
+	var gotPath, gotAuthorization, gotAPIKey, gotModel string
+	var gotTools []any
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		gotPath = request.URL.Path
+		gotAuthorization = request.Header.Get("Authorization")
+		gotAPIKey = request.Header.Get("X-Api-Key")
+		body, _ := io.ReadAll(request.Body)
+		root, _ := decodeRequestObject(body)
+		gotModel = stringValue(root["model"])
+		gotTools = anySlice(root["tools"])
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"msg_ds","type":"message","role":"assistant","content":[{"type":"server_tool_use","id":"ws_ds","name":"web_search","input":{"query":"DeepSeek V4"}},{"type":"web_search_tool_result","tool_use_id":"ws_ds","content":[{"type":"web_search_result","url":"https://api-docs.deepseek.com/zh-cn/quick_start/pricing/","title":"DeepSeek V4"}]},{"type":"text","text":"ok"}],"model":"deepseek-v4-pro","stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":2,"output_tokens":1}}`)
+	}))
+	defer upstream.Close()
+
+	route := xAPIKeyFacadeRoute("deepseek-anthropic", "messages", "deepseek-v4-pro[1m]", "channel-key", upstream.URL+"/anthropic")
+	route.Host = "api.deepseek.com"
+	route.SupportsBackendSearch = true
+	s := New(log.New(io.Discard, "", 0))
+	s.SetRoutes([]config.Route{route})
+	startPathTestServer(t, s)
+
+	data, status := postFacade(t, s, route.ChannelID, nativeRequestBody("responses", false), "")
+	if status != http.StatusOK {
+		t.Fatalf("status=%d body=%s", status, data)
+	}
+	if gotPath != "/anthropic/v1/messages" || gotModel != "deepseek-v4-pro[1m]" ||
+		gotAuthorization != "" || gotAPIKey != "channel-key" {
+		t.Fatalf("path=%q model=%q authorization=%q x-api-key=%q", gotPath, gotModel, gotAuthorization, gotAPIKey)
+	}
+	if len(gotTools) != 1 || stringValue(gotTools[0].(map[string]any)["type"]) != "web_search_20250305" {
+		t.Fatalf("native Messages hosted-search tools=%#v", gotTools)
+	}
+	if !bytes.Contains(data, []byte("web_search_call")) ||
+		!bytes.Contains(data, []byte("https://api-docs.deepseek.com/zh-cn/quick_start/pricing/")) {
+		t.Fatalf("Messages hosted search was not converted for Build: %s", data)
+	}
+}
+
+func TestDeepSeekV4ResponsesPassesThroughDocumentedCustomToolShape(t *testing.T) {
+	var gotPath, gotAuthorization, gotAPIKey string
+	var gotBody []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		gotPath = request.URL.Path
+		gotAuthorization = request.Header.Get("Authorization")
+		gotAPIKey = request.Header.Get("X-Api-Key")
+		gotBody, _ = io.ReadAll(request.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"resp_ds","object":"response","created_at":1,"status":"completed","model":"deepseek-v4-pro","output":[{"type":"message","id":"msg_ds","status":"completed","role":"assistant","content":[{"type":"output_text","text":"ok","annotations":[]}]}],"usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}`)
+	}))
+	defer upstream.Close()
+
+	route := facadeRoute("deepseek-tools", "responses", "deepseek-v4-pro", "channel-key", upstream.URL)
+	route.Host = "api.deepseek.com"
+	route.SupportsBackendSearch = true
+	s := New(log.New(io.Discard, "", 0))
+	s.SetRoutes([]config.Route{route})
+	startPathTestServer(t, s)
+
+	body := []byte(`{
+		"model":"display",
+		"input":"search before editing",
+		"stream":false,
+		"reasoning":{"effort":"max","summary":"auto"},
+		"tools":[
+			{"type":"custom","name":"apply_patch","description":"Apply a patch","format":{"type":"text"}},
+			{"type":"web_search_2025_08_26","search_context_size":"high"}
+		],
+		"tool_choice":{"type":"web_search_2025_08_26"}
+	}`)
+	data, status := postFacade(t, s, route.ChannelID, body, "")
+	if status != http.StatusOK {
+		t.Fatalf("status=%d body=%s", status, data)
+	}
+	if gotPath != "/responses" || gotAuthorization != "Bearer channel-key" || gotAPIKey != "" {
+		t.Fatalf("path=%q authorization=%q x-api-key=%q", gotPath, gotAuthorization, gotAPIKey)
+	}
+	wire, err := decodeRequestObject(gotBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tools := anySlice(wire["tools"])
+	if len(tools) != 2 {
+		t.Fatalf("DeepSeek Responses tools=%#v", tools)
+	}
+	custom, _ := tools[0].(map[string]any)
+	search, _ := tools[1].(map[string]any)
+	if custom["type"] != "custom" || custom["name"] != "apply_patch" || custom["format"] == nil ||
+		search["type"] != "web_search" || search["search_context_size"] != "high" {
+		t.Fatalf("DeepSeek native tools changed: %#v", wire)
+	}
+	choice, _ := wire["tool_choice"].(map[string]any)
+	if choice["type"] != "web_search" {
+		t.Fatalf("named web search choice lost its semantics: %#v", wire["tool_choice"])
+	}
+	reasoning, _ := wire["reasoning"].(map[string]any)
+	if reasoning["effort"] != "max" || reasoning["summary"] != "auto" {
+		t.Fatalf("DeepSeek Responses reasoning changed: %#v", reasoning)
+	}
+}
+
+func TestFacadeAdvertisesConfiguredOrProviderModelLimitsOnEveryResponsePath(t *testing.T) {
+	tests := []struct {
+		name                 string
+		official             bool
+		configuredContext    uint64
+		configuredCompletion uint64
+		upstreamStatus       int
+		requestBody          []byte
+		upstreamContext      string
+		upstreamCompletion   string
+		wantStatus           int
+		wantContext          string
+		wantCompletionTokens string
+	}{
+		{
+			name: "official model without local limits accepts remote metadata", official: true,
+			upstreamStatus: http.StatusOK, requestBody: nativeRequestBody("responses", false),
+			upstreamContext: "1", upstreamCompletion: "2", wantStatus: http.StatusOK,
+			wantContext: "1", wantCompletionTokens: "2",
+		},
+		{
+			name: "configured DeepSeek limits reject different provider metadata", official: true,
+			configuredContext: 131072, configuredCompletion: 32768, upstreamStatus: http.StatusOK,
+			requestBody: nativeRequestBody("responses", false), upstreamContext: "1048576",
+			upstreamCompletion: "384000", wantStatus: http.StatusOK, wantContext: "131072",
+			wantCompletionTokens: "32768",
+		},
+		{
+			name: "official upstream error", official: true,
+			upstreamStatus: http.StatusTooManyRequests, requestBody: nativeRequestBody("responses", false),
+			wantStatus: http.StatusTooManyRequests,
+		},
+		{
+			name: "official local validation error", official: true,
+			upstreamStatus: http.StatusOK, requestBody: []byte(`{"input":`),
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:              "configured generic limits reject different provider metadata",
+			configuredContext: 65536, configuredCompletion: 4096, upstreamStatus: http.StatusOK,
+			requestBody: nativeRequestBody("responses", false), upstreamContext: "262144",
+			upstreamCompletion: "8192", wantStatus: http.StatusOK,
+			wantContext: "65536", wantCompletionTokens: "4096",
+		},
+		{
+			name:           "generic model without tier accepts provider maximum",
+			upstreamStatus: http.StatusOK, requestBody: nativeRequestBody("responses", false),
+			upstreamContext: "262144", upstreamCompletion: "8192", wantStatus: http.StatusOK,
+			wantContext: "262144", wantCompletionTokens: "8192",
+		},
+		{
+			name:           "generic model without provider metadata remains unpinned",
+			upstreamStatus: http.StatusOK, requestBody: nativeRequestBody("responses", false),
+			wantStatus: http.StatusOK,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				if test.upstreamContext != "" {
+					w.Header().Set(grokContextWindowHeader, test.upstreamContext)
+				}
+				if test.upstreamCompletion != "" {
+					w.Header().Set(grokMaxCompletionTokensHeader, test.upstreamCompletion)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(test.upstreamStatus)
+				if test.upstreamStatus == http.StatusOK {
+					_, _ = io.WriteString(w, nativeSuccessBody("responses", "deepseek-v4-pro", "ok"))
+					return
+				}
+				_, _ = io.WriteString(w, `{"error":{"message":"busy","type":"server_error"}}`)
+			}))
+			defer upstream.Close()
+
+			route := facadeRoute("deepseek-model-limits", "responses", "deepseek-v4-pro", "key", upstream.URL)
+			if test.official {
+				route.Host = "api.deepseek.com"
+			}
+			if test.configuredContext != 0 {
+				route.ContextWindow = test.configuredContext
+				route.ContextWindowConfigured = true
+			}
+			if test.configuredCompletion != 0 {
+				route.MaxCompletionTokens = test.configuredCompletion
+				route.MaxCompletionTokensConfigured = true
+			}
+			s := New(log.New(io.Discard, "", 0))
+			s.SetRoutes([]config.Route{route})
+			startPathTestServer(t, s)
+
+			data, status, header := postFacadeResponse(t, s, route.ChannelID, test.requestBody, "")
+			if status != test.wantStatus {
+				t.Fatalf("status=%d want %d body=%s", status, test.wantStatus, data)
+			}
+			if got := header.Get(grokContextWindowHeader); got != test.wantContext {
+				t.Fatalf("%s=%q want %q", grokContextWindowHeader, got, test.wantContext)
+			}
+			if got := header.Get(grokMaxCompletionTokensHeader); got != test.wantCompletionTokens {
+				t.Fatalf("%s=%q want %q", grokMaxCompletionTokensHeader, got, test.wantCompletionTokens)
+			}
+		})
 	}
 }
 
@@ -548,7 +883,7 @@ func TestClientSearchAdapterReturnsResponsesForEveryBackend(t *testing.T) {
 	}
 }
 
-func TestClientSearchAdapterRejectsAnswersWithoutSearchExecutionEvidence(t *testing.T) {
+func TestSelectedSearchModelReportsWhenBackendSearchWasNotExecuted(t *testing.T) {
 	tests := []struct {
 		backend      string
 		upstreamBody string
@@ -574,14 +909,15 @@ func TestClientSearchAdapterRejectsAnswersWithoutSearchExecutionEvidence(t *test
 			}))
 			defer upstream.Close()
 			route := facadeRoute("ignored-search", test.backend, "wire", "key", upstream.URL)
-			route.SupportsBackendSearch = false
+			route.SupportsBackendSearch = true
+			route.DefaultSearchModel = true
 			s := New(log.New(io.Discard, "", 0))
 			s.SetRoutes([]config.Route{route})
 			startPathTestServer(t, s)
 
 			data, status, header := postSearchFacade(t, s, route.ChannelID, buildClientSearchRequest())
 			if status != http.StatusBadGateway || header.Get("X-Should-Retry") != "false" ||
-				!bytes.Contains(data, []byte("no completed web_search_call")) {
+				!bytes.Contains(data, []byte("selected web_search model did not complete backend web_search")) {
 				t.Fatalf("status=%d retry=%q body=%s", status, header.Get("X-Should-Retry"), data)
 			}
 		})
@@ -715,35 +1051,40 @@ func TestNativeStreamsNormalizeHeartbeatsAndStopAtProtocolTerminal(t *testing.T)
 }
 
 func TestResponsesStreamFiltersPrivateKeepaliveAndStopsAtTerminal(t *testing.T) {
-	upstreamCanceled := make(chan struct{})
-	release := make(chan struct{})
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = io.WriteString(w, "event: keepalive\ndata:\n\n"+
-			"event: keepalive\n"+`data: {"type":"keepalive"}`+"\n\n"+
-			`data: {"type":"response.created","response":{"id":"resp_1","object":"response","status":"in_progress","model":"wire","output":[]}}`+"\n\n"+
-			`data: {"type":"response.completed","response":{"id":"resp_1","object":"response","status":"completed","model":"wire","output":[]}}`+"\n\n")
-		w.(http.Flusher).Flush()
-		select {
-		case <-request.Context().Done():
-			close(upstreamCanceled)
-		case <-release:
-		}
-	}))
-	defer func() { close(release); upstream.Close() }()
-	route := facadeRoute("responses-stream", "responses", "wire", "key", upstream.URL)
-	s := New(log.New(io.Discard, "", 0))
-	s.SetRoutes([]config.Route{route})
-	startPathTestServer(t, s)
-	data, status := postFacade(t, s, route.ChannelID, nativeRequestBody("responses", true), "")
-	if status != http.StatusOK || bytes.Contains(data, []byte(`"type":"keepalive"`)) || bytes.Contains(data, []byte("event: keepalive")) ||
-		!bytes.Contains(data, []byte(": keepalive\n\n")) || !bytes.Contains(data, []byte("response.completed")) {
-		t.Fatalf("status=%d body=%s", status, data)
-	}
-	select {
-	case <-upstreamCanceled:
-	case <-time.After(time.Second):
-		t.Fatal("Responses terminal event did not close upstream")
+	for _, terminal := range []string{"response.completed", "response.incomplete", "response.failed"} {
+		t.Run(terminal, func(t *testing.T) {
+			upstreamCanceled := make(chan struct{})
+			release := make(chan struct{})
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				status := strings.TrimPrefix(terminal, "response.")
+				_, _ = io.WriteString(w, "event: keepalive\ndata:\n\n"+
+					"event: keepalive\n"+`data: {"type":"keepalive"}`+"\n\n"+
+					`data: {"type":"response.created","response":{"id":"resp_1","object":"response","status":"in_progress","model":"wire","output":[]}}`+"\n\n"+
+					fmt.Sprintf(`data: {"type":%q,"response":{"id":"resp_1","object":"response","status":%q,"model":"wire","output":[]}}`, terminal, status)+"\n\n")
+				w.(http.Flusher).Flush()
+				select {
+				case <-request.Context().Done():
+					close(upstreamCanceled)
+				case <-release:
+				}
+			}))
+			defer func() { close(release); upstream.Close() }()
+			route := facadeRoute("responses-stream", "responses", "wire", "key", upstream.URL)
+			s := New(log.New(io.Discard, "", 0))
+			s.SetRoutes([]config.Route{route})
+			startPathTestServer(t, s)
+			data, status := postFacade(t, s, route.ChannelID, nativeRequestBody("responses", true), "")
+			if status != http.StatusOK || bytes.Contains(data, []byte(`"type":"keepalive"`)) || bytes.Contains(data, []byte("event: keepalive")) ||
+				!bytes.Contains(data, []byte(": keepalive\n\n")) || !bytes.Contains(data, []byte(terminal)) {
+				t.Fatalf("status=%d body=%s", status, data)
+			}
+			select {
+			case <-upstreamCanceled:
+			case <-time.After(time.Second):
+				t.Fatal("Responses terminal event did not close upstream")
+			}
+		})
 	}
 }
 
@@ -752,6 +1093,8 @@ func TestNativeBufferedFallbackStaysInNativeProtocol(t *testing.T) {
 		t.Run(backend, func(t *testing.T) {
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set(grokContextWindowHeader, "777777")
+				w.Header().Set(grokMaxCompletionTokensHeader, "8192")
 				_, _ = io.WriteString(w, nativeSuccessBody(backend, "wire", "fallback"))
 			}))
 			defer upstream.Close()
@@ -759,9 +1102,13 @@ func TestNativeBufferedFallbackStaysInNativeProtocol(t *testing.T) {
 			s := New(log.New(io.Discard, "", 0))
 			s.SetRoutes([]config.Route{route})
 			startPathTestServer(t, s)
-			data, status := postFacade(t, s, route.ChannelID, nativeRequestBody(backend, true), "")
+			data, status, header := postFacadeResponse(t, s, route.ChannelID, nativeRequestBody(backend, true), "")
 			if status != http.StatusOK {
 				t.Fatalf("status=%d body=%s", status, data)
+			}
+			if header.Get(grokContextWindowHeader) != "777777" || header.Get(grokMaxCompletionTokensHeader) != "8192" {
+				t.Fatalf("buffered fallback lost model metadata: context=%q completion=%q",
+					header.Get(grokContextWindowHeader), header.Get(grokMaxCompletionTokensHeader))
 			}
 			switch backend {
 			case "responses":
@@ -809,6 +1156,55 @@ func TestTruncatedNativeStreamsEmitProtocolNativeErrors(t *testing.T) {
 	}
 }
 
+func TestDeepSeekNativeChatResourceFailureIsRetryable(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"chat_resource","object":"chat.completion","created":1,"model":"deepseek-v4-pro","choices":[{"index":0,"message":{"role":"assistant","content":"partial"},"finish_reason":"insufficient_system_resource"}]}`)
+	}))
+	defer upstream.Close()
+
+	route := facadeRoute("deepseek-resource", "chat_completions", "deepseek-v4-pro", "key", upstream.URL)
+	route.Host = "api.deepseek.com"
+	route.SupportsBackendSearch = false
+	s := New(log.New(io.Discard, "", 0))
+	s.SetRoutes([]config.Route{route})
+	startPathTestServer(t, s)
+
+	data, status, header := postFacadeProtocol(t, s, route.ChannelID, wireChatCompletions, nativeRequestBody("chat_completions", false), "", nil)
+	if status != http.StatusServiceUnavailable || header.Get("X-Should-Retry") != "true" ||
+		!bytes.Contains(data, []byte("insufficient system resources")) ||
+		bytes.Contains(data, []byte(`"finish_reason":"insufficient_system_resource"`)) {
+		t.Fatalf("status=%d retry=%q body=%s", status, header.Get("X-Should-Retry"), data)
+	}
+}
+
+func TestDeepSeekNativeChatStreamResourceFailureBecomesStructuredError(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w,
+			`data: {"id":"chat_resource","object":"chat.completion.chunk","created":1,"model":"deepseek-v4-pro","choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}`+"\n\n"+
+				`data: {"id":"chat_resource","object":"chat.completion.chunk","created":1,"model":"deepseek-v4-pro","choices":[{"index":0,"delta":{},"finish_reason":"insufficient_system_resource"}]}`+"\n\n"+
+				"data: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+
+	route := facadeRoute("deepseek-resource-stream", "chat_completions", "deepseek-v4-pro", "key", upstream.URL)
+	route.Host = "api.deepseek.com"
+	route.SupportsBackendSearch = false
+	s := New(log.New(io.Discard, "", 0))
+	s.SetRoutes([]config.Route{route})
+	startPathTestServer(t, s)
+
+	data, status, _ := postFacadeProtocol(t, s, route.ChannelID, wireChatCompletions, nativeRequestBody("chat_completions", true), "", nil)
+	if status != http.StatusOK || !bytes.Contains(data, []byte(`"content":"partial"`)) ||
+		!bytes.Contains(data, []byte(`"type":"server_error"`)) ||
+		!bytes.Contains(data, []byte(`"code":"insufficient_system_resource"`)) ||
+		!bytes.Contains(data, []byte("data: [DONE]")) ||
+		bytes.Contains(data, []byte(`"finish_reason":"insufficient_system_resource"`)) {
+		t.Fatalf("status=%d body=%s", status, data)
+	}
+}
+
 func TestUpstreamResponseHeaderTimeoutReturnsRetryableGatewayTimeout(t *testing.T) {
 	release := make(chan struct{})
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
@@ -834,7 +1230,7 @@ func TestUpstreamResponseHeaderTimeoutReturnsRetryableGatewayTimeout(t *testing.
 	}
 }
 
-func TestUpstreamStreamIdleTimeoutCoversEveryProtocolPath(t *testing.T) {
+func TestUpstreamBodyIdleTimeoutCoversEveryStreamingProtocolPath(t *testing.T) {
 	tests := []struct {
 		name             string
 		backend          string
@@ -891,7 +1287,7 @@ func TestUpstreamStreamIdleTimeoutCoversEveryProtocolPath(t *testing.T) {
 			route := facadeRoute("idle", test.backend, "wire", "key", upstream.URL)
 			route.SupportsBackendSearch = test.incomingProtocol == wireResponses
 			s := New(log.New(io.Discard, "", 0))
-			s.streamIdleTimeout = 100 * time.Millisecond
+			s.bodyIdleTimeout = 100 * time.Millisecond
 			s.SetRoutes([]config.Route{route})
 			startPathTestServer(t, s)
 			data, status, _ := postFacadeProtocol(t, s, route.ChannelID, test.incomingProtocol, test.requestBody, "", nil)
@@ -907,7 +1303,7 @@ func TestUpstreamStreamIdleTimeoutCoversEveryProtocolPath(t *testing.T) {
 	}
 }
 
-func TestUpstreamHeartbeatsResetStreamIdleTimeout(t *testing.T) {
+func TestUpstreamHeartbeatsResetBodyIdleTimeout(t *testing.T) {
 	tests := []struct {
 		backend string
 		start   string
@@ -942,7 +1338,7 @@ func TestUpstreamHeartbeatsResetStreamIdleTimeout(t *testing.T) {
 				w.(http.Flusher).Flush()
 				for index := 0; index < 7; index++ {
 					time.Sleep(30 * time.Millisecond)
-					_, _ = io.WriteString(w, "event: ping\ndata: {\"type\":\"ping\"}\n\n")
+					_, _ = io.WriteString(w, ": keep-alive\n\n")
 					w.(http.Flusher).Flush()
 				}
 				_, _ = io.WriteString(w, test.end)
@@ -953,14 +1349,116 @@ func TestUpstreamHeartbeatsResetStreamIdleTimeout(t *testing.T) {
 			route := facadeRoute("heartbeat", test.backend, "wire", "key", upstream.URL)
 			route.SupportsBackendSearch = true
 			s := New(log.New(io.Discard, "", 0))
-			s.streamIdleTimeout = 100 * time.Millisecond
+			s.bodyIdleTimeout = 100 * time.Millisecond
 			s.SetRoutes([]config.Route{route})
 			startPathTestServer(t, s)
 			data, status, _ := postFacadeProtocol(t, s, route.ChannelID, wireResponses, nativeRequestBody("responses", true), "", nil)
-			if status != http.StatusOK || !bytes.Contains(data, []byte(test.want)) || bytes.Contains(data, []byte("proxy_stream_error")) {
+			if status != http.StatusOK || !bytes.Contains(data, []byte(test.want)) ||
+				!bytes.Contains(data, []byte(": keepalive\n\n")) || bytes.Contains(data, []byte("proxy_stream_error")) {
 				t.Fatalf("status=%d body=%s", status, data)
 			}
 		})
+	}
+}
+
+func TestDeepSeekNonStreamingQueueEmptyLinesAreAccepted(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		time.Sleep(60 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, "\n")
+		w.(http.Flusher).Flush()
+		for index := 0; index < 3; index++ {
+			time.Sleep(25 * time.Millisecond)
+			_, _ = io.WriteString(w, "\n")
+			w.(http.Flusher).Flush()
+		}
+		_, _ = io.WriteString(w, nativeSuccessBody("responses", "deepseek-v4-pro", "queued"))
+	}))
+	defer upstream.Close()
+
+	route := facadeRoute("deepseek-queue", "responses", "deepseek-v4-pro", "key", upstream.URL)
+	route.Host = "api.deepseek.com"
+	s := New(log.New(io.Discard, "", 0))
+	// A route-selection regression would hit the deliberately shorter generic
+	// header timeout before the simulated DeepSeek queue returns headers.
+	s.transport.ResponseHeaderTimeout = 15 * time.Millisecond
+	s.deepSeekTransport.ResponseHeaderTimeout = 300 * time.Millisecond
+	s.bodyIdleTimeout = 5 * time.Millisecond
+	s.deepSeekBodyIdleTimeout = 40 * time.Millisecond
+	s.SetRoutes([]config.Route{route})
+	startPathTestServer(t, s)
+
+	data, status, _ := postFacadeResponse(t, s, route.ChannelID, nativeRequestBody("responses", false), "")
+	if status != http.StatusOK || !bytes.Contains(data, []byte(`"queued"`)) || bytes.Contains(data, []byte("upstream timed out")) {
+		t.Fatalf("status=%d body=%s", status, data)
+	}
+}
+
+func TestDeepSeekNonStreamingBodyIdleTimeoutCancelsUpstream(t *testing.T) {
+	upstreamCanceled := make(chan struct{})
+	release := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, "\n")
+		w.(http.Flusher).Flush()
+		select {
+		case <-request.Context().Done():
+			close(upstreamCanceled)
+		case <-release:
+		}
+	}))
+	defer func() {
+		close(release)
+		upstream.Close()
+	}()
+
+	route := facadeRoute("deepseek-body-idle", "responses", "deepseek-v4-pro", "key", upstream.URL)
+	route.Host = "api.deepseek.com"
+	s := New(log.New(io.Discard, "", 0))
+	s.bodyIdleTimeout = 5 * time.Second
+	s.deepSeekBodyIdleTimeout = 50 * time.Millisecond
+	s.SetRoutes([]config.Route{route})
+	startPathTestServer(t, s)
+
+	data, status, header := postFacadeResponse(t, s, route.ChannelID, nativeRequestBody("responses", false), "")
+	if status != http.StatusGatewayTimeout || header.Get("X-Should-Retry") != "true" ||
+		!bytes.Contains(data, []byte("timed out waiting for response body data")) {
+		t.Fatalf("status=%d retry=%q body=%s", status, header.Get("X-Should-Retry"), data)
+	}
+	select {
+	case <-upstreamCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("body idle timeout did not cancel the upstream request")
+	}
+}
+
+func TestDeepSeekStreamingQueueKeepAlivesResetDedicatedIdleTimeout(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, `data: {"type":"response.created","response":{"id":"resp_ds_queue","object":"response","status":"in_progress","model":"deepseek-v4-pro","output":[]}}`+"\n\n")
+		w.(http.Flusher).Flush()
+		for index := 0; index < 6; index++ {
+			time.Sleep(30 * time.Millisecond)
+			_, _ = io.WriteString(w, ": keep-alive\n\n")
+			w.(http.Flusher).Flush()
+		}
+		_, _ = io.WriteString(w, `data: {"type":"response.completed","response":{"id":"resp_ds_queue","object":"response","status":"completed","model":"deepseek-v4-pro","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`+"\n\n")
+		w.(http.Flusher).Flush()
+	}))
+	defer upstream.Close()
+
+	route := facadeRoute("deepseek-stream-queue", "responses", "deepseek-v4-pro", "key", upstream.URL)
+	route.Host = "api.deepseek.com"
+	s := New(log.New(io.Discard, "", 0))
+	s.bodyIdleTimeout = 5 * time.Millisecond
+	s.deepSeekBodyIdleTimeout = 80 * time.Millisecond
+	s.SetRoutes([]config.Route{route})
+	startPathTestServer(t, s)
+
+	data, status := postFacade(t, s, route.ChannelID, nativeRequestBody("responses", true), "")
+	if status != http.StatusOK || !bytes.Contains(data, []byte("response.completed")) ||
+		!bytes.Contains(data, []byte(": keepalive\n\n")) || bytes.Contains(data, []byte("proxy_stream_error")) {
+		t.Fatalf("status=%d body=%s", status, data)
 	}
 }
 
@@ -984,7 +1482,7 @@ func TestClientCancellationBeatsStreamIdleTimeout(t *testing.T) {
 
 	route := facadeRoute("cancel", "responses", "wire", "key", upstream.URL)
 	s := New(log.New(io.Discard, "", 0))
-	s.streamIdleTimeout = 5 * time.Second
+	s.bodyIdleTimeout = 5 * time.Second
 	s.SetRoutes([]config.Route{route})
 	startPathTestServer(t, s)
 
@@ -1152,6 +1650,75 @@ func TestSameHostChannelsKeepDistinctCredentialsModelsAndProtocols(t *testing.T)
 	if len(seen) != 2 || seen[0] != (observed{"/v1/responses", "Bearer key-one", "model-one"}) ||
 		seen[1] != (observed{"/v1/messages", "Bearer key-two", "model-two"}) {
 		t.Fatalf("observed=%#v", seen)
+	}
+}
+
+func TestUnconfiguredBackendFollowsCatalogResolvedProtocolEndToEnd(t *testing.T) {
+	tests := []struct {
+		backend string
+		path    string
+	}{
+		{"responses", "/v1/responses"},
+		{"messages", "/v1/messages"},
+		{"chat_completions", "/v1/chat/completions"},
+	}
+	for _, test := range tests {
+		t.Run(test.backend, func(t *testing.T) {
+			var gotPath string
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				gotPath = request.URL.Path
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, nativeSuccessBody(test.backend, "future-wire", "ok"))
+			}))
+			defer upstream.Close()
+
+			route := facadeRoute("future", "", "future-wire", "key", upstream.URL+"/v1")
+			s := New(log.New(io.Discard, "", 0))
+			s.SetRoutes([]config.Route{route})
+			startPathTestServer(t, s)
+
+			protocol := backendProtocol(t, test.backend)
+			data, status, _ := postFacadeProtocol(t, s, route.ChannelID, protocol, nativeRequestBody(test.backend, false), "", nil)
+			if status != http.StatusOK || gotPath != test.path {
+				t.Fatalf("status=%d path=%q want=%q body=%s", status, gotPath, test.path, data)
+			}
+		})
+	}
+}
+
+func TestGrokConversationIDReachesEveryProviderAndProtocol(t *testing.T) {
+	for _, provider := range cacheProviders() {
+		for _, backend := range []string{"responses", "messages", "chat_completions"} {
+			t.Run(provider.name+"/"+backend, func(t *testing.T) {
+				var gotConversationIDs []string
+				upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+					gotConversationIDs = append([]string(nil), request.Header.Values("X-Grok-Conv-Id")...)
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, nativeSuccessBody(backend, provider.model, "ok"))
+				}))
+				defer upstream.Close()
+
+				route := facadeRoute("conversation-id", backend, provider.model, "key", upstream.URL)
+				route.Host = provider.host
+				route.APIBackendConfigured = true
+				route.SupportsBackendSearch = false
+				s := New(log.New(io.Discard, "", 0))
+				s.SetRoutes([]config.Route{route})
+				startPathTestServer(t, s)
+
+				extra := http.Header{"X-Grok-Conv-Id": []string{"conversation-stable"}}
+				protocol := backendProtocol(t, backend)
+				data, status, _ := postFacadeProtocol(
+					t, s, route.ChannelID, protocol, nativeRequestBody(backend, false), "", extra,
+				)
+				if status != http.StatusOK {
+					t.Fatalf("status=%d body=%s", status, data)
+				}
+				if len(gotConversationIDs) != 1 || gotConversationIDs[0] != "conversation-stable" {
+					t.Fatalf("upstream conversation IDs=%v", gotConversationIDs)
+				}
+			})
+		}
 	}
 }
 

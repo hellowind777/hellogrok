@@ -1,7 +1,6 @@
 package cfgpatch
 
 import (
-	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
@@ -244,14 +243,14 @@ func TestApplyTargetsAndRestoreExactConfig(t *testing.T) {
 	}
 
 	result, err := ApplyTargets(configPath, statePath, []Target{
-		{ID: "chat", APIBaseURL: true, APIBackend: "chat_completions"},
+		{ID: "chat", APIBaseURL: true, APIBackend: "chat_completions", ProjectBackendSearch: true},
 		{ID: "inherited", APIBackend: "messages"},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if result.BaseURLs != 2 || result.APIBaseURLs != 1 ||
-		result.BackendSearch != 1 || result.BackendTools != 1 || result.WebFetch != 1 || result.ValidatedTargets != 2 {
+		result.BackendSearch != 0 || result.BackendTools != 1 || result.WebFetch != 1 || result.ValidatedTargets != 2 {
 		t.Fatalf("unexpected result: %#v", result)
 	}
 	patchedBytes, _ := os.ReadFile(configPath)
@@ -281,15 +280,15 @@ func TestApplyTargetsAndRestoreExactConfig(t *testing.T) {
 		t.Fatalf("official model changed: %s", official)
 	}
 	inherited := sectionText(t, patched, "model.inherited")
-	if !strings.Contains(inherited, "supports_backend_search = false") {
-		t.Fatalf("effective missing capability was not materialized: %s", inherited)
+	if strings.Contains(inherited, "supports_backend_search") {
+		t.Fatalf("unconfigured capability overrode the remote catalog: %s", inherited)
 	}
 
 	restored, err := Restore(configPath, statePath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if restored != 7 {
+	if restored != 6 {
 		t.Fatalf("restored fields = %d", restored)
 	}
 	finalBytes, _ := os.ReadFile(configPath)
@@ -298,6 +297,100 @@ func TestApplyTargetsAndRestoreExactConfig(t *testing.T) {
 	}
 	if _, err := os.Stat(statePath); !os.IsNotExist(err) {
 		t.Fatalf("state file remains: %v", err)
+	}
+}
+
+func TestApplyTargetsProjectsDeepSeekReasoningMenuAndRestoresMultilineValue(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	statePath := filepath.Join(dir, "state.json")
+	original := strings.Join([]string{
+		"[model.pro]",
+		`base_url = "https://api.deepseek.com"`,
+		"supports_reasoning_effort = false # preserve original support flag",
+		"reasoning_efforts = [",
+		`  { value = "low", label = "Legacy Low" },`,
+		`  { value = "xhigh", label = "Legacy Deep", default = true },`,
+		"] # preserve original menu formatting",
+		"",
+	}, "\r\n")
+	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	efforts := []ReasoningEffortOption{
+		{Value: "none", Label: "None"},
+		{Value: "high", Label: "High", Default: true},
+		{Value: "max", Label: "Max"},
+	}
+	targets := []Target{{ID: "pro", ReasoningEfforts: efforts}}
+	result, err := ApplyTargets(configPath, statePath, targets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.SupportsReasoningEffort != 1 || result.ReasoningEfforts != 1 {
+		t.Fatalf("reasoning projection result = %+v", result)
+	}
+	patched, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantMenu := `reasoning_efforts = [{ value = "none", label = "None" }, { value = "high", label = "High", default = true }, { value = "max", label = "Max" }]`
+	if !strings.Contains(string(patched), "supports_reasoning_effort = true # preserve original support flag") ||
+		!strings.Contains(string(patched), wantMenu) || strings.Contains(string(patched), "Legacy Low") {
+		t.Fatalf("DeepSeek reasoning menu was not projected:\n%s", patched)
+	}
+
+	first := string(patched)
+	secondResult, err := ApplyTargets(configPath, statePath, targets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, _ := os.ReadFile(configPath)
+	if string(second) != first || secondResult.SupportsReasoningEffort != 0 || secondResult.ReasoningEfforts != 0 {
+		t.Fatalf("reapply changed reasoning projection: result=%+v\n%s", secondResult, second)
+	}
+
+	if _, err := Restore(configPath, statePath); err != nil {
+		t.Fatal(err)
+	}
+	restored, _ := os.ReadFile(configPath)
+	if string(restored) != original {
+		t.Fatalf("reasoning projection was not restored byte-exactly\nwant: %q\ngot:  %q", original, restored)
+	}
+}
+
+func TestRestorePreservesConcurrentDeepSeekReasoningMenuEdit(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	statePath := filepath.Join(dir, "state.json")
+	original := "[model.pro]\nbase_url = \"https://api.deepseek.com\"\n"
+	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	efforts := []ReasoningEffortOption{
+		{Value: "none", Label: "None"},
+		{Value: "high", Label: "High", Default: true},
+		{Value: "max", Label: "Max"},
+	}
+	if _, err := ApplyTargets(configPath, statePath, []Target{{ID: "pro", ReasoningEfforts: efforts}}); err != nil {
+		t.Fatal(err)
+	}
+	patched, _ := os.ReadFile(configPath)
+	userEdited := strings.ReplaceAll(string(patched),
+		`reasoning_efforts = [{ value = "none", label = "None" }, { value = "high", label = "High", default = true }, { value = "max", label = "Max" }]`,
+		"reasoning_efforts = [\n  { value = \"high\", label = \"Focused\", default = true },\n]\n")
+	userEdited = strings.ReplaceAll(userEdited, "supports_reasoning_effort = true", "supports_reasoning_effort = false")
+	if err := os.WriteFile(configPath, []byte(userEdited), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Restore(configPath, statePath); err != nil {
+		t.Fatal(err)
+	}
+	current, _ := os.ReadFile(configPath)
+	if !strings.Contains(string(current), "supports_reasoning_effort = false") ||
+		!strings.Contains(string(current), `label = "Focused"`) ||
+		strings.Contains(string(current), "127.0.0.1:18787") {
+		t.Fatalf("concurrent reasoning edit was not preserved while the route was restored:\n%s", current)
 	}
 }
 
@@ -585,17 +678,16 @@ func TestApplyTargetsMaterializesEffectiveBackendSearchAndRestores(t *testing.T)
 		wantChanges int
 	}{
 		{
-			name:        "missing defaults false",
+			name:        "missing stays absent for remote catalog",
 			original:    "[model.one]\nbase_url = \"https://one.example/v1\"\n",
 			target:      Target{ID: "one"},
-			wantLine:    "supports_backend_search = false",
-			wantChanges: 1,
+			wantChanges: 0,
 		},
 		{
 			name: "provider true is materialized on model",
 			original: "[model_providers.gateway]\nbase_url = \"https://one.example/v1\"\n" +
 				"supports_backend_search = true\n\n[model.one]\nmodel_provider = \"gateway\"\n",
-			target:      Target{ID: "one", SupportsBackendSearch: true},
+			target:      Target{ID: "one", SupportsBackendSearch: true, ProjectBackendSearch: true},
 			wantLine:    "supports_backend_search = true",
 			wantChanges: 1,
 		},
@@ -604,7 +696,7 @@ func TestApplyTargetsMaterializesEffectiveBackendSearchAndRestores(t *testing.T)
 			original: "[model_providers.gateway]\nbase_url = \"https://one.example/v1\"\n" +
 				"supports_backend_search = true\n\n[model.one]\nmodel_provider = \"gateway\"\n" +
 				"supports_backend_search = false # model wins\n",
-			target:      Target{ID: "one"},
+			target:      Target{ID: "one", ProjectBackendSearch: true},
 			wantLine:    "supports_backend_search = false # model wins",
 			wantChanges: 0,
 		},
@@ -614,6 +706,7 @@ func TestApplyTargetsMaterializesEffectiveBackendSearchAndRestores(t *testing.T)
 			target: Target{
 				ID:                    "one",
 				SupportsBackendSearch: true,
+				ProjectBackendSearch:  true,
 			},
 			wantLine:    "supports_backend_search = true # hosted",
 			wantChanges: 0,
@@ -638,8 +731,11 @@ func TestApplyTargetsMaterializesEffectiveBackendSearchAndRestores(t *testing.T)
 			}
 			patched, _ := os.ReadFile(configPath)
 			model := sectionText(t, string(patched), "model.one")
-			if !strings.Contains(model, test.wantLine) {
+			if test.wantLine != "" && !strings.Contains(model, test.wantLine) {
 				t.Fatalf("model capability missing %q:\n%s", test.wantLine, model)
+			}
+			if test.wantLine == "" && strings.Contains(model, "supports_backend_search") {
+				t.Fatalf("unconfigured capability overrode the remote catalog:\n%s", model)
 			}
 
 			if _, err := Restore(configPath, statePath); err != nil {
@@ -650,6 +746,157 @@ func TestApplyTargetsMaterializesEffectiveBackendSearchAndRestores(t *testing.T)
 				t.Fatalf("restore was not byte-exact\nwant: %q\ngot:  %q", test.original, restored)
 			}
 		})
+	}
+}
+
+func TestApplyTargetsLeavesUnconfiguredAPIBackendCatalogOwned(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	statePath := filepath.Join(dir, "state.json")
+	original := "[model.one]\nmodel = \"future-model\"\nbase_url = \"https://one.example/v1\"\n"
+	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := ApplyTargets(configPath, statePath, []Target{{ID: "one"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.APIBackends != 0 {
+		t.Fatalf("api backend changes = %d, want 0", result.APIBackends)
+	}
+	patched, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(patched), "api_backend") {
+		t.Fatalf("unconfigured api_backend was materialized:\n%s", patched)
+	}
+	if _, err := Restore(configPath, statePath); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(restored) != original {
+		t.Fatalf("restore was not byte-exact\nwant: %q\ngot:  %q", original, restored)
+	}
+}
+
+func TestApplyTargetsMaterializesOnlyInheritedMaxCompletionTokens(t *testing.T) {
+	tests := []struct {
+		name        string
+		original    string
+		target      Target
+		wantLine    string
+		wantAbsent  bool
+		wantChanges int
+	}{
+		{
+			name: "provider value is projected onto model",
+			original: "[model_providers.gateway]\nbase_url = \"https://one.example/v1\"\n" +
+				"max_completion_tokens = 16384\n\n[model.one]\nmodel_provider = \"gateway\"\n",
+			target:      Target{ID: "one", MaxCompletionTokens: 16384},
+			wantLine:    "max_completion_tokens = 16384",
+			wantChanges: 1,
+		},
+		{
+			name: "model value remains user owned",
+			original: "[model_providers.gateway]\nbase_url = \"https://one.example/v1\"\n" +
+				"max_completion_tokens = 16384\n\n[model.one]\nmodel_provider = \"gateway\"\n" +
+				"max_completion_tokens = 8192 # model wins\n",
+			target:      Target{ID: "one", MaxCompletionTokens: 8192},
+			wantLine:    "max_completion_tokens = 8192 # model wins",
+			wantChanges: 0,
+		},
+		{
+			name:        "unconfigured capacity stays absent",
+			original:    "[model.one]\nbase_url = \"https://one.example/v1\"\n",
+			target:      Target{ID: "one"},
+			wantAbsent:  true,
+			wantChanges: 0,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			configPath := filepath.Join(dir, "config.toml")
+			statePath := filepath.Join(dir, "state.json")
+			if err := os.WriteFile(configPath, []byte(test.original), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			result, err := ApplyTargets(configPath, statePath, []Target{test.target})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.MaxCompletionTokens != test.wantChanges {
+				t.Fatalf("max-completion changes = %d, want %d", result.MaxCompletionTokens, test.wantChanges)
+			}
+			patched, err := os.ReadFile(configPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			model := sectionText(t, string(patched), "model.one")
+			if test.wantAbsent {
+				if strings.Contains(model, "max_completion_tokens") {
+					t.Fatalf("unconfigured max completion tokens were invented:\n%s", model)
+				}
+			} else if !strings.Contains(model, test.wantLine) {
+				t.Fatalf("model max completion tokens missing %q:\n%s", test.wantLine, model)
+			}
+
+			if _, err := Restore(configPath, statePath); err != nil {
+				t.Fatal(err)
+			}
+			restored, err := os.ReadFile(configPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(restored) != test.original {
+				t.Fatalf("restore was not byte-exact\nwant: %q\ngot:  %q", test.original, restored)
+			}
+		})
+	}
+}
+
+func TestRestorePreservesConcurrentEditToMaterializedMaxCompletionTokens(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	statePath := filepath.Join(dir, "state.json")
+	original := "[model_providers.gateway]\nbase_url = \"https://one.example/v1\"\n" +
+		"max_completion_tokens = 16384\n\n[model.one]\nmodel_provider = \"gateway\"\n"
+	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ApplyTargets(configPath, statePath, []Target{{ID: "one", MaxCompletionTokens: 16384}}); err != nil {
+		t.Fatal(err)
+	}
+	patched, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	edited := strings.Replace(string(patched),
+		`base_url = "http://127.0.0.1:18787/c/one"`+"\nmax_completion_tokens = 16384",
+		`base_url = "http://127.0.0.1:18787/c/one"`+"\nmax_completion_tokens = 4096", 1)
+	if edited == string(patched) {
+		t.Fatalf("materialized model value was not found:\n%s", patched)
+	}
+	if err := os.WriteFile(configPath, []byte(edited), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Restore(configPath, statePath); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(restored), "127.0.0.1:18787") ||
+		!strings.Contains(sectionText(t, string(restored), "model.one"), "max_completion_tokens = 4096") {
+		t.Fatalf("concurrent model edit was not preserved while proxy route restored:\n%s", restored)
 	}
 }
 
@@ -673,7 +920,9 @@ func TestApplyTargetsPlacesBackendSearchAfterChannelConfiguration(t *testing.T) 
 	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ApplyTargets(configPath, statePath, []Target{{ID: "one", APIBaseURL: true, APIBackend: "chat_completions"}}); err != nil {
+	if _, err := ApplyTargets(configPath, statePath, []Target{{
+		ID: "one", APIBaseURL: true, APIBackend: "chat_completions", ProjectBackendSearch: true,
+	}}); err != nil {
 		t.Fatal(err)
 	}
 	patched, err := os.ReadFile(configPath)
@@ -1003,7 +1252,9 @@ supports_backend_search = false
 		t.Fatal(err)
 	}
 
-	result, err := ApplyTargets(configPath, statePath, []Target{{ID: "one", APIBaseURL: true, APIBackend: "messages"}})
+	result, err := ApplyTargets(configPath, statePath, []Target{{
+		ID: "one", APIBaseURL: true, APIBackend: "messages", ProjectBackendSearch: true,
+	}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1042,7 +1293,7 @@ func TestApplyTargetsRejectsWrongTypedBackendSearchWithoutWriting(t *testing.T) 
 		t.Fatal(err)
 	}
 
-	_, err := ApplyTargets(configPath, statePath, []Target{{ID: "one"}})
+	_, err := ApplyTargets(configPath, statePath, []Target{{ID: "one", ProjectBackendSearch: true}})
 	if err == nil || !strings.Contains(err.Error(), "supports_backend_search must be a boolean") {
 		t.Fatalf("wrong capability error = %v", err)
 	}
@@ -1055,95 +1306,32 @@ func TestApplyTargetsRejectsWrongTypedBackendSearchWithoutWriting(t *testing.T) 
 	}
 }
 
-func TestRestoreRejectsAllOlderRewriteStateVersions(t *testing.T) {
-	for _, version := range []string{"3", "4"} {
-		t.Run("version "+version, func(t *testing.T) {
-			dir := t.TempDir()
-			configPath := filepath.Join(dir, "config.toml")
-			statePath := filepath.Join(dir, "state.json")
-			patched := "[model.one]\nsupports_backend_search = true\n"
-			legacyState := `{"version":` + version + `,"models":{"one":{"backend_search":{"managed":true,"present":true,"original_line":"supports_backend_search = false\n"}}}}`
-			if err := os.WriteFile(configPath, []byte(patched), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.WriteFile(statePath, []byte(legacyState), 0o600); err != nil {
-				t.Fatal(err)
-			}
-
-			restored, err := Restore(configPath, statePath)
-			if err == nil || !strings.Contains(err.Error(), "unsupported rewrite state version "+version) {
-				t.Fatalf("legacy state error = %v", err)
-			}
-			if restored != 0 {
-				t.Fatalf("restored fields = %d, want 0", restored)
-			}
-			current, _ := os.ReadFile(configPath)
-			if string(current) != patched {
-				t.Fatalf("config changed after rejecting legacy state: %q", current)
-			}
-			if _, err := os.Stat(statePath); err != nil {
-				t.Fatalf("legacy state should remain for manual recovery: %v", err)
-			}
-		})
-	}
-}
-
-func TestRestoreAcceptsVersionFiveRewriteState(t *testing.T) {
+func TestRestoreRejectsIncompatibleRewriteStateFormat(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.toml")
 	statePath := filepath.Join(dir, "state.json")
-	original := "[model.one]\nbase_url = \"https://one.example/v1\"\n"
-	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
+	patched := "[model.one]\nsupports_backend_search = true\n"
+	incompatibleState := `{"format":"obsolete-rewrite-state","models":{"one":{"backend_search":{"managed":true,"present":true,"original_line":"supports_backend_search = false\n"}}}}`
+	if err := os.WriteFile(configPath, []byte(patched), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ApplyTargets(configPath, statePath, []Target{{ID: "one"}}); err != nil {
+	if err := os.WriteFile(statePath, []byte(incompatibleState), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	encoded, err := os.ReadFile(statePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	encoded = bytes.Replace(encoded, []byte(`"version": 8`), []byte(`"version": 5`), 1)
-	if err := os.WriteFile(statePath, encoded, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := Restore(configPath, statePath); err != nil {
-		t.Fatal(err)
-	}
-	restored, err := os.ReadFile(configPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(restored) != original {
-		t.Fatalf("version 5 state did not restore exactly: %q", restored)
-	}
-}
 
-func TestRestoreAcceptsVersionSevenRewriteState(t *testing.T) {
-	dir := t.TempDir()
-	configPath := filepath.Join(dir, "config.toml")
-	statePath := filepath.Join(dir, "state.json")
-	original := "[model.one]\nbase_url = \"https://one.example/v1\"\napi_backend = \"messages\"\n"
-	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
-		t.Fatal(err)
+	restored, err := Restore(configPath, statePath)
+	if err == nil || !strings.Contains(err.Error(), `unsupported rewrite state format "obsolete-rewrite-state"`) {
+		t.Fatalf("incompatible state error = %v", err)
 	}
-	if _, err := ApplyTargets(configPath, statePath, []Target{{ID: "one", APIBackend: "messages"}}); err != nil {
-		t.Fatal(err)
+	if restored != 0 {
+		t.Fatalf("restored fields = %d, want 0", restored)
 	}
-	encoded, err := os.ReadFile(statePath)
-	if err != nil {
-		t.Fatal(err)
+	current, _ := os.ReadFile(configPath)
+	if string(current) != patched {
+		t.Fatalf("config changed after rejecting incompatible state: %q", current)
 	}
-	encoded = bytes.Replace(encoded, []byte(`"version": 8`), []byte(`"version": 7`), 1)
-	if err := os.WriteFile(statePath, encoded, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := Restore(configPath, statePath); err != nil {
-		t.Fatal(err)
-	}
-	restored, _ := os.ReadFile(configPath)
-	if string(restored) != original {
-		t.Fatalf("version 7 state did not restore exactly: %q", restored)
+	if _, err := os.Stat(statePath); err != nil {
+		t.Fatalf("incompatible state should remain for manual recovery: %v", err)
 	}
 }
 
@@ -1383,7 +1571,7 @@ func TestRestorePreservesBackendSearchEditWhileRestoringProxyRoute(t *testing.T)
 			if err := os.WriteFile(configPath, []byte(test.original), 0o600); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := ApplyTargets(configPath, statePath, []Target{{ID: "one"}}); err != nil {
+			if _, err := ApplyTargets(configPath, statePath, []Target{{ID: "one", ProjectBackendSearch: true}}); err != nil {
 				t.Fatal(err)
 			}
 			patched, err := os.ReadFile(configPath)
@@ -1575,7 +1763,8 @@ func TestRestoreDiscardsStateCommittedBeforeConfigRewrite(t *testing.T) {
 	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ApplyTargets(configPath, statePath, []Target{{ID: "one"}}); err != nil {
+	targets := []Target{{ID: "one"}}
+	if _, err := ApplyTargets(configPath, statePath, targets); err != nil {
 		t.Fatal(err)
 	}
 	preparedState, err := os.ReadFile(statePath)
@@ -1615,7 +1804,8 @@ func TestApplyTargetsRecoversStateCommittedBeforeConfigRewrite(t *testing.T) {
 	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ApplyTargets(configPath, statePath, []Target{{ID: "one"}}); err != nil {
+	targets := []Target{{ID: "one"}}
+	if _, err := ApplyTargets(configPath, statePath, targets); err != nil {
 		t.Fatal(err)
 	}
 	preparedState, err := os.ReadFile(statePath)
@@ -1628,7 +1818,7 @@ func TestApplyTargetsRecoversStateCommittedBeforeConfigRewrite(t *testing.T) {
 	if err := os.WriteFile(statePath, preparedState, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	result, err := ApplyTargets(configPath, statePath, []Target{{ID: "one"}})
+	result, err := ApplyTargets(configPath, statePath, targets)
 	if err != nil || result.ValidatedTargets != 1 {
 		t.Fatalf("reapply result=%+v err=%v", result, err)
 	}

@@ -206,6 +206,58 @@ func TestSSEDataLineUsesFallbackSequenceAndPreservesExisting(t *testing.T) {
 	}
 }
 
+func TestSSETerminalUsageKeepsUnknownMeasurementsNull(t *testing.T) {
+	tests := []struct {
+		name  string
+		usage string
+	}{
+		{name: "missing", usage: ""},
+		{name: "null", usage: `,"usage":null`},
+		{name: "empty", usage: `,"usage":{}`},
+		{name: "partial", usage: `,"usage":{"input_tokens":3}`},
+		{name: "negative", usage: `,"usage":{"input_tokens":3,"output_tokens":-1}`},
+		{name: "fractional", usage: `,"usage":{"input_tokens":3.5,"output_tokens":1}`},
+		{name: "overflow", usage: `,"usage":{"total_tokens":4294967296}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			line := `data: {"type":"response.completed","response":{"id":"resp_1","object":"response","status":"completed","model":"deepseek-v4-pro","output":[]` + test.usage + `}}`
+			patched := PatchSSEDataLineWithSequence(line, Options{}, 9)
+			var event map[string]any
+			payload := strings.TrimSpace(strings.TrimPrefix(patched, "data:"))
+			if err := json.Unmarshal([]byte(payload), &event); err != nil {
+				t.Fatal(err)
+			}
+			response := event["response"].(map[string]any)
+			usage, exists := response["usage"]
+			if !exists || usage != nil {
+				t.Fatalf("untrustworthy usage was not kept unknown: %s", patched)
+			}
+			if event["sequence_number"].(float64) != 9 {
+				t.Fatalf("fallback sequence missing: %s", patched)
+			}
+		})
+	}
+}
+
+func TestSSETerminalUsagePreservesExplicitZeroAndContextDetails(t *testing.T) {
+	line := `data: {"type":"response.completed","response":{"id":"resp_1","object":"response","status":"completed","model":"deepseek-v4-pro","output":[],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0,"context_details":{"input_tokens":40,"output_tokens":2}}}}`
+	patched := PatchSSEDataLineWithSequence(line, Options{}, 1)
+	var event map[string]any
+	payload := strings.TrimSpace(strings.TrimPrefix(patched, "data:"))
+	if err := json.Unmarshal([]byte(payload), &event); err != nil {
+		t.Fatal(err)
+	}
+	usage := event["response"].(map[string]any)["usage"].(map[string]any)
+	if usage["total_tokens"].(float64) != 0 {
+		t.Fatalf("explicit zero measurement changed: %s", patched)
+	}
+	contextDetails := usage["context_details"].(map[string]any)
+	if contextDetails["input_tokens"].(float64) != 40 || contextDetails["output_tokens"].(float64) != 2 {
+		t.Fatalf("provider context_details changed: %s", patched)
+	}
+}
+
 func TestPreserveExistingAnnotations(t *testing.T) {
 	raw := `{
 		"response":{
@@ -429,6 +481,126 @@ func TestReasoningNullSummaryAndIncompleteUsageAreCompleted(t *testing.T) {
 	usage := response["usage"].(map[string]any)
 	if usage["total_tokens"] != float64(5) {
 		t.Fatalf("total_tokens was not derived: %s", patched)
+	}
+}
+
+func TestMissingOrEmptyUsageDoesNotBecomeZero(t *testing.T) {
+	for _, raw := range []string{
+		`{"id":"resp_1","object":"response","created_at":1,"status":"completed","model":"m","output":[]}`,
+		`{"id":"resp_1","object":"response","created_at":1,"status":"completed","model":"m","output":[],"usage":null}`,
+		`{"id":"resp_1","object":"response","created_at":1,"status":"completed","model":"m","output":[],"usage":{}}`,
+	} {
+		patched := PatchJSONBytes([]byte(raw), Options{GPTResponses: true})
+		var response map[string]any
+		if err := json.Unmarshal(patched, &response); err != nil {
+			t.Fatal(err)
+		}
+		if usage, exists := response["usage"]; !exists || usage != nil {
+			t.Fatalf("missing usage was not preserved as null: %s", patched)
+		}
+	}
+}
+
+func TestAllZeroUsageRemainsUnknown(t *testing.T) {
+	raw := `{"id":"resp_1","object":"response","created_at":1,"status":"completed","model":"m","output":[],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}`
+	patched := PatchJSONBytes([]byte(raw), Options{GPTResponses: true})
+	var response map[string]any
+	if err := json.Unmarshal(patched, &response); err != nil {
+		t.Fatal(err)
+	}
+	if response["usage"] != nil {
+		t.Fatalf("all-zero placeholder was forwarded: %s", patched)
+	}
+}
+
+func TestInvalidOrPartialUsageRemainsUnknown(t *testing.T) {
+	tests := map[string]string{
+		"input only":               `{"input_tokens":3}`,
+		"output only":              `{"output_tokens":3}`,
+		"total only":               `{"total_tokens":7}`,
+		"input and total only":     `{"input_tokens":3,"total_tokens":7}`,
+		"negative output":          `{"input_tokens":3,"output_tokens":-1}`,
+		"fractional output":        `{"input_tokens":3,"output_tokens":1.5}`,
+		"wire count overflow":      `{"input_tokens":4294967296,"output_tokens":1}`,
+		"derived total overflow":   `{"input_tokens":4294967295,"output_tokens":1}`,
+		"invalid reasoning detail": `{"input_tokens":3,"output_tokens":1,"output_tokens_details":{"reasoning_tokens":-1}}`,
+		"non-object details":       `{"input_tokens":3,"output_tokens":1,"input_tokens_details":7}`,
+	}
+	for name, usage := range tests {
+		t.Run(name, func(t *testing.T) {
+			raw := `{"id":"resp_1","object":"response","created_at":1,"status":"completed","model":"m","output":[],"usage":` + usage + `}`
+			patched := PatchJSONBytes([]byte(raw), Options{GPTResponses: true})
+			var response map[string]any
+			if err := json.Unmarshal(patched, &response); err != nil {
+				t.Fatal(err)
+			}
+			if response["usage"] != nil {
+				t.Fatalf("untrustworthy usage was forwarded: %s", patched)
+			}
+		})
+	}
+}
+
+func TestContextDetailsAreDerivedOnlyFromCompleteRealUsage(t *testing.T) {
+	tests := []struct {
+		name        string
+		usage       string
+		wantContext bool
+		wantNull    bool
+	}{
+		{name: "complete", usage: `{"input_tokens":40,"output_tokens":2,"total_tokens":99}`, wantContext: true},
+		{name: "all-zero placeholder", usage: `{"input_tokens":0,"output_tokens":0,"total_tokens":0}`, wantNull: true},
+		{name: "overflowing sum", usage: `{"input_tokens":4294967295,"output_tokens":1,"total_tokens":4294967295}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			raw := `{"id":"resp_1","object":"response","created_at":1,"status":"completed","model":"m","output":[],"usage":` + test.usage + `}`
+			patched := PatchJSONBytes([]byte(raw), Options{GPTResponses: true, ContextDetailsFromUsage: true})
+			var response map[string]any
+			if err := json.Unmarshal(patched, &response); err != nil {
+				t.Fatal(err)
+			}
+			if test.wantNull {
+				if response["usage"] != nil {
+					t.Fatalf("usage=%#v want null", response["usage"])
+				}
+				return
+			}
+			usage := response["usage"].(map[string]any)
+			contextDetails, exists := usage["context_details"].(map[string]any)
+			if exists != test.wantContext {
+				t.Fatalf("context_details presence=%t want %t: %s", exists, test.wantContext, patched)
+			}
+			if test.wantContext && (contextDetails["input_tokens"] != usage["input_tokens"] ||
+				contextDetails["output_tokens"] != usage["output_tokens"]) {
+				t.Fatalf("context_details did not use real input/output: %s", patched)
+			}
+			if test.name == "complete" && usage["total_tokens"] != float64(99) {
+				t.Fatalf("billing total was overwritten by live context: %s", patched)
+			}
+		})
+	}
+}
+
+func TestContextDetailsDerivationIsOptInAndPreservesProviderValue(t *testing.T) {
+	raw := `{"id":"resp_1","object":"response","created_at":1,"status":"completed","model":"m","output":[],"usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}`
+	patched := PatchJSONBytes([]byte(raw), Options{GPTResponses: true})
+	var response map[string]any
+	if err := json.Unmarshal(patched, &response); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := response["usage"].(map[string]any)["context_details"]; exists {
+		t.Fatalf("generic Responses route received a private context extension: %s", patched)
+	}
+
+	provider := `{"id":"resp_1","object":"response","created_at":1,"status":"completed","model":"m","output":[],"usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6,"context_details":{"input_tokens":50,"output_tokens":7,"provider_field":true}}}`
+	patched = PatchJSONBytes([]byte(provider), Options{GPTResponses: true, ContextDetailsFromUsage: true})
+	if err := json.Unmarshal(patched, &response); err != nil {
+		t.Fatal(err)
+	}
+	contextDetails := response["usage"].(map[string]any)["context_details"].(map[string]any)
+	if contextDetails["input_tokens"] != float64(50) || contextDetails["output_tokens"] != float64(7) || contextDetails["provider_field"] != true {
+		t.Fatalf("provider context_details was changed: %s", patched)
 	}
 }
 

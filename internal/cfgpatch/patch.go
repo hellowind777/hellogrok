@@ -18,45 +18,66 @@ import (
 )
 
 const (
-	ProxyHost    = "127.0.0.1"
-	ProxyPort    = "18787"
-	stateVersion = 8
+	ProxyHost   = "127.0.0.1"
+	ProxyPort   = "18787"
+	stateFormat = "hellogrok-config-rewrite"
 
 	ccSwitchProxyToken = "PROXY_MANAGED"
 )
 
 var (
-	sectionRe                     = regexp.MustCompile(`^\[([^\]]+)\]\s*(?:#.*)?$`)
-	modelSectionRe                = regexp.MustCompile(`^model\.(?:"([^"]+)"|'([^']+)'|(.+))$`)
-	baseURLLine                   = regexp.MustCompile(`^(\s*base_url\s*=\s*)(?:"[^"]*"|'[^']*')(\s*(?:#.*)?)?$`)
-	apiBaseURLLine                = regexp.MustCompile(`^(\s*api_base_url\s*=\s*)(?:"[^"]*"|'[^']*')(\s*(?:#.*)?)?$`)
-	apiBackendLine                = regexp.MustCompile(`^(\s*api_backend\s*=\s*)(?:"[^"]*"|'[^']*')(\s*(?:#.*)?)?$`)
-	backendSearchLine             = regexp.MustCompile(`^(\s*supports_backend_search\s*=\s*)(?:true|false)(\s*(?:#.*)?)?$`)
-	backendToolsLine              = regexp.MustCompile(`^(\s*backend_tools\s*=\s*)(?:true|false)(\s*(?:#.*)?)?$`)
-	webFetchLine                  = regexp.MustCompile(`^(\s*web_fetch\s*=\s*)(?:true|false)(\s*(?:#.*)?)?$`)
-	subagentsEnabledLine          = regexp.MustCompile(`^(\s*enabled\s*=\s*)(?:true|false)(\s*(?:#.*)?)?$`)
-	subagentsEnabledDottedLine    = regexp.MustCompile(`^(\s*subagents\.enabled\s*=\s*)(?:true|false)(\s*(?:#.*)?)?$`)
-	baseURLAnyLine                = regexp.MustCompile(`^(\s*base_url\s*=\s*).*$`)
-	apiBaseURLAnyLine             = regexp.MustCompile(`^(\s*api_base_url\s*=\s*).*$`)
-	apiBackendAnyLine             = regexp.MustCompile(`^(\s*api_backend\s*=\s*).*$`)
-	backendSearchAnyLine          = regexp.MustCompile(`^(\s*supports_backend_search\s*=\s*).*$`)
-	backendToolsAnyLine           = regexp.MustCompile(`^(\s*backend_tools\s*=\s*).*$`)
-	webFetchAnyLine               = regexp.MustCompile(`^(\s*web_fetch\s*=\s*).*$`)
-	subagentsEnabledAnyLine       = regexp.MustCompile(`^(\s*enabled\s*=\s*).*$`)
-	subagentsEnabledDottedAnyLine = regexp.MustCompile(`^(\s*subagents\.enabled\s*=\s*).*$`)
+	sectionRe                      = regexp.MustCompile(`^\[([^\]]+)\]\s*(?:#.*)?$`)
+	modelSectionRe                 = regexp.MustCompile(`^model\.(?:"([^"]+)"|'([^']+)'|(.+))$`)
+	baseURLLine                    = regexp.MustCompile(`^(\s*base_url\s*=\s*)(?:"[^"]*"|'[^']*')(\s*(?:#.*)?)?$`)
+	apiBaseURLLine                 = regexp.MustCompile(`^(\s*api_base_url\s*=\s*)(?:"[^"]*"|'[^']*')(\s*(?:#.*)?)?$`)
+	apiBackendLine                 = regexp.MustCompile(`^(\s*api_backend\s*=\s*)(?:"[^"]*"|'[^']*')(\s*(?:#.*)?)?$`)
+	maxCompletionTokensLine        = regexp.MustCompile(`^(\s*max_completion_tokens\s*=\s*)[0-9]+(\s*(?:#.*)?)?$`)
+	backendSearchLine              = regexp.MustCompile(`^(\s*supports_backend_search\s*=\s*)(?:true|false)(\s*(?:#.*)?)?$`)
+	supportsReasoningEffortLine    = regexp.MustCompile(`^(\s*supports_reasoning_effort\s*=\s*)(?:true|false)(\s*(?:#.*)?)?$`)
+	reasoningEffortsLine           = regexp.MustCompile(`^(\s*reasoning_efforts\s*=\s*)\[.*\](\s*(?:#.*)?)?$`)
+	backendToolsLine               = regexp.MustCompile(`^(\s*backend_tools\s*=\s*)(?:true|false)(\s*(?:#.*)?)?$`)
+	webFetchLine                   = regexp.MustCompile(`^(\s*web_fetch\s*=\s*)(?:true|false)(\s*(?:#.*)?)?$`)
+	subagentsEnabledLine           = regexp.MustCompile(`^(\s*enabled\s*=\s*)(?:true|false)(\s*(?:#.*)?)?$`)
+	subagentsEnabledDottedLine     = regexp.MustCompile(`^(\s*subagents\.enabled\s*=\s*)(?:true|false)(\s*(?:#.*)?)?$`)
+	baseURLAnyLine                 = regexp.MustCompile(`^(\s*base_url\s*=\s*).*$`)
+	apiBaseURLAnyLine              = regexp.MustCompile(`^(\s*api_base_url\s*=\s*).*$`)
+	apiBackendAnyLine              = regexp.MustCompile(`^(\s*api_backend\s*=\s*).*$`)
+	maxCompletionTokensAnyLine     = regexp.MustCompile(`^(\s*max_completion_tokens\s*=\s*).*$`)
+	backendSearchAnyLine           = regexp.MustCompile(`^(\s*supports_backend_search\s*=\s*).*$`)
+	supportsReasoningEffortAnyLine = regexp.MustCompile(`^(\s*supports_reasoning_effort\s*=\s*).*$`)
+	reasoningEffortsAnyLine        = regexp.MustCompile(`^(\s*reasoning_efforts\s*=\s*).*$`)
+	backendToolsAnyLine            = regexp.MustCompile(`^(\s*backend_tools\s*=\s*).*$`)
+	webFetchAnyLine                = regexp.MustCompile(`^(\s*web_fetch\s*=\s*).*$`)
+	subagentsEnabledAnyLine        = regexp.MustCompile(`^(\s*enabled\s*=\s*).*$`)
+	subagentsEnabledDottedAnyLine  = regexp.MustCompile(`^(\s*subagents\.enabled\s*=\s*).*$`)
 )
 
 // Target describes one resolved custom model. APIBaseURL is true when Grok
 // could select a separate API-key endpoint, which must be routed through the
 // same channel facade to prevent a direct-request bypass. APIBackend is the
 // provider's real protocol; BuildAPIBackend is the protocol exposed to Grok
-// Build while the facade is active.
+// Build while the facade is active. An empty protocol remains catalog-owned:
+// the rewrite must not pin Grok Build's local or remote model resolution.
 type Target struct {
 	ID                    string
 	APIBaseURL            bool
 	APIBackend            string
 	BuildAPIBackend       string
 	SupportsBackendSearch bool
+	// ProjectBackendSearch is true only when a config value or a documented
+	// provider default may override Grok Build's resolved model catalog.
+	ProjectBackendSearch bool
+	ReasoningEfforts     []ReasoningEffortOption
+	// MaxCompletionTokens is the effective configured model/provider limit.
+	// A zero value leaves the field entirely to Grok Build and remote metadata.
+	MaxCompletionTokens uint64
+}
+
+// ReasoningEffortOption mirrors Grok Build's per-model effort menu entry.
+type ReasoningEffortOption struct {
+	Value   string
+	Label   string
+	Default bool
 }
 
 // CCSwitchTakeover identifies CC Switch's Grok Build live-proxy projection.
@@ -74,7 +95,7 @@ func (t CCSwitchTakeover) Active() bool {
 // State contains the exact lines replaced by hellogrok. It is written before
 // config.toml so an unclean exit can restore every managed field.
 type State struct {
-	Version    int                   `json:"version"`
+	Format     string                `json:"format"`
 	ConfigPath string                `json:"config_path"`
 	Models     map[string]ModelState `json:"models"`
 	Features   FeatureState          `json:"features,omitempty"`
@@ -95,13 +116,14 @@ type SubagentState struct {
 }
 
 type ModelState struct {
-	Section    ModelSectionState `json:"section,omitempty"`
-	BaseURL    ManagedLineState  `json:"base_url"`
-	APIBaseURL ManagedLineState  `json:"api_base_url,omitempty"`
-	// APIBackend is nil when the exposed and provider protocols are identical.
-	// A pointer also keeps v5/v6 rewrite states decodable during restoration.
-	APIBackend    *ManagedLineState `json:"api_backend,omitempty"`
-	BackendSearch ManagedLineState  `json:"backend_search"`
+	Section                 ModelSectionState `json:"section,omitempty"`
+	BaseURL                 ManagedLineState  `json:"base_url"`
+	APIBaseURL              ManagedLineState  `json:"api_base_url,omitempty"`
+	APIBackend              ManagedLineState  `json:"api_backend,omitempty"`
+	MaxCompletionTokens     ManagedLineState  `json:"max_completion_tokens,omitempty"`
+	BackendSearch           ManagedLineState  `json:"backend_search"`
+	SupportsReasoningEffort ManagedLineState  `json:"supports_reasoning_effort,omitempty"`
+	ReasoningEfforts        ManagedLineState  `json:"reasoning_efforts,omitempty"`
 }
 
 type ModelSectionState struct {
@@ -119,17 +141,20 @@ type ManagedLineState struct {
 }
 
 type ApplyResult struct {
-	ModelSections      int
-	BaseURLs           int
-	APIBaseURLs        int
-	APIBackends        int
-	BackendSearch      int
-	BackendTools       int
-	WebFetch           int
-	SubagentsEnabled   int
-	ValidatedTargets   int
-	Targets            []string
-	LegacyModelAliases map[string]string
+	ModelSections           int
+	BaseURLs                int
+	APIBaseURLs             int
+	APIBackends             int
+	MaxCompletionTokens     int
+	BackendSearch           int
+	SupportsReasoningEffort int
+	ReasoningEfforts        int
+	BackendTools            int
+	WebFetch                int
+	SubagentsEnabled        int
+	ValidatedTargets        int
+	Targets                 []string
+	LegacyModelAliases      map[string]string
 }
 
 // ModelTables returns [model.<id>] entries keyed by their effective ID. TOML
@@ -172,7 +197,9 @@ func isModelEntryTable(table map[string]any) bool {
 		switch key {
 		case "model", "name", "model_provider", "base_url", "api_base_url",
 			"api_backend", "api_key", "env_key", "auth_provider", "auth_scheme",
-			"supports_backend_search", "extra_headers", "env_http_headers":
+			"supports_backend_search", "supports_reasoning_effort", "reasoning_efforts",
+			"context_window", "max_completion_tokens",
+			"inference_idle_timeout_secs", "extra_headers", "env_http_headers":
 			return true
 		}
 		if _, nested := value.(map[string]any); !nested {
@@ -323,9 +350,10 @@ func ChannelIDFromProxyURL(raw string) string {
 }
 
 // ApplyTargets gives every resolved custom model a channel-scoped facade URL,
-// projects the protocol Grok Build must consume, materializes its effective
-// backend-search capability, and enables Build's backend-tool and web-fetch
-// feature gates. It preserves [models].web_search and stream_tool_calls.
+// projects the protocol Grok Build must consume, materializes only declared
+// capabilities missing from Grok Build's provider inheritance, and enables
+// Build's backend-tool and web-fetch feature gates. It preserves
+// [models].web_search, stream_tool_calls, and omitted catalog-owned fields.
 func ApplyTargets(configPath, statePath string, targets []Target) (ApplyResult, error) {
 	configPath, err := canonicalConfigPath(configPath)
 	if err != nil {
@@ -342,22 +370,29 @@ func ApplyTargets(configPath, statePath string, targets []Target) (ApplyResult, 
 			continue
 		}
 		target.APIBackend = strings.ToLower(strings.TrimSpace(target.APIBackend))
-		if target.APIBackend == "" {
-			target.APIBackend = "chat_completions"
-		}
 		switch target.APIBackend {
-		case "responses", "messages", "chat_completions":
+		case "", "responses", "messages", "chat_completions":
 		default:
 			return ApplyResult{}, fmt.Errorf("model %q uses unsupported api_backend %q", target.ID, target.APIBackend)
 		}
 		target.BuildAPIBackend = strings.ToLower(strings.TrimSpace(target.BuildAPIBackend))
-		if target.BuildAPIBackend == "" {
+		if target.BuildAPIBackend == "" && target.APIBackend != "" {
 			target.BuildAPIBackend = target.APIBackend
 		}
 		switch target.BuildAPIBackend {
-		case "responses", "messages", "chat_completions":
+		case "", "responses", "messages", "chat_completions":
 		default:
 			return ApplyResult{}, fmt.Errorf("model %q uses unsupported Build api_backend %q", target.ID, target.BuildAPIBackend)
+		}
+		if len(target.ReasoningEfforts) > 0 {
+			efforts, err := normalizedReasoningEfforts(target.ReasoningEfforts)
+			if err != nil {
+				return ApplyResult{}, fmt.Errorf("model %q reasoning efforts: %w", target.ID, err)
+			}
+			target.ReasoningEfforts = efforts
+		}
+		if target.MaxCompletionTokens > uint64(^uint32(0)) {
+			return ApplyResult{}, fmt.Errorf("model %q max completion tokens must be between 1 and %d", target.ID, uint64(^uint32(0)))
 		}
 		targetMap[target.ID] = target
 	}
@@ -371,17 +406,20 @@ func ApplyTargets(configPath, statePath string, targets []Target) (ApplyResult, 
 	if err := validateTargetBackendSearchValues(initialRoot, targetMap); err != nil {
 		return ApplyResult{}, err
 	}
+	if err := validateTargetReasoningEffortValues(initialRoot, targetMap); err != nil {
+		return ApplyResult{}, err
+	}
 	if err := validateSubagentEnabledValue(initialRoot); err != nil {
 		return ApplyResult{}, err
 	}
 
-	state := State{Version: stateVersion, ConfigPath: configPath, Models: map[string]ModelState{}}
+	state := State{Format: stateFormat, ConfigPath: configPath, Models: map[string]ModelState{}}
 	if existing, readErr := os.ReadFile(statePath); readErr == nil {
 		if err := json.Unmarshal(existing, &state); err != nil {
 			return ApplyResult{}, fmt.Errorf("decode rewrite state: %w", err)
 		}
-		if !supportedStateVersion(state.Version) {
-			return ApplyResult{}, fmt.Errorf("unsupported rewrite state version %d", state.Version)
+		if state.Format != stateFormat {
+			return ApplyResult{}, fmt.Errorf("unsupported rewrite state format %q", state.Format)
 		}
 		if state.Models == nil {
 			return ApplyResult{}, fmt.Errorf("invalid rewrite state: missing models")
@@ -397,12 +435,12 @@ func ApplyTargets(configPath, statePath string, targets []Target) (ApplyResult, 
 			if err := os.Remove(statePath); err != nil && !os.IsNotExist(err) {
 				return ApplyResult{}, fmt.Errorf("discard unapplied rewrite state: %w", err)
 			}
-			state = State{Version: stateVersion, ConfigPath: configPath, Models: map[string]ModelState{}}
+			state = State{Format: stateFormat, ConfigPath: configPath, Models: map[string]ModelState{}}
 		} else if err := validateRestorableConfig(raw, state); err != nil {
 			return ApplyResult{}, fmt.Errorf("existing rewrite state conflicts with config: %w", err)
 		}
 	}
-	state.Version = stateVersion
+	state.Format = stateFormat
 	state.ConfigPath = configPath
 
 	text, subagentEnabled, err := rewriteSubagentEnabled(string(raw), initialRoot, &state)
@@ -520,15 +558,34 @@ func validateManagedConfig(raw []byte, targets map[string]Target, state State) e
 				return fmt.Errorf("[model.%s].api_base_url must be %q", id, proxyURL)
 			}
 		}
-		backend, err := effectiveModelBackend(root, model)
-		if err != nil {
-			return fmt.Errorf("[model.%s].api_backend %w", id, err)
+		if expected := targets[id].BuildAPIBackend; expected != "" {
+			backend, err := effectiveModelBackend(root, model)
+			if err != nil {
+				return fmt.Errorf("[model.%s].api_backend %w", id, err)
+			}
+			if backend != expected {
+				return fmt.Errorf("[model.%s].api_backend must be %q, got %q", id, expected, backend)
+			}
 		}
-		if backend != targets[id].BuildAPIBackend {
-			return fmt.Errorf("[model.%s].api_backend must be %q, got %q", id, targets[id].BuildAPIBackend, backend)
+		if expected := targets[id].MaxCompletionTokens; expected > 0 {
+			actual, ok := positiveUint64(model["max_completion_tokens"])
+			if !ok || actual != expected {
+				return fmt.Errorf("[model.%s].max_completion_tokens must be %d", id, expected)
+			}
 		}
-		if value, ok := model["supports_backend_search"].(bool); !ok || value != targets[id].SupportsBackendSearch {
-			return fmt.Errorf("[model.%s].supports_backend_search must be %t", id, targets[id].SupportsBackendSearch)
+		if targets[id].ProjectBackendSearch || state.Models[id].BackendSearch.Managed {
+			if value, ok := model["supports_backend_search"].(bool); !ok || value != targets[id].SupportsBackendSearch {
+				return fmt.Errorf("[model.%s].supports_backend_search must be %t", id, targets[id].SupportsBackendSearch)
+			}
+		}
+		if expected := targets[id].ReasoningEfforts; len(expected) > 0 {
+			if value, ok := model["supports_reasoning_effort"].(bool); !ok || !value {
+				return fmt.Errorf("[model.%s].supports_reasoning_effort must be true", id)
+			}
+			actual, ok := reasoningEffortOptionsValue(model["reasoning_efforts"])
+			if !ok || !reasoningEffortsEqual(actual, expected) {
+				return fmt.Errorf("[model.%s].reasoning_efforts does not match the projected menu", id)
+			}
 		}
 	}
 	return nil
@@ -562,6 +619,9 @@ func validateTargetBackendSearchValues(root map[string]any, targets map[string]T
 	models := ModelTables(root)
 	providers, _ := root["model_providers"].(map[string]any)
 	for id := range targets {
+		if !targets[id].ProjectBackendSearch {
+			continue
+		}
 		model := models[id]
 		if model == nil {
 			continue
@@ -582,6 +642,138 @@ func validateTargetBackendSearchValues(root map[string]any, targets map[string]T
 		}
 	}
 	return nil
+}
+
+func positiveUint64(value any) (uint64, bool) {
+	switch typed := value.(type) {
+	case int:
+		if typed > 0 {
+			return uint64(typed), true
+		}
+	case int64:
+		if typed > 0 {
+			return uint64(typed), true
+		}
+	case uint:
+		if typed > 0 {
+			return uint64(typed), true
+		}
+	case uint64:
+		if typed > 0 {
+			return typed, true
+		}
+	}
+	return 0, false
+}
+
+func validateTargetReasoningEffortValues(root map[string]any, targets map[string]Target) error {
+	models := ModelTables(root)
+	for id, target := range targets {
+		if len(target.ReasoningEfforts) == 0 {
+			continue
+		}
+		model := models[id]
+		if model == nil {
+			continue
+		}
+		if value, exists := model["supports_reasoning_effort"]; exists {
+			if _, ok := value.(bool); !ok {
+				return fmt.Errorf("[model.%s].supports_reasoning_effort must be a boolean", id)
+			}
+		}
+		if value, exists := model["reasoning_efforts"]; exists {
+			if _, ok := reasoningEffortOptionsValue(value); !ok {
+				return fmt.Errorf("[model.%s].reasoning_efforts must be an array of valid effort options", id)
+			}
+		}
+	}
+	return nil
+}
+
+func normalizedReasoningEfforts(options []ReasoningEffortOption) ([]ReasoningEffortOption, error) {
+	allowed := map[string]bool{
+		"none": true, "minimal": true, "low": true, "medium": true,
+		"high": true, "xhigh": true, "max": true,
+	}
+	seen := make(map[string]bool, len(options))
+	normalized := make([]ReasoningEffortOption, 0, len(options))
+	defaults := 0
+	for _, option := range options {
+		option.Value = strings.ToLower(strings.TrimSpace(option.Value))
+		option.Label = strings.TrimSpace(option.Label)
+		if !allowed[option.Value] {
+			return nil, fmt.Errorf("unsupported value %q", option.Value)
+		}
+		if seen[option.Value] {
+			return nil, fmt.Errorf("duplicate value %q", option.Value)
+		}
+		if option.Label == "" {
+			return nil, fmt.Errorf("value %q has an empty label", option.Value)
+		}
+		seen[option.Value] = true
+		if option.Default {
+			defaults++
+		}
+		normalized = append(normalized, option)
+	}
+	if defaults != 1 {
+		return nil, fmt.Errorf("exactly one option must be the default")
+	}
+	return normalized, nil
+}
+
+func reasoningEffortsTOML(options []ReasoningEffortOption) string {
+	entries := make([]string, 0, len(options))
+	for _, option := range options {
+		entry := "{ value = " + quoteTOML(option.Value) + ", label = " + quoteTOML(option.Label)
+		if option.Default {
+			entry += ", default = true"
+		}
+		entries = append(entries, entry+" }")
+	}
+	return "[" + strings.Join(entries, ", ") + "]"
+}
+
+func reasoningEffortOptionsValue(value any) ([]ReasoningEffortOption, bool) {
+	rawOptions, ok := value.([]any)
+	if !ok || len(rawOptions) == 0 {
+		return nil, false
+	}
+	options := make([]ReasoningEffortOption, 0, len(rawOptions))
+	for _, raw := range rawOptions {
+		switch typed := raw.(type) {
+		case string:
+			options = append(options, ReasoningEffortOption{Value: typed, Label: typed})
+		case map[string]any:
+			value, valueOK := typed["value"].(string)
+			if !valueOK {
+				return nil, false
+			}
+			label, _ := typed["label"].(string)
+			if strings.TrimSpace(label) == "" {
+				label = value
+			}
+			isDefault, _ := typed["default"].(bool)
+			options = append(options, ReasoningEffortOption{Value: value, Label: label, Default: isDefault})
+		default:
+			return nil, false
+		}
+	}
+	return options, true
+}
+
+func reasoningEffortsEqual(left, right []ReasoningEffortOption) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if strings.ToLower(strings.TrimSpace(left[index].Value)) != right[index].Value ||
+			strings.TrimSpace(left[index].Label) != right[index].Label ||
+			left[index].Default != right[index].Default {
+			return false
+		}
+	}
+	return true
 }
 
 func validateSubagentEnabledValue(root map[string]any) error {
@@ -609,10 +801,6 @@ func discardUncommittedState(statePath string, cause error) error {
 		return fmt.Errorf("%w; remove uncommitted rewrite state: %v", cause, err)
 	}
 	return cause
-}
-
-func supportedStateVersion(version int) bool {
-	return version == 5 || version == 6 || version == 7 || version == stateVersion
 }
 
 // rewriteSubagentEnabled repairs a Grok Build 0.2.118 defaulting bug. When a
@@ -871,22 +1059,60 @@ func rewriteModelBlock(block []string, id string, target Target, state *State, e
 	if target.APIBaseURL {
 		fields = append(fields, managedField{name: "api_base_url", pattern: apiBaseURLLine, anyPattern: apiBaseURLAnyLine, value: quoteTOML(proxyURL), state: &modelState.APIBaseURL, changed: &result.APIBaseURLs})
 	}
-	if target.BuildAPIBackend != target.APIBackend || modelState.APIBackend != nil {
-		if modelState.APIBackend == nil {
-			modelState.APIBackend = &ManagedLineState{}
-		}
+	if target.BuildAPIBackend != "" && (target.BuildAPIBackend != target.APIBackend || modelState.APIBackend.Managed) {
 		fields = append(fields, managedField{
 			name: "api_backend", pattern: apiBackendLine, anyPattern: apiBackendAnyLine,
-			value: quoteTOML(target.BuildAPIBackend), state: modelState.APIBackend, changed: &result.APIBackends,
+			value: quoteTOML(target.BuildAPIBackend), state: &modelState.APIBackend, changed: &result.APIBackends,
 		})
 	}
-	fields = append(fields,
-		managedField{name: "supports_backend_search", pattern: backendSearchLine, anyPattern: backendSearchAnyLine, value: fmt.Sprintf("%t", target.SupportsBackendSearch), state: &modelState.BackendSearch, changed: &result.BackendSearch},
-	)
+	// Grok Build inherits provider context_window but not provider
+	// max_completion_tokens. Materialize only a missing model field so an
+	// explicit [model.*] value remains user-owned and highest priority.
+	if target.MaxCompletionTokens > 0 &&
+		(modelState.MaxCompletionTokens.Managed || !modelBlockHasField(block, maxCompletionTokensAnyLine)) {
+		fields = append(fields, managedField{
+			name: "max_completion_tokens", pattern: maxCompletionTokensLine,
+			anyPattern: maxCompletionTokensAnyLine, value: fmt.Sprintf("%d", target.MaxCompletionTokens),
+			state: &modelState.MaxCompletionTokens, changed: &result.MaxCompletionTokens,
+		})
+	}
+	if target.ProjectBackendSearch || modelState.BackendSearch.Managed {
+		fields = append(fields,
+			managedField{name: "supports_backend_search", pattern: backendSearchLine, anyPattern: backendSearchAnyLine, value: fmt.Sprintf("%t", target.SupportsBackendSearch), state: &modelState.BackendSearch, changed: &result.BackendSearch},
+		)
+	}
+	if len(target.ReasoningEfforts) > 0 {
+		fields = append(fields, managedField{
+			name: "supports_reasoning_effort", pattern: supportsReasoningEffortLine,
+			anyPattern: supportsReasoningEffortAnyLine, value: "true",
+			state: &modelState.SupportsReasoningEffort, changed: &result.SupportsReasoningEffort,
+		})
+	}
 
 	block = rewriteManagedFields(block, 1, fields, ending)
+	if len(target.ReasoningEfforts) > 0 {
+		field := managedField{
+			name: "reasoning_efforts", pattern: reasoningEffortsLine,
+			anyPattern: reasoningEffortsAnyLine, value: reasoningEffortsTOML(target.ReasoningEfforts),
+			state: &modelState.ReasoningEfforts, changed: &result.ReasoningEfforts,
+		}
+		block, err = rewriteManagedCompositeField(block, 1, field, ending)
+		if err != nil {
+			return nil, fmt.Errorf("[model.%s].reasoning_efforts: %w", id, err)
+		}
+	}
 	state.Models[id] = modelState
 	return block, nil
+}
+
+func modelBlockHasField(block []string, pattern *regexp.Regexp) bool {
+	structural := tomlStructuralLines(block)
+	for index := 1; index < len(block); index++ {
+		if structural[index] && pattern.MatchString(strings.TrimRight(block[index], "\r\n")) {
+			return true
+		}
+	}
+	return false
 }
 
 // rewriteManagedFields updates existing managed values in place and appends
@@ -944,6 +1170,80 @@ func rewriteManagedFields(block []string, firstContent int, fields []managedFiel
 	return block
 }
 
+// rewriteManagedCompositeField handles TOML values that may span multiple
+// lines. The complete original assignment is kept in OriginalLine so shutdown
+// can restore comments, formatting, and line endings byte-for-byte.
+func rewriteManagedCompositeField(block []string, firstContent int, field managedField, ending string) ([]string, error) {
+	structural := tomlStructuralLines(block)
+	for index := firstContent; index < len(block); index++ {
+		if !structural[index] {
+			continue
+		}
+		bare := strings.TrimRight(block[index], "\r\n")
+		match := field.anyPattern.FindStringSubmatch(bare)
+		if match == nil {
+			continue
+		}
+		end, err := tomlAssignmentEnd(block, index, field.name)
+		if err != nil {
+			return nil, err
+		}
+		original := strings.Join(block[index:end], "")
+		replacement := match[1] + field.value + lineEnding(block[end-1])
+		if end == index+1 {
+			if preserved, ok := replacementForManagedLine(bare, block[index], field); ok {
+				replacement = preserved
+			}
+		}
+		if !field.state.Managed {
+			field.state.Managed = true
+			field.state.Present = true
+			field.state.OriginalLine = original
+		}
+		field.state.AppliedValue = managedSemanticValue(field.value)
+		if original == replacement {
+			return block, nil
+		}
+		next := make([]string, 0, len(block)-(end-index)+1)
+		next = append(next, block[:index]...)
+		next = append(next, replacement)
+		next = append(next, block[end:]...)
+		*field.changed++
+		return next, nil
+	}
+
+	if !field.state.Managed {
+		*field.state = ManagedLineState{Managed: true, Present: false}
+	}
+	field.state.AppliedValue = managedSemanticValue(field.value)
+	insertAt := managedFieldFooterInsertAt(block, firstContent)
+	if insertAt > 0 && lineEnding(block[insertAt-1]) == "" {
+		if field.state.PreviousLineHash == "" {
+			field.state.PreviousLineHash = lineFingerprint(block[insertAt-1])
+		}
+		block[insertAt-1] += ending
+	}
+	block = insertBlockLine(block, insertAt, field.name+" = "+field.value+ending)
+	*field.changed++
+	return block, nil
+}
+
+func tomlAssignmentEnd(lines []string, start int, key string) (int, error) {
+	var assignment strings.Builder
+	for end := start + 1; end <= len(lines); end++ {
+		assignment.WriteString(lines[end-1])
+		var root map[string]any
+		if err := toml.Unmarshal([]byte("[managed]\n"+assignment.String()), &root); err != nil {
+			continue
+		}
+		table, _ := root["managed"].(map[string]any)
+		if _, exists := table[key]; exists {
+			return end, nil
+		}
+	}
+	return 0, fmt.Errorf("could not locate the end of its TOML value")
+}
+
 func insertBlockLine(block []string, index int, line string) []string {
 	block = append(block, "")
 	copy(block[index+1:], block[index:])
@@ -981,8 +1281,8 @@ func Restore(configPath, statePath string) (int, error) {
 	if err := json.Unmarshal(encoded, &state); err != nil {
 		return 0, fmt.Errorf("decode rewrite state: %w", err)
 	}
-	if !supportedStateVersion(state.Version) || state.Models == nil {
-		return 0, fmt.Errorf("unsupported rewrite state version %d", state.Version)
+	if state.Format != stateFormat || state.Models == nil {
+		return 0, fmt.Errorf("unsupported rewrite state format %q", state.Format)
 	}
 	configPath, err = canonicalConfigPath(configPath)
 	if err != nil {
@@ -1096,8 +1396,11 @@ func matchesOriginalManagedState(raw []byte, state State) (bool, error) {
 		for _, check := range []managedValueCheck{
 			{key: "base_url", state: modelState.BaseURL},
 			{key: "api_base_url", state: modelState.APIBaseURL},
-			{key: "api_backend", state: legacyManagedState(modelState.APIBackend)},
+			{key: "api_backend", state: modelState.APIBackend},
+			{key: "max_completion_tokens", state: modelState.MaxCompletionTokens},
 			{key: "supports_backend_search", state: modelState.BackendSearch},
+			{key: "supports_reasoning_effort", state: modelState.SupportsReasoningEffort},
+			{key: "reasoning_efforts", state: modelState.ReasoningEfforts},
 		} {
 			matches, err := managedValueMatchesOriginal(model, check)
 			if err != nil || !matches {
@@ -1120,7 +1423,9 @@ func managedValueMatchesOriginal(table map[string]any, check managedValueCheck) 
 	if err != nil {
 		return false, err
 	}
-	return fmt.Sprint(current) == fmt.Sprint(expected), nil
+	currentValue, currentOK := managedScalarString(current)
+	expectedValue, expectedOK := managedScalarString(expected)
+	return currentOK && expectedOK && currentValue == expectedValue, nil
 }
 
 func originalManagedValue(key, line string) (any, error) {
@@ -1161,6 +1466,12 @@ func managedSemanticValue(rendered string) string {
 	var decoded string
 	if json.Unmarshal([]byte(rendered), &decoded) == nil {
 		return decoded
+	}
+	var root map[string]any
+	if toml.Unmarshal([]byte("value = "+rendered), &root) == nil {
+		if value, ok := managedScalarString(root["value"]); ok {
+			return value
+		}
 	}
 	return strings.TrimSpace(rendered)
 }
@@ -1220,14 +1531,23 @@ func prepareRestoreState(raw []byte, state State) (State, error) {
 		if err != nil {
 			return State{}, err
 		}
-		if modelState.APIBackend != nil {
-			apiBackend, _, fieldErr := managedStateForRestore(section, model, "api_backend", *modelState.APIBackend)
-			if fieldErr != nil {
-				return State{}, fieldErr
-			}
-			modelState.APIBackend = &apiBackend
+		modelState.APIBackend, _, err = managedStateForRestore(section, model, "api_backend", modelState.APIBackend)
+		if err != nil {
+			return State{}, err
+		}
+		modelState.MaxCompletionTokens, _, err = managedStateForRestore(section, model, "max_completion_tokens", modelState.MaxCompletionTokens)
+		if err != nil {
+			return State{}, err
 		}
 		modelState.BackendSearch, _, err = managedStateForRestore(section, model, "supports_backend_search", modelState.BackendSearch)
+		if err != nil {
+			return State{}, err
+		}
+		modelState.SupportsReasoningEffort, _, err = managedStateForRestore(section, model, "supports_reasoning_effort", modelState.SupportsReasoningEffort)
+		if err != nil {
+			return State{}, err
+		}
+		modelState.ReasoningEfforts, _, err = managedStateForRestore(section, model, "reasoning_efforts", modelState.ReasoningEfforts)
 		if err != nil {
 			return State{}, err
 		}
@@ -1282,13 +1602,8 @@ func managedStateForRestore(section string, table map[string]any, key string, st
 	}
 	current, exists := table[key]
 	if exists {
-		var value string
-		switch typed := current.(type) {
-		case string:
-			value = typed
-		case bool:
-			value = fmt.Sprintf("%t", typed)
-		default:
+		value, ok := managedScalarString(current)
+		if !ok {
 			state.Managed = false
 			return state, true, nil
 		}
@@ -1341,8 +1656,11 @@ func validateRestorableConfig(raw []byte, state State) error {
 		if err := validateManagedTable(fmt.Sprintf("[model.%s]", id), model, []managedValueCheck{
 			{key: "base_url", state: modelState.BaseURL},
 			{key: "api_base_url", state: modelState.APIBaseURL},
-			{key: "api_backend", state: legacyManagedState(modelState.APIBackend)},
+			{key: "api_backend", state: modelState.APIBackend},
+			{key: "max_completion_tokens", state: modelState.MaxCompletionTokens},
 			{key: "supports_backend_search", state: modelState.BackendSearch},
+			{key: "supports_reasoning_effort", state: modelState.SupportsReasoningEffort},
+			{key: "reasoning_efforts", state: modelState.ReasoningEfforts},
 		}); err != nil {
 			return err
 		}
@@ -1370,13 +1688,8 @@ func validateManagedTable(section string, table map[string]any, checks []managed
 			}
 			continue
 		}
-		var value string
-		switch typed := current.(type) {
-		case string:
-			value = typed
-		case bool:
-			value = fmt.Sprintf("%t", typed)
-		default:
+		value, ok := managedScalarString(current)
+		if !ok {
 			return fmt.Errorf("%s.%s has an unexpected type", section, check.key)
 		}
 		if value != check.state.AppliedValue {
@@ -1384,6 +1697,43 @@ func validateManagedTable(section string, table map[string]any, checks []managed
 		}
 	}
 	return nil
+}
+
+func managedScalarString(value any) (string, bool) {
+	switch typed := value.(type) {
+	case string:
+		return typed, true
+	case bool:
+		return fmt.Sprintf("%t", typed), true
+	case int:
+		return fmt.Sprintf("%d", typed), true
+	case int8:
+		return fmt.Sprintf("%d", typed), true
+	case int16:
+		return fmt.Sprintf("%d", typed), true
+	case int32:
+		return fmt.Sprintf("%d", typed), true
+	case int64:
+		return fmt.Sprintf("%d", typed), true
+	case uint:
+		return fmt.Sprintf("%d", typed), true
+	case uint8:
+		return fmt.Sprintf("%d", typed), true
+	case uint16:
+		return fmt.Sprintf("%d", typed), true
+	case uint32:
+		return fmt.Sprintf("%d", typed), true
+	case uint64:
+		return fmt.Sprintf("%d", typed), true
+	case []any, map[string]any:
+		encoded, err := json.Marshal(typed)
+		if err != nil {
+			return "", false
+		}
+		return string(encoded), true
+	default:
+		return "", false
+	}
 }
 
 func restoreFeatureFlags(text string, state FeatureState) (string, int) {
@@ -1576,14 +1926,10 @@ func restoreModelBlock(block []string, modelState ModelState, restored int, fina
 	}{
 		{baseURLLine, baseURLAnyLine, modelState.BaseURL},
 		{apiBaseURLLine, apiBaseURLAnyLine, modelState.APIBaseURL},
+		{apiBackendLine, apiBackendAnyLine, modelState.APIBackend},
+		{maxCompletionTokensLine, maxCompletionTokensAnyLine, modelState.MaxCompletionTokens},
 		{backendSearchLine, backendSearchAnyLine, modelState.BackendSearch},
-	}
-	if modelState.APIBackend != nil {
-		fields = append(fields, struct {
-			pattern    *regexp.Regexp
-			anyPattern *regexp.Regexp
-			state      ManagedLineState
-		}{apiBackendLine, apiBackendAnyLine, *modelState.APIBackend})
+		{supportsReasoningEffortLine, supportsReasoningEffortAnyLine, modelState.SupportsReasoningEffort},
 	}
 	for _, field := range fields {
 		if !field.state.Managed {
@@ -1610,17 +1956,49 @@ func restoreModelBlock(block []string, modelState ModelState, restored int, fina
 		}
 		block = next
 	}
+	block, restored = restoreManagedCompositeField(block, reasoningEffortsAnyLine, modelState.ReasoningEfforts, restored)
 	if finalBlock {
-		restoreTerminalBlockEnding(block, modelState.BaseURL, modelState.APIBaseURL, legacyManagedState(modelState.APIBackend), modelState.BackendSearch)
+		restoreTerminalBlockEnding(block, modelState.BaseURL, modelState.APIBaseURL,
+			modelState.APIBackend, modelState.MaxCompletionTokens, modelState.BackendSearch,
+			modelState.SupportsReasoningEffort, modelState.ReasoningEfforts)
 	}
 	return block, restored
 }
 
-func legacyManagedState(state *ManagedLineState) ManagedLineState {
-	if state == nil {
-		return ManagedLineState{}
+func restoreManagedCompositeField(block []string, anyPattern *regexp.Regexp, state ManagedLineState, restored int) ([]string, int) {
+	if !state.Managed {
+		return block, restored
 	}
-	return *state
+	start, end := -1, -1
+	structural := tomlStructuralLines(block)
+	for index := 1; index < len(block); index++ {
+		if !structural[index] || !anyPattern.MatchString(strings.TrimRight(block[index], "\r\n")) {
+			continue
+		}
+		assignmentEnd, err := tomlAssignmentEnd(block, index, "reasoning_efforts")
+		if err != nil {
+			return block, restored
+		}
+		start, end = index, assignmentEnd
+		break
+	}
+	if start >= 0 {
+		next := make([]string, 0, len(block)-(end-start))
+		next = append(next, block[:start]...)
+		if state.Present {
+			next = append(next, splitKeepNL(state.OriginalLine)...)
+		}
+		next = append(next, block[end:]...)
+		return next, restored + 1
+	}
+	if state.Present {
+		next := make([]string, 0, len(block)+1)
+		next = append(next, block[:1]...)
+		next = append(next, splitKeepNL(state.OriginalLine)...)
+		next = append(next, block[1:]...)
+		return next, restored + 1
+	}
+	return block, restored
 }
 
 func restoreTerminalBlockEnding(lines []string, states ...ManagedLineState) {

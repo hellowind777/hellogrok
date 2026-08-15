@@ -37,11 +37,14 @@ type Server struct {
 	requestCtx    context.Context
 	requestCancel context.CancelFunc
 
-	transport         *http.Transport
-	client            *http.Client
-	connections       *connectionTracker
-	shutdownTimeout   time.Duration
-	streamIdleTimeout time.Duration
+	transport               *http.Transport
+	client                  *http.Client
+	deepSeekTransport       *http.Transport
+	deepSeekClient          *http.Client
+	connections             *connectionTracker
+	shutdownTimeout         time.Duration
+	bodyIdleTimeout         time.Duration
+	deepSeekBodyIdleTimeout time.Duration
 
 	probedMu  sync.Mutex
 	probed    map[string]bool
@@ -73,26 +76,27 @@ func newServer(logger *log.Logger, reasoningPath string) *Server {
 		logger.Printf("reasoning provenance load warning: %v", reasoningErr)
 	}
 	connections := newConnectionTracker()
-	transport := newUpstreamTransport(connections)
+	// Header deadlines are selected per route in forwardFacade. A transport-wide
+	// value would make one channel's timeout silently govern every future model.
+	transport := newUpstreamTransport(connections, 0)
+	deepSeekTransport := newUpstreamTransport(connections, 0)
 	requestCtx, requestCancel := context.WithCancel(context.Background())
 	return &Server{
-		PathAddr:    "127.0.0.1:18787",
-		channels:    map[string]config.Route{},
-		log:         logger,
-		transport:   transport,
-		connections: connections,
-		client: &http.Client{
-			Transport: transport,
-			CheckRedirect: func(*http.Request, []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
-		},
-		shutdownTimeout:   5 * time.Second,
-		streamIdleTimeout: defaultUpstreamStreamIdleTimeout,
-		requestCtx:        requestCtx,
-		requestCancel:     requestCancel,
-		probed:            map[string]bool{},
-		reasoning:         reasoning,
+		PathAddr:                "127.0.0.1:18787",
+		channels:                map[string]config.Route{},
+		log:                     logger,
+		transport:               transport,
+		deepSeekTransport:       deepSeekTransport,
+		connections:             connections,
+		client:                  newUpstreamClient(transport),
+		deepSeekClient:          newUpstreamClient(deepSeekTransport),
+		shutdownTimeout:         5 * time.Second,
+		bodyIdleTimeout:         defaultUpstreamBodyIdleTimeout,
+		deepSeekBodyIdleTimeout: defaultDeepSeekBodyIdleTimeout,
+		requestCtx:              requestCtx,
+		requestCancel:           requestCancel,
+		probed:                  map[string]bool{},
+		reasoning:               reasoning,
 	}
 }
 
@@ -198,6 +202,7 @@ func (s *Server) Stop() {
 		_ = listener.Close()
 	}
 	s.transport.CloseIdleConnections()
+	s.deepSeekTransport.CloseIdleConnections()
 	s.wg.Wait()
 	if err := s.reasoning.flush(); err != nil {
 		s.log.Printf("reasoning provenance flush failed: %v", err)
@@ -240,7 +245,7 @@ func (s *Server) servePath(w http.ResponseWriter, request *http.Request) {
 	}
 	s.forwardFacade(w, request, route, protocol)
 }
-func newUpstreamTransport(connections *connectionTracker) *http.Transport {
+func newUpstreamTransport(connections *connectionTracker, responseHeaderTimeout time.Duration) *http.Transport {
 	dialer := &net.Dialer{
 		Timeout:   30 * time.Second,
 		KeepAlive: 30 * time.Second,
@@ -260,13 +265,22 @@ func newUpstreamTransport(connections *connectionTracker) *http.Transport {
 		MaxIdleConnsPerHost:   16,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   20 * time.Second,
-		ResponseHeaderTimeout: defaultUpstreamResponseHeaderTimeout,
+		ResponseHeaderTimeout: responseHeaderTimeout,
 		TLSClientConfig: &tls.Config{
 			MinVersion: tls.VersionTLS12,
 			NextProtos: []string{"http/1.1"},
 		},
 	}
 	return transport
+}
+
+func newUpstreamClient(transport *http.Transport) *http.Client {
+	return &http.Client{
+		Transport: transport,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 }
 
 // connectionTracker makes stopping the local facade also terminate requests

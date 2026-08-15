@@ -105,6 +105,9 @@ func scanSSEPayloads(reader io.Reader, consume func([]string, []byte) error) err
 		frame = frame[:0]
 		frameBytes = 0
 		if !ok {
+			if isPrivateSSEHeartbeat(lines, "") {
+				return consume(lines, nil)
+			}
 			return nil
 		}
 		return consume(lines, []byte(payload))
@@ -134,6 +137,11 @@ func isPrivateSSEHeartbeat(lines []string, payload string) bool {
 	for _, line := range lines {
 		if strings.HasPrefix(line, "event:") {
 			eventName = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+		} else if strings.HasPrefix(strings.TrimSpace(line), ":") {
+			comment := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), ":"))
+			if isHeartbeatName(comment) {
+				return true
+			}
 		}
 	}
 
@@ -191,6 +199,7 @@ type messagesStreamState struct {
 	blocks       map[int]*messagesStreamBlock
 	webCalls     map[string]*messagesStreamBlock
 	output       []any
+	usageStart   map[string]any
 	usage        map[string]any
 	stopReason   string
 	sawStart     bool
@@ -246,7 +255,7 @@ func (s *messagesStreamState) handle(payload []byte) error {
 		s.sawStart = true
 		s.messageID = stringValue(message["id"])
 		s.model = stringValue(message["model"])
-		s.mergeUsage(message["usage"])
+		s.observeStartUsage(message["usage"])
 		for index, raw := range anySlice(message["content"]) {
 			block, _ := raw.(map[string]any)
 			if err := s.startBlock(index, block); err != nil {
@@ -277,7 +286,7 @@ func (s *messagesStreamState) handle(payload []byte) error {
 		if delta != nil {
 			s.stopReason = stringValue(delta["stop_reason"])
 		}
-		s.mergeUsage(event["usage"])
+		s.observeDeltaUsage(event["usage"])
 	case "message_stop":
 		if !s.sawStart {
 			return fmt.Errorf("Messages stream ended before message_start")
@@ -570,11 +579,51 @@ func (s *messagesStreamState) appendItem(item map[string]any) int {
 	return index
 }
 
-func (s *messagesStreamState) mergeUsage(value any) {
+func (s *messagesStreamState) observeStartUsage(value any) {
 	usage, _ := value.(map[string]any)
-	for key, child := range usage {
-		s.usage[key] = child
+	if len(usage) == 0 {
+		return
 	}
+	s.usageStart = cloneMap(usage)
+}
+
+func (s *messagesStreamState) observeDeltaUsage(value any) {
+	usage, _ := value.(map[string]any)
+	if len(usage) == 0 {
+		return
+	}
+	if completeMessagesUsage(usage) {
+		s.usage = cloneMap(usage)
+		return
+	}
+	if _, hasOutput, validOutput := optionalCanonicalToken(usage, "output_tokens"); !hasOutput || !validOutput {
+		return
+	}
+	if len(s.usageStart) == 0 {
+		return
+	}
+
+	// Messages defines input/cache usage on message_start and output usage on
+	// message_delta. Combining only those two protocol phases mirrors Grok
+	// Build's native consumer without merging unrelated partial snapshots.
+	candidate := cloneMap(s.usageStart)
+	delete(candidate, "total_tokens")
+	for key, child := range usage {
+		candidate[key] = child
+	}
+	if completeMessagesUsage(candidate) {
+		s.usage = candidate
+	}
+}
+
+func completeMessagesUsage(value any) bool {
+	var result canonicalResult
+	applyMessagesUsage(&result, value)
+	return result.UsagePresent && result.LiveContextPresent
+}
+
+func (s *messagesStreamState) searchUsage() any {
+	return []any{s.usageStart, s.usage}
 }
 
 func (s *messagesStreamState) finish() error {
@@ -589,12 +638,13 @@ func (s *messagesStreamState) finish() error {
 			}
 		}
 	}
-	searchConfirmed := s.hadWebSearch || (s.request.HostedWebSearch && (len(s.allURLs) > 0 || positiveSearchUsage(s.usage)))
+	searchUsage := s.searchUsage()
+	searchConfirmed := s.hadWebSearch || (s.request.HostedWebSearch && (len(s.allURLs) > 0 || positiveSearchUsage(searchUsage)))
 	if searchConfirmed {
 		s.allURLs = mergeUniqueStrings(s.allURLs, s.textURLs...)
 	}
 	if s.hadWebSearch {
-		backfillResponseSearchSources(map[string]any{"output": s.output, "usage": s.usage}, s.request.HostedWebSearch, s.request.SearchQuery)
+		backfillResponseSearchSources(map[string]any{"output": s.output, "usage": searchUsage}, s.request.HostedWebSearch, s.request.SearchQuery)
 	}
 	for _, call := range s.webCalls {
 		if call.kind == "web_search_emitted" {
@@ -604,7 +654,7 @@ func (s *messagesStreamState) finish() error {
 			return err
 		}
 	}
-	if !s.hadWebSearch && s.request.HostedWebSearch && (len(s.allURLs) > 0 || positiveSearchUsage(s.usage)) {
+	if !s.hadWebSearch && s.request.HostedWebSearch && (len(s.allURLs) > 0 || positiveSearchUsage(searchUsage)) {
 		item := webSearchItem("", s.request.SearchQuery, urlsToSources(s.allURLs), "in_progress")
 		call := &messagesStreamBlock{kind: "server_tool_use", item: item, outputIndex: s.appendItem(item)}
 		if err := s.writer.emit("response.output_item.added", map[string]any{"output_index": call.outputIndex, "item": cloneMap(item)}); err != nil {
@@ -623,15 +673,10 @@ func (s *messagesStreamState) finish() error {
 	// Some Messages-compatible gateways report only search usage and final-text
 	// URLs. The inferred call above already has sources; mirror those URLs into
 	// the terminal output_text annotations used by Build's client search path.
-	backfillResponseSearchSources(map[string]any{"output": s.output, "usage": s.usage}, s.request.HostedWebSearch, s.request.SearchQuery)
+	backfillResponseSearchSources(map[string]any{"output": s.output, "usage": searchUsage}, s.request.HostedWebSearch, s.request.SearchQuery)
 
-	result := canonicalResult{
-		Output:          s.output,
-		InputTokens:     numberInt(s.usage["input_tokens"]),
-		OutputTokens:    numberInt(s.usage["output_tokens"]),
-		CachedTokens:    numberInt(s.usage["cache_read_input_tokens"]),
-		ReasoningTokens: 0,
-	}
+	result := canonicalResult{Output: s.output}
+	applyMessagesUsage(&result, s.usage)
 	if s.stopReason == "max_tokens" || s.stopReason == "model_context_window_exceeded" {
 		result.IncompleteReason = "max_output_tokens"
 	}
@@ -754,11 +799,7 @@ func (s *chatStreamState) handle(payload []byte) error {
 		return s.writer.emit("error", map[string]any{"code": code, "message": message, "param": nil})
 	}
 	s.sawChunk = true
-	if usage, _ := root["usage"].(map[string]any); usage != nil {
-		for key, value := range usage {
-			s.usage[key] = value
-		}
-	}
+	s.observeUsage(root["usage"])
 	if err := s.observeSearch(root, nil, nil); err != nil {
 		return err
 	}
@@ -798,6 +839,20 @@ func (s *chatStreamState) handle(payload []byte) error {
 		}
 	}
 	return nil
+}
+
+func (s *chatStreamState) observeUsage(value any) {
+	usage, _ := value.(map[string]any)
+	if len(usage) == 0 {
+		return
+	}
+	var result canonicalResult
+	applyChatUsage(&result, usage)
+	if result.UsagePresent && result.LiveContextPresent {
+		// Chat usage objects are cumulative snapshots. Last complete snapshot
+		// wins; partial or placeholder objects cannot erase a prior measurement.
+		s.usage = cloneMap(usage)
+	}
 }
 
 func (s *chatStreamState) appendReasoning(text string) error {
@@ -984,23 +1039,17 @@ func (s *chatStreamState) finish() error {
 			return err
 		}
 	}
-	result := canonicalResult{
-		Output:           s.output,
-		InputTokens:      numberInt(valueFirst(s.usage, "prompt_tokens", "input_tokens")),
-		OutputTokens:     numberInt(valueFirst(s.usage, "completion_tokens", "output_tokens")),
-		CachedTokens:     nestedNumber(s.usage, "prompt_tokens_details", "cached_tokens"),
-		ReasoningTokens:  nestedNumber(s.usage, "completion_tokens_details", "reasoning_tokens"),
-		IncompleteReason: "",
-	}
-	if s.finishReason == "length" {
-		result.IncompleteReason = "max_output_tokens"
-	}
+	result := canonicalResult{Output: s.output}
+	applyChatUsage(&result, s.usage)
+	applyChatFinishReason(&result, s.finishReason)
 	terminal := translatedResponse(s.route, s.request, result, s.responseID, s.createdAt)
 	if err := validateResponsesEnvelope(terminal); err != nil {
 		return err
 	}
 	typ := "response.completed"
-	if result.IncompleteReason != "" {
+	if result.FailureCode != "" {
+		typ = "response.failed"
+	} else if result.IncompleteReason != "" {
 		typ = "response.incomplete"
 	}
 	s.terminal = true
@@ -1083,6 +1132,8 @@ func (s *Server) streamNativeSSE(w http.ResponseWriter, response *http.Response,
 	terminal := false
 	heartbeats := 0
 	frames := 0
+	chatStreamID := compatID("chatcmpl")
+	chatCreatedAt := time.Now().Unix()
 	messagesSearchFilter := newMessagesHostedSearchStreamFilter(request)
 	evidence := newSearchEvidence()
 	writeHeartbeat := func() error {
@@ -1112,11 +1163,26 @@ func (s *Server) streamNativeSSE(w http.ResponseWriter, response *http.Response,
 		}
 		modelObserver.observe(root, false)
 		evidence.observeJSON(payload)
+		if deepSeekChatInsufficientSystemResource(root, route, request.Protocol) {
+			writeNativeChatStreamError(
+				w,
+				flusher,
+				"server_error",
+				"insufficient_system_resource",
+				errDeepSeekInsufficientSystemResource.Error(),
+			)
+			terminal = true
+			return errSSEStreamComplete
+		}
 		if messagesSearchFilter != nil && !messagesSearchFilter.keep(root) {
 			return nil
 		}
 		if request.Protocol == wireMessages {
 			normalizeMessagesStreamRequiredFields(root)
+		}
+		if request.Protocol == wireChatCompletions {
+			normalizeNativeChatRequiredFields(root, route, true, chatStreamID, chatCreatedAt)
+			normalizeNativeChatUsage(root)
 		}
 		restoreClientWebSearchAlias(root, request.ClientSearchAlias, request.Protocol)
 		s.captureReasoningProvenance(route, root)
@@ -1203,39 +1269,77 @@ func (filter *messagesHostedSearchStreamFilter) keep(root map[string]any) bool {
 }
 
 func validateNativeSSEFrame(protocol wireProtocol, root map[string]any) error {
-	if root["error"] != nil {
+	if protocol == wireChatCompletions && root["error"] != nil {
 		return nil
 	}
 	switch protocol {
 	case wireMessages:
 		typ := stringValue(root["type"])
+		if strings.TrimSpace(typ) == "" {
+			return fmt.Errorf("Messages SSE event type must be a non-empty string")
+		}
 		switch typ {
+		case "message_start":
+			message, ok := root["message"].(map[string]any)
+			if !ok || message == nil {
+				return fmt.Errorf("Messages message_start has no message object")
+			}
+			return validateNativeMessagesEnvelope(message)
+		case "message_delta":
+			delta, ok := root["delta"].(map[string]any)
+			if !ok || delta == nil {
+				return fmt.Errorf("Messages message_delta has no delta object")
+			}
+			if err := validateMessagesDeltaBody(delta); err != nil {
+				return err
+			}
+			usage, ok := root["usage"].(map[string]any)
+			if !ok || usage == nil {
+				return fmt.Errorf("Messages message_delta has no usage object")
+			}
+			return validateMessagesUsage(usage, false)
 		case "content_block_start":
+			if err := validateRequiredU32(root, "index"); err != nil {
+				return fmt.Errorf("Messages content_block_start: %w", err)
+			}
 			block, ok := root["content_block"].(map[string]any)
 			if !ok || block == nil {
 				return fmt.Errorf("Messages content_block_start has no content_block object")
 			}
-			return validateMessagesContentBlock(block)
+			return validateNativeMessagesContentBlock(block)
 		case "content_block_delta":
+			if err := validateRequiredU32(root, "index"); err != nil {
+				return fmt.Errorf("Messages content_block_delta: %w", err)
+			}
 			delta, ok := root["delta"].(map[string]any)
 			if !ok || delta == nil {
 				return fmt.Errorf("Messages content_block_delta has no delta object")
 			}
-			return validateMessagesStreamDelta(delta)
-		case "message_start", "message_delta", "message_stop", "content_block_stop", "error":
+			return validateNativeMessagesStreamDelta(delta)
+		case "content_block_stop":
+			if err := validateRequiredU32(root, "index"); err != nil {
+				return fmt.Errorf("Messages content_block_stop: %w", err)
+			}
+			return nil
+		case "message_stop", "ping":
+			return nil
+		case "error":
+			errorBody, ok := root["error"].(map[string]any)
+			if !ok || errorBody == nil {
+				return fmt.Errorf("Messages error event has no error object")
+			}
+			if _, ok := errorBody["type"].(string); !ok {
+				return fmt.Errorf("Messages error type must be a string")
+			}
+			if _, ok := errorBody["message"].(string); !ok {
+				return fmt.Errorf("Messages error message must be a string")
+			}
 			return nil
 		default:
-			return fmt.Errorf("unsupported Messages SSE event type %q", typ)
+			return nil
 		}
 	case wireChatCompletions:
-		choices, choicesPresent := root["choices"]
-		if !choicesPresent {
-			return fmt.Errorf("Chat Completions SSE chunk has no choices")
-		}
-		if _, ok := choices.([]any); !ok {
-			return fmt.Errorf("Chat Completions SSE choices must be an array")
-		}
-		return nil
+		return validateNativeChatChunk(root)
 	default:
 		return fmt.Errorf("unsupported native stream protocol")
 	}
@@ -1278,16 +1382,22 @@ func writeNativeStreamError(w io.Writer, flusher http.Flusher, protocol wireProt
 		})
 		_, _ = fmt.Fprintf(w, "event: error\ndata: %s\n\n", payload)
 	case wireChatCompletions:
-		payload, _ := json.Marshal(map[string]any{
-			"error": map[string]any{"type": "proxy_stream_error", "code": "proxy_stream_error", "message": message},
-		})
-		_, _ = fmt.Fprintf(w, "data: %s\n\ndata: [DONE]\n\n", payload)
+		writeNativeChatStreamError(w, flusher, "proxy_stream_error", "proxy_stream_error", message)
+		return
 	}
 	flusher.Flush()
 }
 
+func writeNativeChatStreamError(w io.Writer, flusher http.Flusher, errorType, code, message string) {
+	payload, _ := json.Marshal(map[string]any{
+		"error": map[string]any{"type": errorType, "code": code, "message": message},
+	})
+	_, _ = fmt.Fprintf(w, "data: %s\n\ndata: [DONE]\n\n", payload)
+	flusher.Flush()
+}
+
 func writeMessagesSSEFallback(w http.ResponseWriter, response map[string]any) error {
-	if err := validateMessagesEnvelope(response); err != nil {
+	if err := validateNativeMessagesEnvelope(response); err != nil {
 		return err
 	}
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
@@ -1370,7 +1480,7 @@ func messagesFallbackBlock(block map[string]any) (map[string]any, []map[string]a
 }
 
 func writeChatSSEFallback(w http.ResponseWriter, response map[string]any) error {
-	if err := validateChatEnvelope(response); err != nil {
+	if err := validateNativeChatEnvelope(response); err != nil {
 		return err
 	}
 	chunk := cloneMap(response)

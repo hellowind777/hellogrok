@@ -494,6 +494,9 @@ func (a *App) Start() error {
 			APIBackend:            route.APIBackend,
 			BuildAPIBackend:       buildAPIBackend(route),
 			SupportsBackendSearch: buildSupportsBackendSearch(route),
+			ProjectBackendSearch:  projectBackendSearch(route),
+			ReasoningEfforts:      buildDeepSeekReasoningEfforts(route),
+			MaxCompletionTokens:   configuredMaxCompletionTokens(route),
 		})
 	}
 	res, err := cfgpatch.ApplyTargets(cfgPath, stPath, targets)
@@ -512,15 +515,21 @@ func (a *App) Start() error {
 	a.patchedIDs = append([]string(nil), res.Targets...)
 	sort.Strings(a.patchedIDs)
 	a.modelAliases = cloneStringMap(res.LegacyModelAliases)
-	a.logger.Printf("config rewrite all: model_sections=%d base=%d api_base=%d api_backend=%d backend_search=%d backend_tools=%d web_fetch=%d subagents_enabled=%d targets=%v",
-		res.ModelSections, res.BaseURLs, res.APIBaseURLs, res.APIBackends, res.BackendSearch, res.BackendTools, res.WebFetch, res.SubagentsEnabled, res.Targets)
-	a.logger.Printf("config validation passed: backend_protocols=capability-projected backend_tools=true web_fetch=true backend_search=materialized subagent_defaults=repaired-if-needed targets=%d", res.ValidatedTargets)
+	a.logger.Printf("config rewrite all: model_sections=%d base=%d api_base=%d api_backend=%d max_completion_tokens=%d backend_search=%d reasoning_support=%d reasoning_efforts=%d backend_tools=%d web_fetch=%d subagents_enabled=%d targets=%v",
+		res.ModelSections, res.BaseURLs, res.APIBaseURLs, res.APIBackends, res.MaxCompletionTokens, res.BackendSearch, res.SupportsReasoningEffort, res.ReasoningEfforts, res.BackendTools, res.WebFetch, res.SubagentsEnabled, res.Targets)
+	a.logger.Printf("config validation passed: backend_protocols=capability-projected backend_tools=true web_fetch=true backend_search=configured-or-selected-or-documented-default model_limits=configured-first-otherwise-remote deepseek_efforts=protocol-native-if-unconfigured subagent_defaults=repaired-if-needed targets=%d", res.ValidatedTargets)
 	a.refreshOpenGrokSessions("enable", enableGrokSessionSelections(a.patchedIDs, a.modelAliases))
 	for _, route := range routes {
 		backend := strings.TrimSpace(route.APIBackend)
 		a.logger.Printf("channel facade: model=%s build_backend=%s upstream_backend=%s", route.ChannelID, buildAPIBackend(route), backend)
-		if route.SupportsBackendSearch {
-			a.logger.Printf("channel search: model=%s supports_backend_search=true mode=hosted-current-channel source=config", route.ChannelID)
+		if route.DefaultSearchModel {
+			a.logger.Printf("channel search: model=%s supports_backend_search=true mode=hosted-current-channel source=default-search-model", route.ChannelID)
+		} else if route.SupportsBackendSearch {
+			source := "config"
+			if !route.SupportsBackendSearchConfigured && config.IsOfficialDeepSeekRoute(route) {
+				source = "deepseek-provider-default"
+			}
+			a.logger.Printf("channel search: model=%s supports_backend_search=true mode=hosted-current-channel source=%s", route.ChannelID, source)
 		} else {
 			a.logger.Printf("channel search: model=%s supports_backend_search=false mode=client-web_search configured-model-or-authenticated-official-default", route.ChannelID)
 		}
@@ -544,20 +553,28 @@ func (a *App) resolveSearchRoutes(
 	effective := append([]config.Route(nil), routes...)
 	proxiedSearchModel := false
 	for index := range effective {
-		if effective[index].ChannelID == selection.Model {
+		if config.IsOfficialDeepSeekRoute(effective[index]) &&
+			!effective[index].SupportsBackendSearchConfigured {
+			effective[index].SupportsBackendSearch = true
+			a.logger.Printf("search routing: model=%s source=deepseek-provider-default supports_backend_search=true", effective[index].ChannelID)
+		}
+		if selection.Explicit && selection.Model != "" && effective[index].ChannelID == selection.Model {
 			proxiedSearchModel = true
+			effective[index].DefaultSearchModel = true
+			effective[index].SupportsBackendSearch = true
+			a.logger.Printf("search routing: model=%s source=%s default_search_model=true supports_backend_search=true startup_probe=disabled", effective[index].ChannelID, selection.Source)
 		}
 	}
 	if !selection.Explicit {
 		a.logger.Printf("search routing: channel capabilities preserved; Messages/Chat compatibility uses a client web_search declaration promoted by the facade; startup_probe=disabled")
 		return effective
 	}
-	a.logger.Printf("search routing: explicit client model=%q source=%s; channel capabilities preserved; startup_probe=disabled", selection.Model, selection.Source)
+	a.logger.Printf("search routing: explicit client model=%q source=%s; selected custom route is projected as backend-search capable; startup_probe=disabled", selection.Model, selection.Source)
 	switch {
 	case selection.Model == "":
 		a.logger.Printf("search model routing: explicit empty model disables a usable custom client-search route")
 	case proxiedSearchModel:
-		a.logger.Printf("search model routing: model=%s uses the local facade without startup validation", selection.Model)
+		a.logger.Printf("search model routing: model=%s uses the local facade as a hosted-search route without startup validation", selection.Model)
 	default:
 		a.logger.Printf("search model routing: model=%s is not a proxied custom route; Build will resolve it directly", selection.Model)
 	}
@@ -571,15 +588,37 @@ func buildAPIBackend(route config.Route) string {
 	if route.SupportsBackendSearch {
 		return "responses"
 	}
-	backend := strings.ToLower(strings.TrimSpace(route.APIBackend))
-	if backend == "" {
-		return "chat_completions"
-	}
-	return backend
+	// Keep an omitted backend omitted. Grok Build can then resolve the protocol
+	// from its current local or remote model catalog, whose own fallback is Chat
+	// Completions when no catalog entry exists.
+	return strings.ToLower(strings.TrimSpace(route.APIBackend))
 }
 
 func buildSupportsBackendSearch(route config.Route) bool {
 	return route.SupportsBackendSearch
+}
+
+func projectBackendSearch(route config.Route) bool {
+	return route.SupportsBackendSearchConfigured || route.DefaultSearchModel || config.IsOfficialDeepSeekRoute(route)
+}
+
+func configuredMaxCompletionTokens(route config.Route) uint64 {
+	if !route.MaxCompletionTokensConfigured {
+		return 0
+	}
+	return route.MaxCompletionTokens
+}
+
+func buildDeepSeekReasoningEfforts(route config.Route) []cfgpatch.ReasoningEffortOption {
+	if !config.IsOfficialDeepSeekRoute(route) || route.ReasoningEffortConfigured {
+		return nil
+	}
+	return []cfgpatch.ReasoningEffortOption{
+		{Value: "none", Label: "None"},
+		{Value: "low", Label: "Low"},
+		{Value: "high", Label: "High", Default: true},
+		{Value: "max", Label: "Max"},
+	}
 }
 
 func (a *App) abortStart(err error) error {

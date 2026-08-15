@@ -66,12 +66,13 @@ func (observer *upstreamModelObserver) mismatch(configured string) bool {
 
 func (observer *upstreamModelObserver) log(logger *log.Logger, route config.Route) {
 	actual, source := observer.actual()
-	configured, ok := validObservedUpstreamModel(route.WireModel)
+	expected := responseModelForRoute(route)
+	configured, ok := validObservedUpstreamModel(expected)
 	if !ok {
 		configured = "<invalid>"
 	}
 	logger.Printf("UP channel=%s response_model upstream=%q configured=%q protocol=%s source=%s mismatch=%t conflict=%t declarations=%d invalid=%d",
-		route.ChannelID, actual, configured, observer.protocol, source, observer.mismatch(route.WireModel),
+		route.ChannelID, actual, configured, observer.protocol, source, observer.mismatch(expected),
 		observer.conflict, observer.declarations, observer.invalid)
 }
 

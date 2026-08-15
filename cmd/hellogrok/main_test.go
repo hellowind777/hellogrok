@@ -63,7 +63,7 @@ func TestSecondInstanceDoesNotRestoreActiveInstanceConfig(t *testing.T) {
 	t.Setenv("GROK_HOME", grokHome)
 	configPath := filepath.Join(grokHome, "config.toml")
 	statePath := filepath.Join(dataDir, "config_rewrite_state.json")
-	original := "[model.one]\nbase_url = \"https://one.example/v1\"\napi_key = \"test-key\"\n"
+	original := "[model.one]\nbase_url = \"https://one.example/v1\"\napi_key = \"test-key\"\nsupports_backend_search = false\n"
 	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -381,6 +381,124 @@ func TestAppStartStopLifecycleRestoresConfigExactly(t *testing.T) {
 	}
 }
 
+func TestAppDoesNotInventDeepSeekLimits(t *testing.T) {
+	dir := t.TempDir()
+	grokHome := filepath.Join(dir, "grok")
+	dataDir := filepath.Join(dir, "data")
+	if err := os.MkdirAll(grokHome, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GROK_HOME", grokHome)
+	configPath := filepath.Join(grokHome, "config.toml")
+	original := "[model.deepseek]\n" +
+		"model = \"deepseek-v4-pro\"\n" +
+		"base_url = \"https://api.deepseek.com\"\n" +
+		"api_key = \"test-key\"\n" +
+		"api_backend = \"responses\"\n"
+	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	server := proxy.New(log.New(io.Discard, "", 0))
+	server.PathAddr = "127.0.0.1:0"
+	app := &App{logger: log.New(io.Discard, "", 0), dataDir: dataDir, server: server}
+	if err := app.Start(); err != nil {
+		t.Fatal(err)
+	}
+	patched, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{
+		"supports_reasoning_effort = true",
+		`reasoning_efforts = [{ value = "none", label = "None" }, { value = "low", label = "Low" }, { value = "high", label = "High", default = true }, { value = "max", label = "Max" }]`,
+	} {
+		if !strings.Contains(string(patched), expected) {
+			t.Fatalf("pre-response DeepSeek config missing %q:\n%s", expected, patched)
+		}
+	}
+	for _, unexpected := range []string{"context_window", "max_completion_tokens", "inference_idle_timeout_secs"} {
+		if strings.Contains(string(patched), unexpected) {
+			t.Fatalf("DeepSeek capacity was invented for %q:\n%s", unexpected, patched)
+		}
+	}
+	if err := app.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(restored) != original {
+		t.Fatalf("DeepSeek config was not restored exactly\nwant: %q\ngot:  %q", original, restored)
+	}
+}
+
+func TestAppPreservesConfiguredDeepSeekLimits(t *testing.T) {
+	dir := t.TempDir()
+	grokHome := filepath.Join(dir, "grok")
+	dataDir := filepath.Join(dir, "data")
+	if err := os.MkdirAll(grokHome, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GROK_HOME", grokHome)
+	configPath := filepath.Join(grokHome, "config.toml")
+	original := "[model.deepseek]\n" +
+		"model = \"deepseek-v4-pro\"\n" +
+		"base_url = \"https://api.deepseek.com\"\n" +
+		"api_key = \"test-key\"\n" +
+		"api_backend = \"responses\"\n" +
+		"context_window = 131072 # selected billing tier\n" +
+		"max_completion_tokens = 32768 # selected output cap\n" +
+		"inference_idle_timeout_secs = 900 # selected idle policy\n" +
+		"supports_reasoning_effort = true # user capability\n" +
+		"reasoning_efforts = [{ value = \"max\", label = \"Only Max\", default = true }] # user menu\n"
+	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	server := proxy.New(log.New(io.Discard, "", 0))
+	server.PathAddr = "127.0.0.1:0"
+	app := &App{logger: log.New(io.Discard, "", 0), dataDir: dataDir, server: server}
+	if err := app.Start(); err != nil {
+		t.Fatal(err)
+	}
+	patched, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(patched), "context_window = 131072 # selected billing tier") ||
+		!strings.Contains(string(patched), "max_completion_tokens = 32768 # selected output cap") ||
+		!strings.Contains(string(patched), "inference_idle_timeout_secs = 900 # selected idle policy") ||
+		!strings.Contains(string(patched), "supports_reasoning_effort = true # user capability") ||
+		!strings.Contains(string(patched), `reasoning_efforts = [{ value = "max", label = "Only Max", default = true }] # user menu`) ||
+		strings.Contains(string(patched), `label = "Low"`) ||
+		strings.Contains(string(patched), "context_window = 1000000") ||
+		strings.Contains(string(patched), "max_completion_tokens = 384000") ||
+		strings.Contains(string(patched), "inference_idle_timeout_secs = 660") {
+		t.Fatalf("configured DeepSeek limits were replaced:\n%s", patched)
+	}
+	if err := app.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(restored) != original {
+		t.Fatalf("configured DeepSeek limits were not restored byte-exactly\nwant: %q\ngot:  %q", original, restored)
+	}
+}
+
+func TestConfiguredMaxCompletionTokensProjectsOnlyConfiguredLimits(t *testing.T) {
+	if got := configuredMaxCompletionTokens(config.Route{}); got != 0 {
+		t.Fatalf("unconfigured max completion tokens = %d", got)
+	}
+	if got := configuredMaxCompletionTokens(config.Route{
+		MaxCompletionTokens: 32768, MaxCompletionTokensConfigured: true,
+	}); got != 32768 {
+		t.Fatalf("configured max completion tokens = %d", got)
+	}
+}
+
 func TestAppStartRejectsCCSwitchTakeoverBeforeRecovery(t *testing.T) {
 	dir := t.TempDir()
 	grokHome := filepath.Join(dir, "grok")
@@ -638,7 +756,7 @@ func TestAppStopPreservesManagedConfigEdit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := original + "supports_backend_search = true\n"
+	want := strings.Replace(original, "supports_backend_search = false", "supports_backend_search = true", 1)
 	if string(current) != want {
 		t.Fatalf("managed edit was not preserved while stopping\nwant: %q\ngot:  %q", want, current)
 	}
@@ -744,6 +862,52 @@ func TestResolveSearchRoutesPreservesEveryConfiguredNativeSearchCapability(t *te
 	}
 }
 
+func TestResolveSearchRoutesProjectsSelectedCustomModelAsBackendSearch(t *testing.T) {
+	app := &App{logger: log.New(io.Discard, "", 0)}
+	routes := []config.Route{
+		{
+			ChannelID: "selected", APIBackend: "messages", WireModel: "wire-selected",
+			SupportsBackendSearchConfigured: true,
+		},
+		{ChannelID: "ordinary", APIBackend: "chat_completions", WireModel: "wire-ordinary"},
+	}
+	effective := app.resolveSearchRoutes(routes, config.WebSearchSelection{
+		Model: "selected", Explicit: true, Source: "config",
+	})
+	if !effective[0].DefaultSearchModel || !effective[0].SupportsBackendSearch {
+		t.Fatalf("selected route was not projected as backend-search capable: %+v", effective[0])
+	}
+	if buildAPIBackend(effective[0]) != "responses" || !projectBackendSearch(effective[0]) {
+		t.Fatalf("selected route was not exposed through Grok Build's Responses backend: %+v", effective[0])
+	}
+	if effective[1].DefaultSearchModel || effective[1].SupportsBackendSearch {
+		t.Fatalf("unselected route capability changed: %+v", effective[1])
+	}
+	if routes[0].DefaultSearchModel || routes[0].SupportsBackendSearch {
+		t.Fatalf("search routing mutated its input: %+v", routes[0])
+	}
+}
+
+func TestResolveSearchRoutesDefaultsOfficialDeepSeekSearchUnlessExplicitlyDisabled(t *testing.T) {
+	app := &App{logger: log.New(io.Discard, "", 0)}
+	routes := []config.Route{
+		{ChannelID: "deepseek-default", Host: "api.deepseek.com", WireModel: "deepseek-v4-pro", APIBackend: "chat_completions"},
+		{ChannelID: "deepseek-disabled", Host: "api.deepseek.com", WireModel: "deepseek-v4-flash", APIBackend: "responses", SupportsBackendSearchConfigured: true},
+		{ChannelID: "deepseek-future", Host: "api.deepseek.com", WireModel: "deepseek-future-model", APIBackend: "responses"},
+		{ChannelID: "relay", Host: "relay.example", WireModel: "deepseek-v4-pro", APIBackend: "responses"},
+	}
+	effective := app.resolveSearchRoutes(routes, config.WebSearchSelection{})
+	if !effective[0].SupportsBackendSearch || effective[1].SupportsBackendSearch ||
+		!effective[2].SupportsBackendSearch || effective[3].SupportsBackendSearch {
+		t.Fatalf("DeepSeek provider search defaults were not scoped correctly: %+v", effective)
+	}
+	for index := range routes {
+		if routes[index].SupportsBackendSearch {
+			t.Fatalf("search default mutated input route %d: %+v", index, routes[index])
+		}
+	}
+}
+
 func TestBuildSupportsBackendSearchMaterialization(t *testing.T) {
 	for _, test := range []struct {
 		backend    string
@@ -762,6 +926,93 @@ func TestBuildSupportsBackendSearchMaterialization(t *testing.T) {
 	}
 }
 
+func TestProjectBackendSearchOnlyForExplicitOrDocumentedDefaults(t *testing.T) {
+	tests := []struct {
+		name  string
+		route config.Route
+		want  bool
+	}{
+		{
+			name:  "explicit generic capability",
+			route: config.Route{SupportsBackendSearch: true, SupportsBackendSearchConfigured: true},
+			want:  true,
+		},
+		{
+			name:  "explicit generic disable",
+			route: config.Route{SupportsBackendSearchConfigured: true},
+			want:  true,
+		},
+		{
+			name:  "documented V4 default",
+			route: config.Route{Host: "api.deepseek.com", WireModel: "deepseek-v4-pro"},
+			want:  true,
+		},
+		{
+			name:  "future DeepSeek model gets endpoint default",
+			route: config.Route{Host: "api.deepseek.com", WireModel: "deepseek-future-model"},
+			want:  true,
+		},
+		{
+			name:  "unconfigured generic model stays catalog owned",
+			route: config.Route{SupportsBackendSearch: true},
+		},
+		{
+			name:  "selected default search model",
+			route: config.Route{SupportsBackendSearch: true, DefaultSearchModel: true},
+			want:  true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := projectBackendSearch(test.route); got != test.want {
+				t.Fatalf("project backend search = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
+func TestBuildDeepSeekReasoningEffortsFollowOfficialEndpointProtocol(t *testing.T) {
+	tests := []struct {
+		name  string
+		route config.Route
+		want  []string
+	}{
+		{name: "Responses", route: config.Route{APIBackend: "responses"}, want: []string{"none", "low", "high", "max"}},
+		{name: "Chat", route: config.Route{APIBackend: "chat_completions"}, want: []string{"none", "low", "high", "max"}},
+		{name: "Messages", route: config.Route{APIBackend: "messages"}, want: []string{"none", "low", "high", "max"}},
+		{name: "DeepSeek default Chat search bridge", route: config.Route{APIBackend: "chat_completions", SupportsBackendSearch: true}, want: []string{"none", "low", "high", "max"}},
+		{name: "explicit native Chat search", route: config.Route{APIBackend: "chat_completions", SupportsBackendSearch: true, ChatSearchDialect: config.ChatSearchDialectWebSearchOptions}, want: []string{"none", "low", "high", "max"}},
+		{name: "explicit Messages search bridge", route: config.Route{APIBackend: "chat_completions", SupportsBackendSearch: true, ChatSearchDialect: config.ChatSearchDialectMessages}, want: []string{"none", "low", "high", "max"}},
+		{name: "catalog resolved protocol", route: config.Route{}, want: []string{"none", "low", "high", "max"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			test.route.Host = "api.deepseek.com"
+			test.route.WireModel = "deepseek-future-model"
+			efforts := buildDeepSeekReasoningEfforts(test.route)
+			if len(efforts) != len(test.want) {
+				t.Fatalf("DeepSeek effort menu = %+v", efforts)
+			}
+			for index, want := range test.want {
+				if efforts[index].Value != want || efforts[index].Label != strings.ToUpper(want[:1])+want[1:] {
+					t.Fatalf("DeepSeek effort menu = %+v", efforts)
+				}
+			}
+			if !efforts[len(efforts)-2].Default || efforts[len(efforts)-1].Default {
+				t.Fatalf("DeepSeek effort default = %+v", efforts)
+			}
+		})
+	}
+	for _, route := range []config.Route{
+		{Host: "relay.example", WireModel: "deepseek-v4-pro"},
+		{Host: "api.deepseek.com", WireModel: "deepseek-v4-pro", ReasoningEffortConfigured: true},
+	} {
+		if efforts := buildDeepSeekReasoningEfforts(route); efforts != nil {
+			t.Fatalf("non-first-party or explicitly configured route received an inferred effort menu: route=%+v efforts=%+v", route, efforts)
+		}
+	}
+}
+
 func TestBuildAPIBackendUsesResponsesOnlyForCapableChannels(t *testing.T) {
 	for _, test := range []struct {
 		backend    string
@@ -773,11 +1024,58 @@ func TestBuildAPIBackendUsesResponsesOnlyForCapableChannels(t *testing.T) {
 		{backend: "chat_completions", configured: true, want: "responses"},
 		{backend: "messages", configured: false, want: "messages"},
 		{backend: "chat_completions", configured: false, want: "chat_completions"},
+		{backend: "", configured: false, want: ""},
 	} {
 		route := config.Route{APIBackend: test.backend, SupportsBackendSearch: test.configured}
 		if got := buildAPIBackend(route); got != test.want {
 			t.Fatalf("backend=%s configured=%t build=%q want=%q", test.backend, test.configured, got, test.want)
 		}
+	}
+}
+
+func TestAppLeavesUnconfiguredAPIBackendToGrokBuildCatalog(t *testing.T) {
+	dir := t.TempDir()
+	grokHome := filepath.Join(dir, "grok")
+	dataDir := filepath.Join(dir, "data")
+	if err := os.MkdirAll(grokHome, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GROK_HOME", grokHome)
+	configPath := filepath.Join(grokHome, "config.toml")
+	original := "[model.future]\n" +
+		"model = \"future-catalog-model\"\n" +
+		"base_url = \"https://future.example/v1\"\n" +
+		"api_key = \"test-key\"\n"
+	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	server := proxy.New(log.New(io.Discard, "", 0))
+	server.PathAddr = "127.0.0.1:0"
+	app := &App{logger: log.New(io.Discard, "", 0), dataDir: dataDir, server: server}
+	if err := app.Start(); err != nil {
+		t.Fatal(err)
+	}
+	patched, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	model := string(patched)
+	if !strings.Contains(model, `base_url = "http://127.0.0.1:18787/c/future"`) {
+		t.Fatalf("future model was not routed through the facade:\n%s", model)
+	}
+	if strings.Contains(model, "api_backend") {
+		t.Fatalf("unconfigured api_backend was pinned instead of remaining catalog-owned:\n%s", model)
+	}
+	if err := app.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(restored) != original {
+		t.Fatalf("catalog-owned config was not restored exactly\nwant: %q\ngot:  %q", original, restored)
 	}
 }
 
@@ -801,17 +1099,27 @@ func TestResolveSearchRoutesTrustsOnlyConfiguredBackendSearch(t *testing.T) {
 
 func TestAppStartDoesNotProbeUpstreamSearchCapability(t *testing.T) {
 	for _, test := range []struct {
-		name       string
-		modelID    string
-		modelsTOML string
-		capability string
+		name                 string
+		modelID              string
+		modelsTOML           string
+		environmentModel     string
+		capability           string
+		wantSearchProjection bool
 	}{
 		{name: "omitted backend search", modelID: "grok-missing-search-flag"},
 		{
-			name:       "explicit client search model",
-			modelID:    "grok-explicit-search-model",
-			modelsTOML: "[models]\nweb_search = \"grok-explicit-search-model\"\n\n",
-			capability: "supports_backend_search = true\n",
+			name:                 "config-selected search model overrides explicit false",
+			modelID:              "grok-config-search-model",
+			modelsTOML:           "[models]\nweb_search = \"grok-config-search-model\"\n\n",
+			capability:           "supports_backend_search = false\n",
+			wantSearchProjection: true,
+		},
+		{
+			name:                 "environment-selected search model overrides explicit false",
+			modelID:              "grok-environment-search-model",
+			environmentModel:     "grok-environment-search-model",
+			capability:           "supports_backend_search = false\n",
+			wantSearchProjection: true,
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -827,11 +1135,13 @@ func TestAppStartDoesNotProbeUpstreamSearchCapability(t *testing.T) {
 				t.Fatal(err)
 			}
 			t.Setenv("GROK_HOME", grokHome)
+			t.Setenv("GROK_WEB_SEARCH_MODEL", test.environmentModel)
+			configPath := filepath.Join(grokHome, "config.toml")
 			original := test.modelsTOML + "[model." + test.modelID + "]\n" +
 				"model = \"grok-4.5\"\n" +
 				"base_url = \"" + upstream.URL + "/v1\"\n" +
 				"api_key = \"test-key\"\n" + test.capability
-			if err := os.WriteFile(filepath.Join(grokHome, "config.toml"), []byte(original), 0o600); err != nil {
+			if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
 				t.Fatal(err)
 			}
 
@@ -849,8 +1159,24 @@ func TestAppStartDoesNotProbeUpstreamSearchCapability(t *testing.T) {
 			if got := upstreamRequests.Load(); got != 0 {
 				t.Fatalf("startup contacted upstream %d time(s), want 0", got)
 			}
+			patched, err := os.ReadFile(configPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			projected := strings.Contains(string(patched), "supports_backend_search = true") &&
+				strings.Contains(string(patched), `api_backend = "responses"`)
+			if projected != test.wantSearchProjection {
+				t.Fatalf("search projection=%t want=%t config:\n%s", projected, test.wantSearchProjection, patched)
+			}
 			if err := app.Stop(); err != nil {
 				t.Fatal(err)
+			}
+			restored, err := os.ReadFile(configPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(restored) != original {
+				t.Fatalf("config was not restored exactly\nwant: %q\ngot:  %q", original, restored)
 			}
 		})
 	}

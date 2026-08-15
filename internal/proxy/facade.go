@@ -24,6 +24,7 @@ const maxFacadeBodyBytes int64 = 64 << 20
 var errBodyTooLarge = errors.New("body exceeds size limit")
 
 func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, route config.Route, incomingProtocol wireProtocol) {
+	setGrokModelHeaders(w.Header(), route)
 	defer s.flushReasoningProvenance()
 	if incoming.Method != http.MethodPost {
 		writeJSONError(w, http.StatusMethodNotAllowed, "custom channel facade accepts POST only")
@@ -88,6 +89,7 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 	}
 
 	started := time.Now()
+	upstreamClient, responseHeaderTimeout, bodyIdleTimeout := s.upstreamForRoute(route)
 	upstreamContext, cancelUpstream := context.WithCancel(incoming.Context())
 	stopLifecycleCancel := context.AfterFunc(s.upstreamLifecycleContext(), cancelUpstream)
 	defer func() {
@@ -116,7 +118,7 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 			req.Header.Set("Anthropic-Version", "2023-06-01")
 		}
 		req.ContentLength = int64(len(payload))
-		return s.client.Do(req)
+		return doUpstreamRequest(upstreamClient, req, responseHeaderTimeout, cancelUpstream)
 	}
 
 	var response *http.Response
@@ -138,6 +140,7 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 			writeJSONError(w, http.StatusBadGateway, "upstream returned unsupported content encoding "+encoding)
 			return
 		}
+		response.Body = withBodyIdleTimeout(response.Body, bodyIdleTimeout)
 		if response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices {
 			break
 		}
@@ -150,7 +153,9 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 		data, readErr := readBodyLimited(response.Body, maxFacadeBodyBytes)
 		_ = response.Body.Close()
 		if readErr != nil {
-			if errors.Is(readErr, errBodyTooLarge) {
+			if errors.Is(readErr, errUpstreamBodyIdleTimeout) {
+				writeRetryableJSONError(w, http.StatusGatewayTimeout, "upstream timed out waiting for error response body data")
+			} else if errors.Is(readErr, errBodyTooLarge) {
 				writeJSONError(w, http.StatusBadGateway, "upstream error body exceeds 64 MiB")
 			} else {
 				writeRetryableJSONError(w, http.StatusBadGateway, "read upstream error response: "+readErr.Error())
@@ -195,14 +200,18 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 			writeJSONError(w, http.StatusBadGateway, "WebSearchClient requires one non-streaming Responses response")
 			return
 		}
-		response.Body = withStreamIdleTimeout(response.Body, s.streamIdleTimeout)
 		if request.IncomingProtocol != wireResponses {
 			s.streamNativeSSE(w, response, route, request, started)
 			return
 		}
 		switch request.Protocol {
 		case wireResponses:
-			options := patch.Options{GPTResponses: true, WebSearch: true, RequestModel: route.WireModel}
+			options := patch.Options{
+				GPTResponses:            true,
+				WebSearch:               true,
+				RequestModel:            responseModelForRoute(route),
+				ContextDetailsFromUsage: isOfficialDeepSeekRoute(route),
+			}
 			s.streamResponsesSSE(w, response, route, request, options, started)
 		case wireMessages:
 			s.streamMessagesSSE(w, response, route, request, started)
@@ -216,7 +225,9 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 
 	data, readErr := readBodyLimited(response.Body, maxFacadeBodyBytes)
 	if readErr != nil {
-		if errors.Is(readErr, errBodyTooLarge) {
+		if errors.Is(readErr, errUpstreamBodyIdleTimeout) {
+			writeRetryableJSONError(w, http.StatusGatewayTimeout, "upstream timed out waiting for response body data")
+		} else if errors.Is(readErr, errBodyTooLarge) {
 			writeJSONError(w, http.StatusBadGateway, "upstream response body exceeds 64 MiB")
 		} else {
 			writeRetryableJSONError(w, http.StatusBadGateway, "read upstream response: "+readErr.Error())
@@ -232,7 +243,7 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 	modelObserver.log(s.log, route)
 
 	if request.Kind == clientSearchRequest {
-		s.writeClientSearchResponse(w, data, route, request)
+		s.writeClientSearchResponse(w, data, response.Header, route, request)
 		return
 	}
 
@@ -246,6 +257,7 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 			}
 			if request.Stream {
 				s.log.Printf("UP channel=%s backend=responses ignored stream=true; emitting buffered JSON fallback", route.ChannelID)
+				copySafeResponseHeaders(w.Header(), response.Header)
 				if err := writeCanonicalResponse(w, canonical, true); err != nil {
 					writeJSONError(w, http.StatusBadGateway, "invalid non-stream Responses body: "+err.Error())
 				}
@@ -254,7 +266,7 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 			copySafeResponseHeaders(w.Header(), response.Header)
 			writeJSONBody(w, response.StatusCode, normalized)
 		case wireMessages, wireChatCompletions:
-			s.writeTranslatedResponse(w, data, route, request)
+			s.writeTranslatedResponse(w, data, response.Header, route, request)
 		default:
 			writeJSONError(w, http.StatusInternalServerError, "unsupported upstream protocol")
 		}
@@ -270,6 +282,7 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 		}
 		if request.Stream {
 			s.log.Printf("UP channel=%s backend=responses ignored stream=true; emitting buffered JSON fallback", route.ChannelID)
+			copySafeResponseHeaders(w.Header(), response.Header)
 			if err := writeCanonicalResponse(w, canonical, true); err != nil {
 				writeJSONError(w, http.StatusBadGateway, "invalid non-stream Responses body: "+err.Error())
 			}
@@ -278,13 +291,14 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 		copySafeResponseHeaders(w.Header(), response.Header)
 		writeJSONBody(w, response.StatusCode, normalized)
 	case wireMessages:
-		root, normalized, normalizeErr := s.normalizeNativeJSON(data, route, request, validateMessagesEnvelope)
+		root, normalized, normalizeErr := s.normalizeNativeJSON(data, route, request, validateNativeMessagesEnvelope)
 		if normalizeErr != nil {
 			writeJSONError(w, http.StatusBadGateway, "invalid upstream Messages body: "+normalizeErr.Error())
 			return
 		}
 		if request.Stream {
 			s.log.Printf("UP channel=%s backend=messages ignored stream=true; emitting buffered native SSE fallback", route.ChannelID)
+			copySafeResponseHeaders(w.Header(), response.Header)
 			if err := writeMessagesSSEFallback(w, root); err != nil {
 				writeJSONError(w, http.StatusBadGateway, "invalid non-stream Messages body: "+err.Error())
 			}
@@ -293,13 +307,18 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 		copySafeResponseHeaders(w.Header(), response.Header)
 		writeJSONBody(w, response.StatusCode, normalized)
 	case wireChatCompletions:
-		root, normalized, normalizeErr := s.normalizeNativeJSON(data, route, request, validateChatEnvelope)
+		root, normalized, normalizeErr := s.normalizeNativeJSON(data, route, request, validateNativeChatEnvelope)
 		if normalizeErr != nil {
+			if errors.Is(normalizeErr, errDeepSeekInsufficientSystemResource) {
+				writeRetryableJSONError(w, http.StatusServiceUnavailable, normalizeErr.Error())
+				return
+			}
 			writeJSONError(w, http.StatusBadGateway, "invalid upstream Chat Completions body: "+normalizeErr.Error())
 			return
 		}
 		if request.Stream {
 			s.log.Printf("UP channel=%s backend=chat_completions ignored stream=true; emitting buffered native SSE fallback", route.ChannelID)
+			copySafeResponseHeaders(w.Header(), response.Header)
 			if err := writeChatSSEFallback(w, root); err != nil {
 				writeJSONError(w, http.StatusBadGateway, "invalid non-stream Chat Completions body: "+err.Error())
 			}
@@ -310,7 +329,13 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 	}
 }
 
-func (s *Server) writeTranslatedResponse(w http.ResponseWriter, data []byte, route config.Route, request facadeRequest) {
+func (s *Server) writeTranslatedResponse(
+	w http.ResponseWriter,
+	data []byte,
+	upstreamHeader http.Header,
+	route config.Route,
+	request facadeRequest,
+) {
 	evidence := newSearchEvidence()
 	evidence.observeJSON(data)
 	s.logSearchEvidence(route.ChannelID, request, evidence)
@@ -341,6 +366,7 @@ func (s *Server) writeTranslatedResponse(w http.ResponseWriter, data []byte, rou
 	if request.Stream {
 		s.log.Printf("UP channel=%s backend=%s ignored stream=true; emitting buffered Responses fallback", route.ChannelID, protocolLabel(request.Protocol))
 	}
+	copySafeResponseHeaders(w.Header(), upstreamHeader)
 	if err := writeCanonicalResponse(w, canonical, request.Stream); err != nil {
 		writeJSONError(w, http.StatusBadGateway, "canonical response error: "+err.Error())
 	}
@@ -367,7 +393,12 @@ func (s *Server) normalizeResponsesJSON(data []byte, route config.Route, request
 	if err != nil {
 		return nil, nil, fmt.Errorf("restore client search alias: %w", err)
 	}
-	options := patch.Options{GPTResponses: true, WebSearch: true, RequestModel: route.WireModel}
+	options := patch.Options{
+		GPTResponses:            true,
+		WebSearch:               true,
+		RequestModel:            responseModelForRoute(route),
+		ContextDetailsFromUsage: isOfficialDeepSeekRoute(route),
+	}
 	data, err = patch.PatchJSONBytesStrict(data, options)
 	if err != nil {
 		return nil, nil, err
@@ -403,8 +434,15 @@ func (s *Server) normalizeNativeJSON(
 	}
 	evidence := newSearchEvidence()
 	evidence.observeJSON(data)
+	if deepSeekChatInsufficientSystemResource(root, route, request.Protocol) {
+		return nil, nil, errDeepSeekInsufficientSystemResource
+	}
 	if request.Protocol == wireMessages && request.HostedWebSearch {
 		stripMessagesHostedSearchBlocks(root)
+	}
+	if request.Protocol == wireChatCompletions {
+		normalizeNativeChatRequiredFields(root, route, false, compatID("chatcmpl"), time.Now().Unix())
+		normalizeNativeChatUsage(root)
 	}
 	if err := validate(root); err != nil {
 		return nil, nil, err
@@ -416,7 +454,13 @@ func (s *Server) normalizeNativeJSON(
 	return root, normalized, err
 }
 
-func (s *Server) writeClientSearchResponse(w http.ResponseWriter, data []byte, route config.Route, request facadeRequest) {
+func (s *Server) writeClientSearchResponse(
+	w http.ResponseWriter,
+	data []byte,
+	upstreamHeader http.Header,
+	route config.Route,
+	request facadeRequest,
+) {
 	var canonical map[string]any
 	var err error
 	if request.Protocol == wireResponses {
@@ -450,6 +494,7 @@ func (s *Server) writeClientSearchResponse(w http.ResponseWriter, data []byte, r
 		writeJSONError(w, http.StatusBadGateway, "invalid upstream client search response: "+err.Error())
 		return
 	}
+	copySafeResponseHeaders(w.Header(), upstreamHeader)
 	if err := writeCanonicalResponse(w, canonical, false); err != nil {
 		writeJSONError(w, http.StatusBadGateway, "canonical client search response: "+err.Error())
 	}
@@ -473,7 +518,7 @@ func validateClientSearchOutput(response map[string]any) error {
 		}
 	}
 	if !hasCompletedSearch {
-		return fmt.Errorf("response contains no completed web_search_call; upstream may have ignored the search extension")
+		return fmt.Errorf("selected web_search model did not complete backend web_search; it may not support backend search or may have ignored the hosted tool, so web_search cannot be used with this model")
 	}
 	if !hasOutputText {
 		return fmt.Errorf("response contains no non-empty output_text")
@@ -555,9 +600,11 @@ func applyRouteHeaders(header http.Header, route config.Route, protocol wireProt
 	header.Del("Authorization")
 	header.Del("X-Api-Key")
 	authScheme := route.AuthScheme
-	if protocol == wireMessages {
-		if native, _ := routeProtocol(route); native == wireChatCompletions && isOfficialDeepSeekHost(route.Host) {
+	if isOfficialDeepSeekRoute(route) {
+		if protocol == wireMessages {
 			authScheme = "x_api_key"
+		} else {
+			authScheme = "bearer"
 		}
 	}
 	if route.APIKey != "" {
@@ -578,14 +625,23 @@ func applyRouteHeaders(header http.Header, route config.Route, protocol wireProt
 			header.Set("Authorization", "Bearer "+token)
 		}
 	}
-	if authScheme == "x_api_key" && header.Get("X-Api-Key") == "" {
-		if authorization := strings.TrimSpace(header.Get("Authorization")); authorization != "" {
-			token := strings.TrimSpace(strings.TrimPrefix(authorization, "Bearer "))
-			if token != "" {
-				header.Set("X-Api-Key", token)
+	if authScheme == "x_api_key" {
+		if header.Get("X-Api-Key") == "" {
+			if authorization := strings.TrimSpace(header.Get("Authorization")); authorization != "" {
+				token := strings.TrimSpace(strings.TrimPrefix(authorization, "Bearer "))
+				if token != "" {
+					header.Set("X-Api-Key", token)
+				}
 			}
 		}
 		header.Del("Authorization")
+	} else if isOfficialDeepSeekRoute(route) && authScheme == "bearer" {
+		if header.Get("Authorization") == "" {
+			if token := strings.TrimSpace(header.Get("X-Api-Key")); token != "" {
+				header.Set("Authorization", "Bearer "+token)
+			}
+		}
+		header.Del("X-Api-Key")
 	}
 }
 
@@ -682,6 +738,11 @@ func copySafeResponseHeaders(dst, src http.Header) {
 		"connection": true, "proxy-connection": true, "proxy-authenticate": true,
 		"proxy-authorization": true, "keep-alive": true, "te": true,
 		"trailer": true, "upgrade": true, "set-cookie": true, "location": true,
+	}
+	for _, key := range []string{grokContextWindowHeader, grokMaxCompletionTokensHeader} {
+		if dst.Get(key) != "" {
+			blocked[strings.ToLower(key)] = true
+		}
 	}
 	for _, named := range src.Values("Connection") {
 		for _, key := range strings.Split(named, ",") {

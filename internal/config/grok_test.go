@@ -142,6 +142,28 @@ func TestBuildRoutesRecordsWireModels(t *testing.T) {
 	}
 }
 
+func TestOfficialDeepSeekRouteRecognitionUsesExactAPIHost(t *testing.T) {
+	tests := []struct {
+		name  string
+		route Route
+		want  bool
+	}{
+		{"pro", Route{Host: "api.deepseek.com", WireModel: "deepseek-v4-pro"}, true},
+		{"future model", Route{Host: "api.deepseek.com:443", WireModel: "deepseek-future-model"}, true},
+		{"root website", Route{Host: "deepseek.com", WireModel: "deepseek-v4-pro"}, false},
+		{"other subdomain", Route{Host: "proxy.deepseek.com", WireModel: "deepseek-v4-pro"}, false},
+		{"lookalike host", Route{Host: "api.deepseek.com.evil", WireModel: "deepseek-v4-pro"}, false},
+		{"relay", Route{Host: "relay.example", WireModel: "deepseek-v4-pro"}, false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := IsOfficialDeepSeekRoute(test.route); got != test.want {
+				t.Fatalf("IsOfficialDeepSeekRoute(%+v)=%t want %t", test.route, got, test.want)
+			}
+		})
+	}
+}
+
 func TestLoadModelsAndRoutesPreserveChannelAuthAndHeaders(t *testing.T) {
 	t.Setenv("DEEPSEEK_TEST_KEY", "env-deepseek-key")
 	t.Setenv("TENANT_TEST_TOKEN", "tenant-token")
@@ -342,7 +364,7 @@ model_provider = "dynamic"
 	inherited := byModel["inherited"]
 	if inherited.BaseURL != "https://session.gateway.test/v1" ||
 		inherited.APIBaseURL != "https://key.gateway.test/v1" ||
-		inherited.APIBackend != "messages" || inherited.AuthScheme != "x_api_key" {
+		inherited.APIBackend != "messages" || !inherited.APIBackendConfigured || inherited.AuthScheme != "x_api_key" {
 		t.Fatalf("provider connection was not inherited: %+v", inherited)
 	}
 	if ResolveAPIKey(inherited) != "provider-env-key" {
@@ -354,7 +376,7 @@ model_provider = "dynamic"
 	}
 
 	own := byModel["own"]
-	if own.BaseURL != "https://own.test/v1" || own.APIBackend != "responses" || own.APIKey != "own-key" || own.AuthScheme != "bearer" {
+	if own.BaseURL != "https://own.test/v1" || own.APIBackend != "responses" || !own.APIBackendConfigured || own.APIKey != "own-key" || own.AuthScheme != "bearer" {
 		t.Fatalf("model fields did not override provider: %+v", own)
 	}
 	if headerValueTest(own.ExtraHeaders, "X-Provider") != "" || headerValueTest(own.ExtraHeaders, "X-Own") != "yes" {
@@ -380,6 +402,9 @@ model_provider = "dynamic"
 	}
 	if byRoute["dynamic"].IncomingAuthScheme != "bearer" {
 		t.Fatalf("Build-facing default auth scheme mismatch: %+v", byRoute["dynamic"])
+	}
+	if byModel["dynamic"].APIBackendConfigured || byRoute["dynamic"].APIBackendConfigured || byRoute["dynamic"].APIBackend != "" {
+		t.Fatalf("an omitted API backend must remain available for Grok Build catalog inheritance: model=%+v route=%+v", byModel["dynamic"], byRoute["dynamic"])
 	}
 }
 
@@ -494,6 +519,11 @@ base_url = "https://plain.example/v1"
 	if !byModel["inherited"].SupportsBackendSearch {
 		t.Fatal("provider backend-search capability was not inherited")
 	}
+	if !byModel["inherited"].SupportsBackendSearchConfigured ||
+		!byModel["disabled"].SupportsBackendSearchConfigured ||
+		byModel["default-disabled"].SupportsBackendSearchConfigured {
+		t.Fatalf("explicit and omitted backend-search values were not distinguished: %#v", byModel)
+	}
 	if byModel["disabled"].SupportsBackendSearch || byModel["default-disabled"].SupportsBackendSearch {
 		t.Fatalf("false or missing capability became enabled: %#v", byModel)
 	}
@@ -508,6 +538,201 @@ base_url = "https://plain.example/v1"
 	}
 	if !byRoute["inherited"].SupportsBackendSearch || byRoute["disabled"].SupportsBackendSearch || byRoute["default-disabled"].SupportsBackendSearch {
 		t.Fatalf("route capabilities do not match config: %#v", byRoute)
+	}
+	if !byRoute["inherited"].SupportsBackendSearchConfigured ||
+		!byRoute["disabled"].SupportsBackendSearchConfigured ||
+		byRoute["default-disabled"].SupportsBackendSearchConfigured {
+		t.Fatalf("route capability provenance does not match config: %#v", byRoute)
+	}
+}
+
+func TestLoadModelsPreservesConfiguredLimitPrecedence(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	raw := `[models]
+inference_idle_timeout_secs = 900
+
+[model_providers.tiered]
+base_url = "https://tiered.example/v1"
+context_window = 262144
+max_completion_tokens = 16384
+
+[model.inherited]
+model_provider = "tiered"
+
+[model.override]
+model_provider = "tiered"
+context_window = 131072
+max_completion_tokens = 8192
+inference_idle_timeout_secs = 300
+
+[model.remote]
+base_url = "https://remote.example/v1"
+`
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	models, err := LoadModels(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byModel := map[string]Model{}
+	for _, model := range models {
+		byModel[model.ID] = model
+	}
+	if got := byModel["inherited"]; !got.ContextWindowConfigured || got.ContextWindow != 262144 ||
+		!got.MaxCompletionTokensConfigured || got.MaxCompletionTokens != 16384 ||
+		!got.InferenceIdleTimeoutConfigured || got.InferenceIdleTimeoutSecs != 900 {
+		t.Fatalf("provider limits were not inherited: %+v", got)
+	}
+	if got := byModel["override"]; !got.ContextWindowConfigured || got.ContextWindow != 131072 ||
+		!got.MaxCompletionTokensConfigured || got.MaxCompletionTokens != 8192 ||
+		!got.InferenceIdleTimeoutConfigured || got.InferenceIdleTimeoutSecs != 300 {
+		t.Fatalf("model limits did not override provider: %+v", got)
+	}
+	if got := byModel["remote"]; got.ContextWindowConfigured || got.ContextWindow != 0 ||
+		got.MaxCompletionTokensConfigured || got.MaxCompletionTokens != 0 ||
+		!got.InferenceIdleTimeoutConfigured || got.InferenceIdleTimeoutSecs != 900 {
+		t.Fatalf("omitted token limits or global timeout were resolved incorrectly: %+v", got)
+	}
+
+	routes, err := BuildRoutes(models)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byRoute := map[string]Route{}
+	for _, route := range routes {
+		byRoute[route.ChannelID] = route
+	}
+	for _, id := range []string{"inherited", "override", "remote"} {
+		model, route := byModel[id], byRoute[id]
+		if route.ContextWindow != model.ContextWindow ||
+			route.ContextWindowConfigured != model.ContextWindowConfigured ||
+			route.MaxCompletionTokens != model.MaxCompletionTokens ||
+			route.MaxCompletionTokensConfigured != model.MaxCompletionTokensConfigured ||
+			route.InferenceIdleTimeoutSecs != model.InferenceIdleTimeoutSecs ||
+			route.InferenceIdleTimeoutConfigured != model.InferenceIdleTimeoutConfigured {
+			t.Fatalf("route %q lost limit provenance: model=%+v route=%+v", id, model, route)
+		}
+	}
+}
+
+func TestLoadModelsAcceptsZeroInferenceIdleTimeoutLikeGrokBuild(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	raw := "[models]\ninference_idle_timeout_secs = 0\n\n[model.zero]\nbase_url = \"https://example.test/v1\"\n"
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	models, err := LoadModels(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(models) != 1 || !models[0].InferenceIdleTimeoutConfigured || models[0].InferenceIdleTimeoutSecs != 0 {
+		t.Fatalf("zero timeout was not preserved: %#v", models)
+	}
+}
+
+func TestReasoningCapabilityDefaultsAreConfiguredFirstAndHostScoped(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	raw := `[model.v4-default]
+model = "deepseek-v4-pro"
+base_url = "https://api.deepseek.com"
+
+[model.future-default]
+model = "deepseek-future-model"
+base_url = "https://api.deepseek.com"
+
+[model.future-configured]
+model = "deepseek-future-model"
+base_url = "https://api.deepseek.com"
+supports_reasoning_effort = true
+reasoning_efforts = [{ value = "max", label = "Future Max", default = true }]
+
+[model.v4-disabled]
+model = "deepseek-v4-flash"
+base_url = "https://api.deepseek.com"
+supports_reasoning_effort = false
+`
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	models, err := LoadModels(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	routes, err := BuildRoutes(models)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := map[string]Route{}
+	for _, route := range routes {
+		byID[route.ChannelID] = route
+	}
+	if got := byID["v4-default"]; got.ReasoningEffortConfigured || !got.ReasoningEffortEnabled {
+		t.Fatalf("official DeepSeek default capability = %+v", got)
+	}
+	if got := byID["future-default"]; got.ReasoningEffortConfigured || !got.ReasoningEffortEnabled {
+		t.Fatalf("future official model missed endpoint capability = %+v", got)
+	}
+	if got := byID["future-configured"]; !got.ReasoningEffortConfigured || !got.ReasoningEffortEnabled {
+		t.Fatalf("future explicit capability was lost = %+v", got)
+	}
+	if got := byID["v4-disabled"]; !got.ReasoningEffortConfigured || got.ReasoningEffortEnabled {
+		t.Fatalf("explicit V4 opt-out was overridden = %+v", got)
+	}
+}
+
+func TestLoadModelsRejectsMalformedReasoningCapabilityFields(t *testing.T) {
+	for _, body := range []string{
+		"supports_reasoning_effort = \"yes\"\n",
+		"reasoning_efforts = \"high\"\n",
+	} {
+		path := filepath.Join(t.TempDir(), "config.toml")
+		raw := "[model.invalid]\nbase_url = \"https://api.deepseek.com\"\n" + body
+		if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := LoadModels(path); err == nil {
+			t.Fatalf("malformed reasoning capability was accepted: %s", body)
+		}
+	}
+}
+
+func TestLoadModelsRejectsInvalidConfiguredContextWindow(t *testing.T) {
+	for _, value := range []string{"0", "-1", `"131072"`, "131072.5"} {
+		t.Run(value, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.toml")
+			raw := "[model.invalid]\nbase_url = \"https://invalid.example/v1\"\ncontext_window = " + value + "\n"
+			if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := LoadModels(path); err == nil || !strings.Contains(err.Error(), "context_window must be a positive integer") {
+				t.Fatalf("invalid context window %s error = %v", value, err)
+			}
+		})
+	}
+}
+
+func TestLoadModelsRejectsInvalidConfiguredOutputLimits(t *testing.T) {
+	tests := []struct {
+		field string
+		value string
+	}{
+		{"max_completion_tokens", "0"},
+		{"max_completion_tokens", "4294967296"},
+		{"max_completion_tokens", `"384000"`},
+	}
+	for _, test := range tests {
+		t.Run(test.field+"="+test.value, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.toml")
+			raw := "[model.invalid]\nbase_url = \"https://invalid.example/v1\"\n" + test.field + " = " + test.value + "\n"
+			if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := LoadModels(path); err == nil || !strings.Contains(err.Error(), test.field) {
+				t.Fatalf("invalid %s %s error = %v", test.field, test.value, err)
+			}
+		})
 	}
 }
 

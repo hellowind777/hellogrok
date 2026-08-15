@@ -22,12 +22,17 @@ const maxBackfilledSearchSources = 100
 var httpURLInTextPattern = regexp.MustCompile(`https?://[^\s<>"'()\[\]{}]+`)
 
 type canonicalResult struct {
-	Output           []any
-	InputTokens      int
-	OutputTokens     int
-	CachedTokens     int
-	ReasoningTokens  int
-	IncompleteReason string
+	Output             []any
+	InputTokens        int64
+	OutputTokens       int64
+	CachedTokens       int64
+	ReasoningTokens    int64
+	TotalTokens        int64
+	UsagePresent       bool
+	LiveContextPresent bool
+	IncompleteReason   string
+	FailureCode        string
+	FailureMessage     string
 }
 
 func canonicalFromMessages(data []byte, hosted bool, query string) (canonicalResult, error) {
@@ -36,8 +41,16 @@ func canonicalFromMessages(data []byte, hosted bool, query string) (canonicalRes
 		return canonicalResult{}, err
 	}
 	validationRoot := root
-	if hosted {
+	if hosted || root["usage"] == nil {
 		validationRoot = cloneMap(root)
+		if validationRoot["usage"] == nil {
+			// A translated Responses result can truthfully carry usage:null. Keep
+			// native Messages validation strict while validating the rest of this
+			// provider envelope without inventing token counts.
+			validationRoot["usage"] = map[string]any{}
+		}
+	}
+	if hosted {
 		stripMessagesHostedSearchBlocks(validationRoot)
 	}
 	if err := validateMessagesEnvelope(validationRoot); err != nil {
@@ -100,11 +113,7 @@ func canonicalFromMessages(data []byte, hosted bool, query string) (canonicalRes
 		}
 	}
 	flushText()
-	if usage, _ := root["usage"].(map[string]any); usage != nil {
-		result.InputTokens = numberInt(usage["input_tokens"])
-		result.CachedTokens = numberInt(usage["cache_read_input_tokens"])
-		result.OutputTokens = numberInt(usage["output_tokens"])
-	}
+	applyMessagesUsage(&result, root["usage"])
 	if stringValue(root["stop_reason"]) == "max_tokens" {
 		result.IncompleteReason = "max_output_tokens"
 	}
@@ -166,20 +175,185 @@ func canonicalFromChat(data []byte, hosted bool, query string) (canonicalResult,
 	if text := chatMessageText(message["content"]); text != "" {
 		result.Output = append(result.Output, messageItem(text, urlsToAnnotations(urls)))
 	}
-	if usage, _ := root["usage"].(map[string]any); usage != nil {
-		result.InputTokens = numberInt(valueFirst(usage, "prompt_tokens", "input_tokens"))
-		result.OutputTokens = numberInt(valueFirst(usage, "completion_tokens", "output_tokens"))
-		if details, _ := usage["prompt_tokens_details"].(map[string]any); details != nil {
-			result.CachedTokens = numberInt(details["cached_tokens"])
-		}
-		if details, _ := usage["completion_tokens_details"].(map[string]any); details != nil {
-			result.ReasoningTokens = numberInt(details["reasoning_tokens"])
-		}
-	}
-	if finish := stringValue(choice["finish_reason"]); finish == "length" {
-		result.IncompleteReason = "max_output_tokens"
-	}
+	applyChatUsage(&result, root["usage"])
+	applyChatFinishReason(&result, stringValue(choice["finish_reason"]))
 	return result, nil
+}
+
+func applyMessagesUsage(result *canonicalResult, value any) {
+	usage, _ := value.(map[string]any)
+	if result == nil || usage == nil {
+		return
+	}
+	input, hasInput, validInput := optionalCanonicalToken(usage, "input_tokens")
+	cacheRead, _, validCacheRead := optionalCanonicalToken(usage, "cache_read_input_tokens")
+	cacheCreation, _, validCacheCreation := optionalCanonicalToken(usage, "cache_creation_input_tokens")
+	output, hasOutput, validOutput := optionalCanonicalToken(usage, "output_tokens")
+	total, hasTotal, validTotal := optionalCanonicalToken(usage, "total_tokens")
+	if !validInput || !validCacheRead || !validCacheCreation || !validOutput || !validTotal ||
+		!hasInput || !hasOutput {
+		return
+	}
+	inputTotal, ok := sumCanonicalTokens(input, cacheRead, cacheCreation)
+	if !ok {
+		return
+	}
+	if !hasTotal {
+		var valid bool
+		total, valid = sumCanonicalTokens(inputTotal, output)
+		if !valid {
+			return
+		}
+	}
+	if inputTotal == 0 && output == 0 && total == 0 {
+		return
+	}
+	result.UsagePresent = true
+	result.InputTokens = inputTotal
+	result.OutputTokens = output
+	result.CachedTokens = cacheRead
+	result.TotalTokens = total
+	_, result.LiveContextPresent = sumCanonicalTokens(inputTotal, output)
+	result.LiveContextPresent = result.LiveContextPresent && hasInput && hasOutput
+}
+
+func applyChatUsage(result *canonicalResult, value any) {
+	usage, _ := value.(map[string]any)
+	if result == nil || usage == nil {
+		return
+	}
+	input, hasInput, validInput := firstCanonicalToken(usage, "prompt_tokens", "input_tokens")
+	output, hasOutput, validOutput := firstCanonicalToken(usage, "completion_tokens", "output_tokens")
+	total, hasTotal, validTotal := optionalCanonicalToken(usage, "total_tokens")
+	cacheHit, hasCacheHit, validCacheHit := optionalCanonicalToken(usage, "prompt_cache_hit_tokens")
+	cacheMiss, hasCacheMiss, validCacheMiss := optionalCanonicalToken(usage, "prompt_cache_miss_tokens")
+	if !validInput || !validOutput || !validTotal || !validCacheHit || !validCacheMiss {
+		return
+	}
+	if !hasCacheHit {
+		if raw, exists := usage["prompt_tokens_details"]; exists && raw != nil {
+			details, ok := raw.(map[string]any)
+			if !ok {
+				return
+			}
+			cacheHit, hasCacheHit, validCacheHit = optionalCanonicalToken(details, "cached_tokens")
+			if !validCacheHit {
+				return
+			}
+		}
+	}
+	reasoning := int64(0)
+	if raw, exists := usage["completion_tokens_details"]; exists && raw != nil {
+		details, ok := raw.(map[string]any)
+		if !ok {
+			return
+		}
+		var validReasoning bool
+		reasoning, _, validReasoning = optionalCanonicalToken(details, "reasoning_tokens")
+		if !validReasoning {
+			return
+		}
+	}
+	if !hasInput && hasCacheHit && hasCacheMiss {
+		var ok bool
+		input, ok = sumCanonicalTokens(cacheHit, cacheMiss)
+		if !ok {
+			return
+		}
+		hasInput = true
+	}
+	if !hasInput || !hasOutput {
+		return
+	}
+	if !hasTotal {
+		var ok bool
+		total, ok = sumCanonicalTokens(input, output)
+		if !ok {
+			return
+		}
+	}
+	if input == 0 && output == 0 && total == 0 {
+		return
+	}
+	result.UsagePresent = true
+	result.InputTokens = input
+	result.OutputTokens = output
+	result.CachedTokens = cacheHit
+	result.ReasoningTokens = reasoning
+	result.TotalTokens = total
+	_, result.LiveContextPresent = sumCanonicalTokens(input, output)
+	result.LiveContextPresent = result.LiveContextPresent && hasInput && hasOutput
+}
+
+const maxCanonicalTokenCount = int64(^uint32(0))
+
+func optionalCanonicalToken(values map[string]any, key string) (int64, bool, bool) {
+	value, exists := values[key]
+	if !exists || value == nil {
+		return 0, false, true
+	}
+	var count int64
+	switch number := value.(type) {
+	case json.Number:
+		parsed, err := number.Int64()
+		if err != nil {
+			return 0, true, false
+		}
+		count = parsed
+	case float64:
+		if number < 0 || number > float64(maxCanonicalTokenCount) || number != float64(int64(number)) {
+			return 0, true, false
+		}
+		count = int64(number)
+	case int:
+		count = int64(number)
+	case int64:
+		count = number
+	case uint64:
+		if number > uint64(maxCanonicalTokenCount) {
+			return 0, true, false
+		}
+		count = int64(number)
+	default:
+		return 0, true, false
+	}
+	return count, true, count >= 0 && count <= maxCanonicalTokenCount
+}
+
+func firstCanonicalToken(values map[string]any, keys ...string) (int64, bool, bool) {
+	for _, key := range keys {
+		value, present, valid := optionalCanonicalToken(values, key)
+		if !valid || present {
+			return value, present, valid
+		}
+	}
+	return 0, false, true
+}
+
+func sumCanonicalTokens(values ...int64) (int64, bool) {
+	var total int64
+	for _, value := range values {
+		if value < 0 || value > maxCanonicalTokenCount-total {
+			return 0, false
+		}
+		total += value
+	}
+	return total, true
+}
+
+func applyChatFinishReason(result *canonicalResult, finish string) {
+	if result == nil {
+		return
+	}
+	switch finish {
+	case "length":
+		result.IncompleteReason = "max_output_tokens"
+	case "content_filter":
+		result.IncompleteReason = "content_filter"
+	case "insufficient_system_resource":
+		result.FailureCode = "insufficient_system_resource"
+		result.FailureMessage = "upstream inference stopped because DeepSeek had insufficient system resources"
+	}
 }
 
 func validateResponsesEnvelope(root map[string]any) error {
@@ -232,6 +406,21 @@ func validateResponsesEnvelope(root map[string]any) error {
 }
 
 func validateMessagesEnvelope(root map[string]any) error {
+	return validateMessagesEnvelopeWith(root, validateMessagesContentBlock)
+}
+
+func validateNativeMessagesEnvelope(root map[string]any) error {
+	if err := validateMessagesEnvelopeWith(root, validateNativeMessagesContentBlock); err != nil {
+		return err
+	}
+	usage, _ := root["usage"].(map[string]any)
+	if err := validateMessagesUsage(usage, true); err != nil {
+		return fmt.Errorf("Messages response usage: %w", err)
+	}
+	return nil
+}
+
+func validateMessagesEnvelopeWith(root map[string]any, validateBlock func(map[string]any) error) error {
 	for _, field := range []string{"id", "model"} {
 		if strings.TrimSpace(stringValue(root[field])) == "" {
 			return fmt.Errorf("Messages response %s must be a non-empty string", field)
@@ -252,12 +441,37 @@ func validateMessagesEnvelope(root map[string]any) error {
 		if !ok || block == nil {
 			return fmt.Errorf("Messages response content[%d] must be an object", index)
 		}
-		if err := validateMessagesContentBlock(block); err != nil {
+		if err := validateBlock(block); err != nil {
 			return fmt.Errorf("Messages response content[%d]: %w", index, err)
 		}
 	}
-	if usage, ok := root["usage"].(map[string]any); !ok || usage == nil {
+	if value, present := root["stop_reason"]; present && value != nil {
+		if _, ok := value.(string); !ok {
+			return fmt.Errorf("Messages response stop_reason must be a string")
+		}
+	}
+	usage, ok := root["usage"].(map[string]any)
+	if !ok || usage == nil {
 		return fmt.Errorf("Messages response usage must be an object")
+	}
+	return nil
+}
+
+func validateMessagesUsage(usage map[string]any, requireInput bool) error {
+	required := []string{"output_tokens"}
+	if requireInput {
+		required = append([]string{"input_tokens"}, required...)
+	}
+	for _, key := range required {
+		_, present, valid := optionalCanonicalToken(usage, key)
+		if !present || !valid {
+			return fmt.Errorf("%s must be an unsigned 32-bit integer", key)
+		}
+	}
+	for _, key := range []string{"input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"} {
+		if _, present, valid := optionalCanonicalToken(usage, key); present && !valid {
+			return fmt.Errorf("%s must be an unsigned 32-bit integer", key)
+		}
 	}
 	return nil
 }
@@ -334,13 +548,94 @@ func validateMessagesContentBlock(block map[string]any) error {
 		if _, ok := block["data"].(string); !ok {
 			return fmt.Errorf("redacted_thinking block data must be a string")
 		}
-	case "image", "tool_result":
-		// Both variants are part of Grok Build's current Messages ContentBlock
-		// enum, although they are unusual in an assistant response.
+	case "image":
+		if err := validateMessagesImageSource(block["source"]); err != nil {
+			return err
+		}
+	case "tool_result":
+		if _, ok := block["tool_use_id"].(string); !ok {
+			return fmt.Errorf("tool_result block tool_use_id must be a string")
+		}
+		if err := validateMessagesToolResultContent(block["content"]); err != nil {
+			return err
+		}
 	case "":
 		return fmt.Errorf("content block type must be a non-empty string")
 	default:
 		return fmt.Errorf("unsupported content block type %q", stringValue(block["type"]))
+	}
+	if err := validateMessagesCacheControl(block["cache_control"]); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateNativeMessagesContentBlock(block map[string]any) error {
+	typ, ok := block["type"].(string)
+	if !ok || strings.TrimSpace(typ) == "" {
+		return fmt.Errorf("content block type must be a non-empty string")
+	}
+	switch typ {
+	case "text", "tool_use", "thinking", "redacted_thinking", "image", "tool_result":
+		return validateMessagesContentBlock(block)
+	default:
+		return nil
+	}
+}
+
+func validateMessagesImageSource(value any) error {
+	source, ok := value.(map[string]any)
+	if !ok || source == nil {
+		return fmt.Errorf("image block source must be an object")
+	}
+	switch stringValue(source["type"]) {
+	case "base64":
+		if _, ok := source["media_type"].(string); !ok {
+			return fmt.Errorf("image block source media_type must be a string")
+		}
+		if _, ok := source["data"].(string); !ok {
+			return fmt.Errorf("image block source data must be a string")
+		}
+	case "url":
+		if _, ok := source["url"].(string); !ok {
+			return fmt.Errorf("image block source url must be a string")
+		}
+	default:
+		return fmt.Errorf("unsupported image source type %q", stringValue(source["type"]))
+	}
+	return nil
+}
+
+func validateMessagesToolResultContent(value any) error {
+	if _, ok := value.(string); ok {
+		return nil
+	}
+	blocks, ok := value.([]any)
+	if !ok {
+		return fmt.Errorf("tool_result block content must be a string or content block array")
+	}
+	for index, raw := range blocks {
+		block, ok := raw.(map[string]any)
+		if !ok || block == nil {
+			return fmt.Errorf("tool_result block content[%d] must be an object", index)
+		}
+		if err := validateMessagesContentBlock(block); err != nil {
+			return fmt.Errorf("tool_result block content[%d]: %w", index, err)
+		}
+	}
+	return nil
+}
+
+func validateMessagesCacheControl(value any) error {
+	if value == nil {
+		return nil
+	}
+	cacheControl, ok := value.(map[string]any)
+	if !ok || cacheControl == nil {
+		return fmt.Errorf("content block cache_control must be an object")
+	}
+	if _, ok := cacheControl["type"].(string); !ok {
+		return fmt.Errorf("content block cache_control type must be a string")
 	}
 	return nil
 }
@@ -363,6 +658,185 @@ func validateMessagesStreamDelta(delta map[string]any) error {
 		return fmt.Errorf("%s %s must be a string", stringValue(delta["type"]), field)
 	}
 	return nil
+}
+
+func validateNativeMessagesStreamDelta(delta map[string]any) error {
+	typ, ok := delta["type"].(string)
+	if !ok || strings.TrimSpace(typ) == "" {
+		return fmt.Errorf("Messages stream delta type must be a non-empty string")
+	}
+	switch typ {
+	case "text_delta", "input_json_delta", "thinking_delta", "signature_delta":
+		return validateMessagesStreamDelta(delta)
+	default:
+		return nil
+	}
+}
+
+func validateMessagesDeltaBody(delta map[string]any) error {
+	for _, key := range []string{"stop_reason", "stop_sequence"} {
+		if value, present := delta[key]; present && value != nil {
+			if _, ok := value.(string); !ok {
+				return fmt.Errorf("Messages message_delta %s must be a string", key)
+			}
+		}
+	}
+	if value, present := delta["stop_details"]; present && value != nil {
+		details, ok := value.(map[string]any)
+		if !ok {
+			return fmt.Errorf("Messages message_delta stop_details must be an object")
+		}
+		for _, key := range []string{"type", "category", "explanation"} {
+			if value, present := details[key]; present && value != nil {
+				if _, ok := value.(string); !ok {
+					return fmt.Errorf("Messages message_delta stop_details.%s must be a string", key)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// normalizeNativeChatUsage keeps native Chat responses decodable by Grok
+// Build. Its Chat usage type requires all three top-level token counts as u32.
+// Missing values are derived only when the remaining counts prove them. The
+// live-context total is normalized from complete input/output counts because
+// Grok Build's Chat consumer uses total_tokens directly. DeepSeek's cache-hit
+// field is projected only after the complete measurement has passed validation.
+func normalizeNativeChatUsage(root map[string]any) {
+	rawUsage, present := root["usage"]
+	if !present || rawUsage == nil {
+		return
+	}
+	usage, ok := rawUsage.(map[string]any)
+	if !ok || !normalizeRequiredChatUsage(usage) ||
+		!validChatUsageDetails(usage, "prompt_tokens_details", "cached_tokens", "audio_tokens") ||
+		!validChatUsageDetails(
+			usage,
+			"completion_tokens_details",
+			"reasoning_tokens",
+			"audio_tokens",
+			"accepted_prediction_tokens",
+			"rejected_prediction_tokens",
+		) || !validOptionalChatCost(usage) {
+		root["usage"] = nil
+		return
+	}
+
+	cacheHit, present, valid := optionalCanonicalToken(usage, "prompt_cache_hit_tokens")
+	if !present || !valid {
+		return
+	}
+
+	rawDetails, detailsPresent := usage["prompt_tokens_details"]
+	if detailsPresent && rawDetails != nil {
+		details, ok := rawDetails.(map[string]any)
+		if !ok {
+			root["usage"] = nil
+			return
+		}
+		if _, cachedPresent := details["cached_tokens"]; cachedPresent {
+			return
+		}
+		details["cached_tokens"] = cacheHit
+		return
+	}
+	usage["prompt_tokens_details"] = map[string]any{"cached_tokens": cacheHit}
+}
+
+func normalizeRequiredChatUsage(usage map[string]any) bool {
+	prompt, hasPrompt, validPrompt := firstCanonicalToken(usage, "prompt_tokens", "input_tokens")
+	completion, hasCompletion, validCompletion := firstCanonicalToken(usage, "completion_tokens", "output_tokens")
+	cacheHit, hasCacheHit, validCacheHit := optionalCanonicalToken(usage, "prompt_cache_hit_tokens")
+	cacheMiss, hasCacheMiss, validCacheMiss := optionalCanonicalToken(usage, "prompt_cache_miss_tokens")
+	if !validPrompt || !validCompletion || !hasCompletion {
+		return false
+	}
+
+	if !hasPrompt {
+		if !hasCacheHit || !hasCacheMiss || !validCacheHit || !validCacheMiss {
+			return false
+		}
+		var valid bool
+		prompt, valid = sumCanonicalTokens(cacheHit, cacheMiss)
+		if !valid {
+			return false
+		}
+		usage["prompt_tokens"] = prompt
+		hasPrompt = true
+	}
+	if _, present, _ := optionalCanonicalToken(usage, "prompt_tokens"); !present {
+		usage["prompt_tokens"] = prompt
+	}
+	if _, present, _ := optionalCanonicalToken(usage, "completion_tokens"); !present {
+		usage["completion_tokens"] = completion
+	}
+
+	expectedTotal, valid := sumCanonicalTokens(prompt, completion)
+	if !valid || expectedTotal == 0 {
+		return false
+	}
+	usage["total_tokens"] = expectedTotal
+
+	// DeepSeek defines hit and miss as a complete partition of prompt tokens.
+	// Do not expose a cache measurement that contradicts the prompt total.
+	if hasCacheHit && hasCacheMiss && validCacheHit && validCacheMiss {
+		cachePrompt, valid := sumCanonicalTokens(cacheHit, cacheMiss)
+		if !valid || cachePrompt != prompt {
+			return false
+		}
+	}
+	return hasPrompt
+}
+
+func validRequiredChatUsage(usage map[string]any) bool {
+	for _, key := range []string{"prompt_tokens", "completion_tokens", "total_tokens"} {
+		_, present, valid := optionalCanonicalToken(usage, key)
+		if !present || !valid {
+			return false
+		}
+	}
+	return true
+}
+
+func validChatUsageDetails(usage map[string]any, container string, keys ...string) bool {
+	raw, present := usage[container]
+	if !present || raw == nil {
+		return true
+	}
+	details, ok := raw.(map[string]any)
+	if !ok {
+		return false
+	}
+	for _, key := range keys {
+		if value, exists := details[key]; exists {
+			_, tokenPresent, valid := optionalCanonicalToken(details, key)
+			if value == nil || !tokenPresent || !valid {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func validOptionalChatCost(usage map[string]any) bool {
+	value, present := usage["cost_in_usd_ticks"]
+	if !present || value == nil {
+		return true
+	}
+	switch number := value.(type) {
+	case json.Number:
+		parsed, err := number.Int64()
+		return err == nil && parsed >= 0
+	case int:
+		return number >= 0
+	case int64:
+		return number >= 0
+	case uint64:
+		return number <= uint64(^uint64(0)>>1)
+	default:
+		return false
+	}
 }
 
 func stripMessagesHostedSearchBlocks(root map[string]any) bool {
@@ -410,6 +884,296 @@ func validateChatEnvelope(root map[string]any) error {
 		}
 	}
 	return nil
+}
+
+func normalizeNativeChatRequiredFields(
+	root map[string]any,
+	route config.Route,
+	stream bool,
+	fallbackID string,
+	createdAt int64,
+) {
+	if root["error"] != nil {
+		return
+	}
+	if value, present := root["id"]; !present || value == nil {
+		root["id"] = fallbackID
+	}
+	if value, present := root["object"]; !present || value == nil {
+		if stream {
+			root["object"] = "chat.completion.chunk"
+		} else {
+			root["object"] = "chat.completion"
+		}
+	}
+	if value, present := root["created"]; !present || value == nil {
+		root["created"] = createdAt
+	}
+	if value, present := root["model"]; !present || value == nil {
+		root["model"] = responseModelForRoute(route)
+	}
+	if choices, _ := root["choices"].([]any); choices != nil {
+		for index, raw := range choices {
+			choice, _ := raw.(map[string]any)
+			if choice == nil {
+				continue
+			}
+			if value, present := choice["index"]; !present || value == nil {
+				choice["index"] = index
+			}
+			if stream {
+				continue
+			}
+			message, _ := choice["message"].(map[string]any)
+			if message == nil {
+				continue
+			}
+			if value, present := message["role"]; !present || value == nil {
+				message["role"] = "assistant"
+			}
+			if value, present := message["tool_calls"]; present && value == nil {
+				message["tool_calls"] = []any{}
+			}
+		}
+	}
+}
+
+func validateNativeChatEnvelope(root map[string]any) error {
+	if err := validateChatEnvelope(root); err != nil {
+		return err
+	}
+	if stringValue(root["object"]) != "chat.completion" {
+		return fmt.Errorf("Chat Completions response object must be %q", "chat.completion")
+	}
+	if err := validateNativeChatCommon(root); err != nil {
+		return err
+	}
+	for index, raw := range anySlice(root["choices"]) {
+		choice, _ := raw.(map[string]any)
+		if err := validateRequiredU32(choice, "index"); err != nil {
+			return fmt.Errorf("Chat Completions response choices[%d]: %w", index, err)
+		}
+		if err := validateChatFinishReason(choice["finish_reason"]); err != nil {
+			return fmt.Errorf("Chat Completions response choices[%d]: %w", index, err)
+		}
+		message, _ := choice["message"].(map[string]any)
+		if err := validateNativeChatMessage(message); err != nil {
+			return fmt.Errorf("Chat Completions response choices[%d].message: %w", index, err)
+		}
+	}
+	return nil
+}
+
+func validateNativeChatChunk(root map[string]any) error {
+	if strings.TrimSpace(stringValue(root["id"])) == "" {
+		return fmt.Errorf("Chat Completions SSE chunk id must be a non-empty string")
+	}
+	if stringValue(root["object"]) != "chat.completion.chunk" {
+		return fmt.Errorf("Chat Completions SSE chunk object must be %q", "chat.completion.chunk")
+	}
+	if err := validateNativeChatCommon(root); err != nil {
+		return err
+	}
+	choices, ok := root["choices"].([]any)
+	if !ok {
+		return fmt.Errorf("Chat Completions SSE choices must be an array")
+	}
+	for index, raw := range choices {
+		choice, ok := raw.(map[string]any)
+		if !ok || choice == nil {
+			return fmt.Errorf("Chat Completions SSE choices[%d] must be an object", index)
+		}
+		if err := validateRequiredU32(choice, "index"); err != nil {
+			return fmt.Errorf("Chat Completions SSE choices[%d]: %w", index, err)
+		}
+		if err := validateChatFinishReason(choice["finish_reason"]); err != nil {
+			return fmt.Errorf("Chat Completions SSE choices[%d]: %w", index, err)
+		}
+		delta, ok := choice["delta"].(map[string]any)
+		if !ok || delta == nil {
+			return fmt.Errorf("Chat Completions SSE choices[%d].delta must be an object", index)
+		}
+		if err := validateNativeChatDelta(delta); err != nil {
+			return fmt.Errorf("Chat Completions SSE choices[%d].delta: %w", index, err)
+		}
+	}
+	return nil
+}
+
+func validateNativeChatCommon(root map[string]any) error {
+	if !validNonNegativeInteger(root["created"]) {
+		return fmt.Errorf("Chat Completions created must be an unsigned integer")
+	}
+	if strings.TrimSpace(stringValue(root["model"])) == "" {
+		return fmt.Errorf("Chat Completions model must be a non-empty string")
+	}
+	if value, present := root["system_fingerprint"]; present && value != nil {
+		if _, ok := value.(string); !ok {
+			return fmt.Errorf("Chat Completions system_fingerprint must be a string")
+		}
+	}
+	if usage := root["usage"]; usage != nil {
+		values, ok := usage.(map[string]any)
+		if !ok || !validRequiredChatUsage(values) ||
+			!validChatUsageDetails(values, "prompt_tokens_details", "cached_tokens", "audio_tokens") ||
+			!validChatUsageDetails(
+				values,
+				"completion_tokens_details",
+				"reasoning_tokens",
+				"audio_tokens",
+				"accepted_prediction_tokens",
+				"rejected_prediction_tokens",
+			) || !validOptionalChatCost(values) {
+			return fmt.Errorf("Chat Completions usage is not compatible with Grok Build")
+		}
+	}
+	return nil
+}
+
+func validateNativeChatMessage(message map[string]any) error {
+	if message == nil {
+		return fmt.Errorf("must be an object")
+	}
+	if !validChatRole(message["role"]) {
+		return fmt.Errorf("role must be a non-empty string")
+	}
+	for _, key := range []string{"content", "reasoning_content", "tool_call_id"} {
+		if value, present := message[key]; present && value != nil {
+			if _, ok := value.(string); !ok {
+				return fmt.Errorf("%s must be a string", key)
+			}
+		}
+	}
+	if value, present := message["citations"]; present && value != nil {
+		citations, ok := value.([]any)
+		if !ok {
+			return fmt.Errorf("citations must be a string array")
+		}
+		for _, citation := range citations {
+			if _, ok := citation.(string); !ok {
+				return fmt.Errorf("citations must be a string array")
+			}
+		}
+	}
+	if value, present := message["tool_calls"]; present {
+		toolCalls, ok := value.([]any)
+		if !ok {
+			return fmt.Errorf("tool_calls must be an array")
+		}
+		for index, raw := range toolCalls {
+			toolCall, ok := raw.(map[string]any)
+			if !ok || toolCall == nil {
+				return fmt.Errorf("tool_calls[%d] must be an object", index)
+			}
+			for _, key := range []string{"id", "type"} {
+				if _, ok := toolCall[key].(string); !ok {
+					return fmt.Errorf("tool_calls[%d].%s must be a string", index, key)
+				}
+			}
+			function, ok := toolCall["function"].(map[string]any)
+			if !ok || function == nil {
+				return fmt.Errorf("tool_calls[%d].function must be an object", index)
+			}
+			for _, key := range []string{"name", "arguments"} {
+				if _, ok := function[key].(string); !ok {
+					return fmt.Errorf("tool_calls[%d].function.%s must be a string", index, key)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func validateNativeChatDelta(delta map[string]any) error {
+	if value, present := delta["role"]; present && value != nil && !validChatRole(value) {
+		return fmt.Errorf("role must be a non-empty string")
+	}
+	for _, key := range []string{"content", "reasoning_content", "tool_call_id"} {
+		if value, present := delta[key]; present && value != nil {
+			if _, ok := value.(string); !ok {
+				return fmt.Errorf("%s must be a string", key)
+			}
+		}
+	}
+	if value, present := delta["tool_calls"]; present && value != nil {
+		toolCalls, ok := value.([]any)
+		if !ok {
+			return fmt.Errorf("tool_calls must be an array")
+		}
+		for index, raw := range toolCalls {
+			toolCall, ok := raw.(map[string]any)
+			if !ok || toolCall == nil {
+				return fmt.Errorf("tool_calls[%d] must be an object", index)
+			}
+			if value, present := toolCall["index"]; present {
+				if _, _, valid := optionalCanonicalToken(toolCall, "index"); !valid || value == nil {
+					return fmt.Errorf("tool_calls[%d].index must be an unsigned 32-bit integer", index)
+				}
+			}
+			for _, key := range []string{"id", "type"} {
+				if value, present := toolCall[key]; present && value != nil {
+					if _, ok := value.(string); !ok {
+						return fmt.Errorf("tool_calls[%d].%s must be a string", index, key)
+					}
+				}
+			}
+			if value, present := toolCall["function"]; present && value != nil {
+				function, ok := value.(map[string]any)
+				if !ok {
+					return fmt.Errorf("tool_calls[%d].function must be an object", index)
+				}
+				for _, key := range []string{"name", "arguments"} {
+					if value, present := function[key]; present && value != nil {
+						if _, ok := value.(string); !ok {
+							return fmt.Errorf("tool_calls[%d].function.%s must be a string", index, key)
+						}
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func validateChatFinishReason(value any) error {
+	if value == nil {
+		return nil
+	}
+	if _, ok := value.(string); !ok {
+		return fmt.Errorf("finish_reason must be a string")
+	}
+	return nil
+}
+
+func validateRequiredU32(values map[string]any, key string) error {
+	_, present, valid := optionalCanonicalToken(values, key)
+	if !present || !valid {
+		return fmt.Errorf("%s must be an unsigned 32-bit integer", key)
+	}
+	return nil
+}
+
+func validChatRole(value any) bool {
+	role, ok := value.(string)
+	return ok && strings.TrimSpace(role) != ""
+}
+
+func validNonNegativeInteger(value any) bool {
+	switch number := value.(type) {
+	case json.Number:
+		parsed, err := number.Int64()
+		return err == nil && parsed >= 0
+	case float64:
+		return number >= 0 && number <= float64(^uint64(0)>>1) && number == float64(uint64(number))
+	case int:
+		return number >= 0
+	case int64:
+		return number >= 0
+	case uint64:
+		return true
+	default:
+		return false
+	}
 }
 
 func validateResponsesEventPayload(data []byte) error {
@@ -487,11 +1251,35 @@ func canonicalResponse(route config.Route, request facadeRequest, result canonic
 	now := time.Now().Unix()
 	status := "completed"
 	var incomplete any
-	if result.IncompleteReason != "" {
+	var responseError any
+	if result.FailureCode != "" {
+		status = "failed"
+		responseError = map[string]any{"code": result.FailureCode, "message": result.FailureMessage}
+	} else if result.IncompleteReason != "" {
 		status = "incomplete"
 		incomplete = map[string]any{"reason": result.IncompleteReason}
 	}
-	total := result.InputTokens + result.OutputTokens
+	var usage any
+	if result.UsagePresent {
+		measurement := map[string]any{
+			"input_tokens":  result.InputTokens,
+			"output_tokens": result.OutputTokens,
+			"total_tokens":  result.TotalTokens,
+			"input_tokens_details": map[string]any{
+				"cached_tokens": result.CachedTokens,
+			},
+			"output_tokens_details": map[string]any{
+				"reasoning_tokens": result.ReasoningTokens,
+			},
+		}
+		if result.LiveContextPresent {
+			measurement["context_details"] = map[string]any{
+				"input_tokens":  result.InputTokens,
+				"output_tokens": result.OutputTokens,
+			}
+		}
+		usage = measurement
+	}
 	output := result.Output
 	if output == nil {
 		output = []any{}
@@ -503,13 +1291,13 @@ func canonicalResponse(route config.Route, request facadeRequest, result canonic
 		"completed_at":           now,
 		"status":                 status,
 		"background":             false,
-		"error":                  nil,
+		"error":                  responseError,
 		"incomplete_details":     incomplete,
 		"instructions":           nil,
 		"max_output_tokens":      nil,
 		"max_tool_calls":         nil,
 		"metadata":               map[string]any{},
-		"model":                  route.WireModel,
+		"model":                  responseModelForRoute(route),
 		"output":                 output,
 		"parallel_tool_calls":    true,
 		"previous_response_id":   nil,
@@ -526,18 +1314,8 @@ func canonicalResponse(route config.Route, request facadeRequest, result canonic
 		"top_logprobs":           0,
 		"top_p":                  1,
 		"truncation":             "disabled",
-		"usage": map[string]any{
-			"input_tokens":  result.InputTokens,
-			"output_tokens": result.OutputTokens,
-			"total_tokens":  total,
-			"input_tokens_details": map[string]any{
-				"cached_tokens": result.CachedTokens,
-			},
-			"output_tokens_details": map[string]any{
-				"reasoning_tokens": result.ReasoningTokens,
-			},
-		},
-		"user": nil,
+		"usage":                  usage,
+		"user":                   nil,
 	}
 }
 
@@ -600,6 +1378,8 @@ func writeCanonicalResponse(w http.ResponseWriter, response map[string]any, stre
 	terminal := "response.completed"
 	if stringValue(response["status"]) == "incomplete" {
 		terminal = "response.incomplete"
+	} else if stringValue(response["status"]) == "failed" {
+		terminal = "response.failed"
 	}
 	emit(terminal, map[string]any{"response": response})
 	return nil

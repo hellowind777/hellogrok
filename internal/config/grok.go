@@ -15,23 +15,50 @@ import (
 
 // Model is one [model.*] entry from Grok config.toml.
 type Model struct {
-	ID                    string
-	Model                 string
-	Name                  string
-	BaseURL               string
-	APIBaseURL            string
-	APIBackend            string
+	ID         string
+	Model      string
+	Name       string
+	BaseURL    string
+	APIBaseURL string
+	APIBackend string
+	// APIBackendConfigured distinguishes an explicit model/provider protocol
+	// from the protocol inherited by Grok Build from its model catalog.
+	APIBackendConfigured  bool
 	ChatSearchDialect     ChatSearchDialect
 	SupportsBackendSearch bool
-	AuthScheme            string
-	IncomingAuthScheme    string
-	APIKey                string
-	EnvKey                string // single name or first of array (resolved later)
-	EnvKeys               []string
-	AuthProvider          string
-	DynamicAuth           bool
-	ExtraHeaders          map[string]string
-	EnvHTTPHeaders        map[string]string
+	// SupportsBackendSearchConfigured distinguishes an explicit false from an
+	// omitted capability so first-party providers can supply documented defaults.
+	SupportsBackendSearchConfigured bool
+	// ReasoningEffortConfigured records whether the model explicitly declares
+	// supports_reasoning_effort or reasoning_efforts. Provider tables do not
+	// expose these fields in Grok Build, so only [model.*] participates.
+	ReasoningEffortConfigured bool
+	// ReasoningEffortEnabled tells the protocol facade whether an omitted
+	// Messages effort can represent the user's explicit None selection.
+	ReasoningEffortEnabled bool
+	// ContextWindowConfigured distinguishes a user-selected model/provider
+	// window from a remotely discovered maximum. Grok Build must keep the
+	// configured value as the auto-compaction denominator when it is present.
+	ContextWindow           uint64
+	ContextWindowConfigured bool
+	// MaxCompletionTokensConfigured keeps remote metadata from replacing an
+	// explicit model/provider output cap.
+	MaxCompletionTokens           uint64
+	MaxCompletionTokensConfigured bool
+	// InferenceIdleTimeoutSecs mirrors Grok Build's per-chunk timeout. The
+	// facade also uses it while waiting for upstream response headers, a phase
+	// Grok Build's stream-level timer does not cover.
+	InferenceIdleTimeoutSecs       uint64
+	InferenceIdleTimeoutConfigured bool
+	AuthScheme                     string
+	IncomingAuthScheme             string
+	APIKey                         string
+	EnvKey                         string // single name or first of array (resolved later)
+	EnvKeys                        []string
+	AuthProvider                   string
+	DynamicAuth                    bool
+	ExtraHeaders                   map[string]string
+	EnvHTTPHeaders                 map[string]string
 }
 
 // ChatSearchDialect identifies the provider extension used to enable hosted
@@ -62,6 +89,10 @@ type Route struct {
 	Host       string // e.g. congee.pro
 	OriginBase string // effective upstream base_url before proxy rewriting
 	APIBackend string // original upstream backend
+	// APIBackendConfigured is false when Grok Build is free to inherit the
+	// effective protocol from its local or remote model catalog. In that case
+	// the facade follows the protocol of the request Grok Build actually sends.
+	APIBackendConfigured bool
 	// ChatSearchDialect selects the provider extension used both by the fixed
 	// Responses-to-Chat WebSearchClient adapter and native Chat search promotion.
 	ChatSearchDialect ChatSearchDialect
@@ -80,6 +111,36 @@ type Route struct {
 	// web_search declaration to this channel's hosted search API. False keeps
 	// Build's configured client-search model or authenticated official fallback.
 	SupportsBackendSearch bool
+	// SupportsBackendSearchConfigured preserves an explicit user opt-out from a
+	// provider capability that hellogrok can otherwise infer deterministically.
+	SupportsBackendSearchConfigured bool
+	// DefaultSearchModel records the runtime selection made through
+	// [models].web_search or GROK_WEB_SEARCH_MODEL. A selected custom route is
+	// exposed to Grok Build as hosted-search capable while the facade is active.
+	DefaultSearchModel        bool
+	ReasoningEffortConfigured bool
+	ReasoningEffortEnabled    bool
+	// ContextWindow is the effective explicit [model.*] or inherited
+	// [model_providers.*] value. When it is not configured, the facade leaves
+	// provider model-metadata responses free to supply the maximum window.
+	ContextWindow                  uint64
+	ContextWindowConfigured        bool
+	MaxCompletionTokens            uint64
+	MaxCompletionTokensConfigured  bool
+	InferenceIdleTimeoutSecs       uint64
+	InferenceIdleTimeoutConfigured bool
+}
+
+// IsOfficialDeepSeekRoute identifies DeepSeek's first-party API independently
+// of model name so rolling aliases and future models inherit protocol handling.
+// Relays that reuse a DeepSeek model name deliberately do not qualify.
+func IsOfficialDeepSeekRoute(route Route) bool {
+	host := strings.ToLower(strings.TrimSpace(route.Host))
+	if parsedHost, _, err := net.SplitHostPort(host); err == nil {
+		host = parsedHost
+	}
+	host = strings.Trim(host, "[]")
+	return host == "api.deepseek.com"
 }
 
 // WebSearchSelection is an explicitly selected Build client-search model.
@@ -128,10 +189,11 @@ func LoadModels(path string) ([]Model, error) {
 	for name, rawProvider := range authProviderTable {
 		usableAuthProviders[name] = usableAuthProvider(rawProvider)
 	}
+	modelsConfig, _ := root["models"].(map[string]any)
 	globalHeaders := map[string]string{}
-	if models, _ := root["models"].(map[string]any); models != nil {
+	if modelsConfig != nil {
 		var headerErr error
-		globalHeaders, headerErr = configuredRouteHeaders(models["extra_headers"], "[models].extra_headers")
+		globalHeaders, headerErr = configuredRouteHeaders(modelsConfig["extra_headers"], "[models].extra_headers")
 		if headerErr != nil {
 			return nil, headerErr
 		}
@@ -150,6 +212,7 @@ func LoadModels(path string) ([]Model, error) {
 		baseURL := inheritedString(m, provider, "base_url")
 		apiBaseURL := inheritedString(m, provider, "api_base_url")
 		apiBackend := normalizeAPIBackend(inheritedString(m, provider, "api_backend"))
+		apiBackendConfigured := inheritedFieldExists(m, provider, "api_backend")
 		chatSearchDialect, err := normalizeChatSearchDialect(inheritedString(m, provider, "chat_search_dialect"))
 		if err != nil {
 			return nil, fmt.Errorf("[model.%s].chat_search_dialect %w", id, err)
@@ -157,6 +220,37 @@ func LoadModels(path string) ([]Model, error) {
 		supportsBackendSearch, err := inheritedBool(m, provider, "supports_backend_search")
 		if err != nil {
 			return nil, fmt.Errorf("[model.%s].supports_backend_search %w", id, err)
+		}
+		supportsBackendSearchConfigured := inheritedFieldExists(m, provider, "supports_backend_search")
+		supportsReasoningEffort, err := inheritedBool(m, nil, "supports_reasoning_effort")
+		if err != nil {
+			return nil, fmt.Errorf("[model.%s].supports_reasoning_effort %w", id, err)
+		}
+		reasoningEffortsConfigured := false
+		reasoningEffortsEnabled := false
+		if rawEfforts, exists := m["reasoning_efforts"]; exists {
+			reasoningEffortsConfigured = true
+			efforts, ok := rawEfforts.([]any)
+			if !ok {
+				return nil, fmt.Errorf("[model.%s].reasoning_efforts must be an array", id)
+			}
+			reasoningEffortsEnabled = len(efforts) > 0
+		}
+		reasoningEffortConfigured := inheritedFieldExists(m, nil, "supports_reasoning_effort") || reasoningEffortsConfigured
+		contextWindow, contextWindowConfigured, err := inheritedPositiveUint64(m, provider, "context_window")
+		if err != nil {
+			return nil, fmt.Errorf("[model.%s].context_window %w", id, err)
+		}
+		maxCompletionTokens, maxCompletionTokensConfigured, err := inheritedPositiveUint64(m, provider, "max_completion_tokens")
+		if err != nil {
+			return nil, fmt.Errorf("[model.%s].max_completion_tokens %w", id, err)
+		}
+		if maxCompletionTokens > uint64(^uint32(0)) {
+			return nil, fmt.Errorf("[model.%s].max_completion_tokens must be between 1 and %d", id, uint64(^uint32(0)))
+		}
+		inferenceIdleTimeoutSecs, inferenceIdleTimeoutConfigured, err := inheritedUint64(m, modelsConfig, "inference_idle_timeout_secs")
+		if err != nil {
+			return nil, fmt.Errorf("[model.%s].inference_idle_timeout_secs %w", id, err)
 		}
 
 		modelEnvKeys := envKeyList(m["env_key"])
@@ -215,23 +309,33 @@ func LoadModels(path string) ([]Model, error) {
 			upstreamAuthScheme = normalizeAuthScheme(inheritedString(nil, provider, "auth_scheme"))
 		}
 		out = append(out, Model{
-			ID:                    id,
-			Model:                 str(m["model"]),
-			Name:                  str(m["name"]),
-			BaseURL:               baseURL,
-			APIBaseURL:            apiBaseURL,
-			APIBackend:            apiBackend,
-			ChatSearchDialect:     chatSearchDialect,
-			SupportsBackendSearch: supportsBackendSearch,
-			AuthScheme:            upstreamAuthScheme,
-			IncomingAuthScheme:    modelAuthScheme,
-			APIKey:                apiKey,
-			EnvKeys:               envKeys,
-			EnvKey:                first(envKeys),
-			AuthProvider:          authProvider,
-			DynamicAuth:           dynamicAuth,
-			ExtraHeaders:          extraHeaders,
-			EnvHTTPHeaders:        envHTTPHeaders,
+			ID:                              id,
+			Model:                           str(m["model"]),
+			Name:                            str(m["name"]),
+			BaseURL:                         baseURL,
+			APIBaseURL:                      apiBaseURL,
+			APIBackend:                      apiBackend,
+			APIBackendConfigured:            apiBackendConfigured,
+			ChatSearchDialect:               chatSearchDialect,
+			SupportsBackendSearch:           supportsBackendSearch,
+			SupportsBackendSearchConfigured: supportsBackendSearchConfigured,
+			ReasoningEffortConfigured:       reasoningEffortConfigured,
+			ReasoningEffortEnabled:          supportsReasoningEffort || reasoningEffortsEnabled,
+			ContextWindow:                   contextWindow,
+			ContextWindowConfigured:         contextWindowConfigured,
+			MaxCompletionTokens:             maxCompletionTokens,
+			MaxCompletionTokensConfigured:   maxCompletionTokensConfigured,
+			InferenceIdleTimeoutSecs:        inferenceIdleTimeoutSecs,
+			InferenceIdleTimeoutConfigured:  inferenceIdleTimeoutConfigured,
+			AuthScheme:                      upstreamAuthScheme,
+			IncomingAuthScheme:              modelAuthScheme,
+			APIKey:                          apiKey,
+			EnvKeys:                         envKeys,
+			EnvKey:                          first(envKeys),
+			AuthProvider:                    authProvider,
+			DynamicAuth:                     dynamicAuth,
+			ExtraHeaders:                    extraHeaders,
+			EnvHTTPHeaders:                  envHTTPHeaders,
 		})
 	}
 	return out, nil
@@ -275,6 +379,136 @@ func inheritedBool(model, provider map[string]any, key string) (bool, error) {
 		return value, nil
 	}
 	return false, nil
+}
+
+func inheritedFieldExists(model, provider map[string]any, key string) bool {
+	for _, values := range []map[string]any{model, provider} {
+		if values == nil {
+			continue
+		}
+		if _, exists := values[key]; exists {
+			return true
+		}
+	}
+	return false
+}
+
+func inheritedPositiveUint64(model, provider map[string]any, key string) (uint64, bool, error) {
+	for _, values := range []map[string]any{model, provider} {
+		if values == nil {
+			continue
+		}
+		raw, exists := values[key]
+		if !exists {
+			continue
+		}
+		value, ok := positiveUint64(raw)
+		if !ok {
+			return 0, false, fmt.Errorf("must be a positive integer")
+		}
+		return value, true, nil
+	}
+	return 0, false, nil
+}
+
+func inheritedUint64(model, fallback map[string]any, key string) (uint64, bool, error) {
+	for _, values := range []map[string]any{model, fallback} {
+		if values == nil {
+			continue
+		}
+		raw, exists := values[key]
+		if !exists {
+			continue
+		}
+		value, ok := nonNegativeUint64(raw)
+		if !ok {
+			return 0, false, fmt.Errorf("must be a non-negative integer")
+		}
+		return value, true, nil
+	}
+	return 0, false, nil
+}
+
+func nonNegativeUint64(value any) (uint64, bool) {
+	switch typed := value.(type) {
+	case int:
+		if typed >= 0 {
+			return uint64(typed), true
+		}
+	case int8:
+		if typed >= 0 {
+			return uint64(typed), true
+		}
+	case int16:
+		if typed >= 0 {
+			return uint64(typed), true
+		}
+	case int32:
+		if typed >= 0 {
+			return uint64(typed), true
+		}
+	case int64:
+		if typed >= 0 {
+			return uint64(typed), true
+		}
+	case uint:
+		return uint64(typed), true
+	case uint8:
+		return uint64(typed), true
+	case uint16:
+		return uint64(typed), true
+	case uint32:
+		return uint64(typed), true
+	case uint64:
+		return typed, true
+	}
+	return 0, false
+}
+
+func positiveUint64(value any) (uint64, bool) {
+	switch typed := value.(type) {
+	case int:
+		if typed > 0 {
+			return uint64(typed), true
+		}
+	case int8:
+		if typed > 0 {
+			return uint64(typed), true
+		}
+	case int16:
+		if typed > 0 {
+			return uint64(typed), true
+		}
+	case int32:
+		if typed > 0 {
+			return uint64(typed), true
+		}
+	case int64:
+		if typed > 0 {
+			return uint64(typed), true
+		}
+	case uint:
+		if typed > 0 {
+			return uint64(typed), true
+		}
+	case uint8:
+		if typed > 0 {
+			return uint64(typed), true
+		}
+	case uint16:
+		if typed > 0 {
+			return uint64(typed), true
+		}
+	case uint32:
+		if typed > 0 {
+			return uint64(typed), true
+		}
+	case uint64:
+		if typed > 0 {
+			return typed, true
+		}
+	}
+	return 0, false
 }
 
 // LoadWebSearchSelection resolves only explicit client-search choices. The
@@ -453,6 +687,12 @@ func EffectiveOriginBase(baseURL string) string {
 func BuildRoutes(models []Model) ([]Route, error) {
 	var out []Route
 	for _, m := range models {
+		if m.ContextWindowConfigured && m.ContextWindow == 0 {
+			return nil, fmt.Errorf("model %q context window must be greater than zero", m.ID)
+		}
+		if m.MaxCompletionTokensConfigured && (m.MaxCompletionTokens == 0 || m.MaxCompletionTokens > uint64(^uint32(0))) {
+			return nil, fmt.Errorf("model %q max completion tokens must be between 1 and %d", m.ID, uint64(^uint32(0)))
+		}
 		key := ResolveAPIKey(m)
 		origin := m.BaseURL
 		// Grok Build uses base_url for a model-owned api_key/env_key, an
@@ -496,10 +736,7 @@ func BuildRoutes(models []Model) ([]Route, error) {
 			displayHost = net.JoinHostPort(host, u.Port())
 		}
 		backend := strings.TrimSpace(strings.ToLower(m.APIBackend))
-		if backend == "" {
-			backend = "chat_completions"
-		}
-		if backend != "responses" && backend != "messages" && backend != "chat_completions" {
+		if backend != "" && backend != "responses" && backend != "messages" && backend != "chat_completions" {
 			return nil, fmt.Errorf("model %q uses unsupported api_backend %q", m.ID, backend)
 		}
 		wireModel := strings.TrimSpace(m.Model)
@@ -518,20 +755,37 @@ func BuildRoutes(models []Model) ([]Route, error) {
 		if err != nil {
 			return nil, fmt.Errorf("model %q has invalid HTTP headers: %w", m.ID, err)
 		}
-		out = append(out, Route{
-			ChannelID:             m.ID,
-			Host:                  displayHost,
-			OriginBase:            origin,
-			APIBackend:            backend,
-			ChatSearchDialect:     m.ChatSearchDialect,
-			WireModel:             wireModel,
-			APIKey:                key,
-			AuthScheme:            authScheme,
-			IncomingAuthScheme:    incomingAuthScheme,
-			DynamicAuth:           m.DynamicAuth && key == "",
-			ExtraHeaders:          extraHeaders,
-			SupportsBackendSearch: m.SupportsBackendSearch,
-		})
+		route := Route{
+			ChannelID:                       m.ID,
+			Host:                            displayHost,
+			OriginBase:                      origin,
+			APIBackend:                      backend,
+			APIBackendConfigured:            m.APIBackendConfigured,
+			ChatSearchDialect:               m.ChatSearchDialect,
+			WireModel:                       wireModel,
+			APIKey:                          key,
+			AuthScheme:                      authScheme,
+			IncomingAuthScheme:              incomingAuthScheme,
+			DynamicAuth:                     m.DynamicAuth && key == "",
+			ExtraHeaders:                    extraHeaders,
+			SupportsBackendSearch:           m.SupportsBackendSearch,
+			SupportsBackendSearchConfigured: m.SupportsBackendSearchConfigured,
+			ReasoningEffortConfigured:       m.ReasoningEffortConfigured,
+			ReasoningEffortEnabled:          m.ReasoningEffortEnabled,
+			ContextWindow:                   m.ContextWindow,
+			ContextWindowConfigured:         m.ContextWindowConfigured,
+			MaxCompletionTokens:             m.MaxCompletionTokens,
+			MaxCompletionTokensConfigured:   m.MaxCompletionTokensConfigured,
+			InferenceIdleTimeoutSecs:        m.InferenceIdleTimeoutSecs,
+			InferenceIdleTimeoutConfigured:  m.InferenceIdleTimeoutConfigured,
+		}
+		// DeepSeek documents the effort surface at the first-party protocol
+		// endpoints. Keep this independent of model IDs so rolling aliases and
+		// future models inherit it without a hellogrok release.
+		if !route.ReasoningEffortConfigured && IsOfficialDeepSeekRoute(route) {
+			route.ReasoningEffortEnabled = true
+		}
+		out = append(out, route)
 	}
 	return out, nil
 }

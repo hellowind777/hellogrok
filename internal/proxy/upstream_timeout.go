@@ -5,16 +5,84 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/http"
 	"sync"
 	"time"
+
+	"github.com/hellowind777/hellogrok/internal/config"
 )
 
 const (
-	defaultUpstreamResponseHeaderTimeout = 3 * time.Minute
-	defaultUpstreamStreamIdleTimeout     = 3 * time.Minute
+	upstreamTimeoutGrace = time.Second
+
+	// Grok Build's shell default is 600 seconds per inference idle interval.
+	// Keep the facade one second behind that boundary so Grok Build owns the
+	// timeout classification instead of receiving an earlier gateway error.
+	defaultUpstreamResponseHeaderTimeout = 10*time.Minute + upstreamTimeoutGrace
+	defaultUpstreamBodyIdleTimeout       = 10*time.Minute + upstreamTimeoutGrace
+	defaultDeepSeekResponseHeaderTimeout = 11 * time.Minute
+	defaultDeepSeekBodyIdleTimeout       = 11 * time.Minute
+	minimumInferenceIdleTimeout          = 10 * time.Second
 )
 
-var errUpstreamStreamIdleTimeout = errors.New("upstream SSE stream idle timeout")
+var (
+	errUpstreamBodyIdleTimeout       = errors.New("upstream response body idle timeout")
+	errUpstreamResponseHeaderTimeout = errors.New("upstream response header timeout")
+)
+
+// routeUpstreamIdleTimeout keeps hellogrok just behind Grok Build's configured
+// per-chunk deadline. The small grace prevents the proxy from winning a timer
+// race and replacing Grok Build's native IdleTimeout with a gateway error.
+func routeUpstreamIdleTimeout(route config.Route, fallback time.Duration) time.Duration {
+	if !route.InferenceIdleTimeoutConfigured {
+		return fallback
+	}
+	const maxDuration = time.Duration(1<<63 - 1)
+	seconds := route.InferenceIdleTimeoutSecs
+	if seconds < uint64(minimumInferenceIdleTimeout/time.Second) {
+		seconds = uint64(minimumInferenceIdleTimeout / time.Second)
+	}
+	maxSeconds := uint64((maxDuration - upstreamTimeoutGrace) / time.Second)
+	if seconds >= maxSeconds {
+		return maxDuration
+	}
+	return time.Duration(seconds)*time.Second + upstreamTimeoutGrace
+}
+
+// doUpstreamRequest applies a deadline only until response headers arrive.
+// http.Client.Timeout would also cap a healthy long-running stream.
+func doUpstreamRequest(client *http.Client, request *http.Request, timeout time.Duration, cancel context.CancelFunc) (*http.Response, error) {
+	if timeout <= 0 {
+		return client.Do(request)
+	}
+
+	var stateMu sync.Mutex
+	returned := false
+	timedOut := false
+	timer := time.AfterFunc(timeout, func() {
+		stateMu.Lock()
+		defer stateMu.Unlock()
+		if returned {
+			return
+		}
+		timedOut = true
+		cancel()
+	})
+
+	response, err := client.Do(request)
+	stateMu.Lock()
+	returned = true
+	headerTimedOut := timedOut
+	stateMu.Unlock()
+	_ = timer.Stop()
+	if headerTimedOut {
+		if response != nil && response.Body != nil {
+			_ = response.Body.Close()
+		}
+		return nil, errUpstreamResponseHeaderTimeout
+	}
+	return response, err
+}
 
 type idleTimeoutReadCloser struct {
 	body       io.ReadCloser
@@ -25,7 +93,7 @@ type idleTimeoutReadCloser struct {
 	timedOut   bool
 }
 
-func withStreamIdleTimeout(body io.ReadCloser, timeout time.Duration) io.ReadCloser {
+func withBodyIdleTimeout(body io.ReadCloser, timeout time.Duration) io.ReadCloser {
 	if body == nil || timeout <= 0 {
 		return body
 	}
@@ -38,7 +106,7 @@ func (reader *idleTimeoutReadCloser) Read(buffer []byte) (int, error) {
 		timedOut := reader.timedOut
 		reader.mu.Unlock()
 		if timedOut {
-			return 0, errUpstreamStreamIdleTimeout
+			return 0, errUpstreamBodyIdleTimeout
 		}
 		return 0, io.ErrClosedPipe
 	}
@@ -64,7 +132,7 @@ func (reader *idleTimeoutReadCloser) Read(buffer []byte) (int, error) {
 		if count > 0 {
 			return count, nil
 		}
-		return 0, errUpstreamStreamIdleTimeout
+		return 0, errUpstreamBodyIdleTimeout
 	}
 	if closed && count == 0 && err == nil {
 		return 0, io.ErrClosedPipe
@@ -98,7 +166,7 @@ func (reader *idleTimeoutReadCloser) expire(generation uint64) {
 }
 
 func isUpstreamTimeout(err error) bool {
-	if errors.Is(err, context.DeadlineExceeded) {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, errUpstreamResponseHeaderTimeout) {
 		return true
 	}
 	var networkError net.Error
@@ -106,7 +174,7 @@ func isUpstreamTimeout(err error) bool {
 }
 
 func upstreamStreamFailureMessage(protocol string, err error) string {
-	if errors.Is(err, errUpstreamStreamIdleTimeout) {
+	if errors.Is(err, errUpstreamBodyIdleTimeout) {
 		return "upstream " + protocol + " stream timed out waiting for data"
 	}
 	return "upstream " + protocol + " stream failed"
