@@ -1504,9 +1504,7 @@ func messageSearchSources(value any) ([]any, bool) {
 		}
 		if rawURL := stringValue(entry["url"]); rawURL != "" {
 			source := map[string]any{"type": "url", "url": rawURL}
-			if title := stringValue(entry["title"]); title != "" {
-				source["title"] = title
-			}
+			copyIfPresent(source, entry, "title", "page_age", "encrypted_content")
 			sources = append(sources, source)
 		}
 	}
@@ -1611,6 +1609,7 @@ func backfillResponseSearchSources(response map[string]any, hosted bool, query s
 	structuredURLs := collectCitationURLs(response)
 	var textURLs []string
 	firstMessage := len(output)
+	changed := false
 	for index, raw := range output {
 		item, _ := raw.(map[string]any)
 		if item == nil {
@@ -1620,6 +1619,12 @@ func backfillResponseSearchSources(response map[string]any, hosted bool, query s
 		case "web_search_call":
 			calls = append(calls, item)
 			if action, _ := item["action"].(map[string]any); action != nil {
+				if strings.TrimSpace(stringValue(action["query"])) == "" {
+					if nativeQuery := firstSearchQuery(action["queries"]); nativeQuery != "" {
+						action["query"] = nativeQuery
+						changed = true
+					}
+				}
 				structuredURLs = mergeUniqueStrings(structuredURLs, urlsFromJSON(action["sources"])...)
 			}
 		case "message":
@@ -1641,7 +1646,6 @@ func backfillResponseSearchSources(response map[string]any, hosted bool, query s
 	if !confirmed {
 		return false
 	}
-	changed := false
 	if len(calls) == 0 {
 		call := webSearchItem("", query, nil, "completed")
 		output = append(output, nil)
@@ -1691,6 +1695,12 @@ func mergeResponseSearchURLs(response map[string]any, urls []string) bool {
 		return false
 	}
 	action, _ := target["action"].(map[string]any)
+	// Provider-native source objects may carry opaque replay state (for example
+	// DeepSeek web_search_result encrypted_content). Once authoritative sources
+	// exist, do not mix citation-only URLs into that replayable result set.
+	if len(urlsFromJSON(action["sources"])) > 0 {
+		return false
+	}
 	before := len(anySlice(action["sources"]))
 	mergeWebSearchSources(target, urlsToSources(urls))
 	return len(anySlice(action["sources"])) > before

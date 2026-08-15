@@ -334,6 +334,28 @@ func TestSearchEvidenceCountsWithoutLoggingQueriesOrURLs(t *testing.T) {
 }
 
 func TestSearchSourcesCoverResponsesAndChatMetadataVariants(t *testing.T) {
+	deepSeekNative := map[string]any{
+		"output": []any{
+			map[string]any{"type": "web_search_call", "id": "ws_ds_1", "status": "completed", "action": map[string]any{
+				"type": "search", "queries": []any{"ws_call_id=ws_ds_1", "DeepSeek Responses API"},
+			}},
+			map[string]any{"type": "web_search_call", "id": "ws_ds_2", "status": "completed", "action": map[string]any{
+				"type": "search", "queries": []any{"DeepSeek include support"},
+			}},
+			messageItem("answer", nil),
+		},
+	}
+	if !backfillResponseSearchSources(deepSeekNative, true, "original user request") {
+		t.Fatal("DeepSeek native search queries were not normalized")
+	}
+	deepSeekOutput := anySlice(deepSeekNative["output"])
+	firstAction := deepSeekOutput[0].(map[string]any)["action"].(map[string]any)
+	secondAction := deepSeekOutput[1].(map[string]any)["action"].(map[string]any)
+	if firstAction["query"] != "DeepSeek Responses API" || secondAction["query"] != "DeepSeek include support" ||
+		len(anySlice(firstAction["queries"])) != 2 {
+		t.Fatalf("DeepSeek Responses queries were not preserved and exposed to Build: %#v", deepSeekNative)
+	}
+
 	responses := map[string]any{
 		"output": []any{
 			webSearchItem("ws_1", "current news", nil, "completed"),
@@ -344,6 +366,24 @@ func TestSearchSourcesCoverResponsesAndChatMetadataVariants(t *testing.T) {
 	backfillResponseSearchSources(responses, true, "current news")
 	if urls := urlsFromJSON(responses["output"]); len(urls) != 1 || urls[0] != "https://responses.example/source" {
 		t.Fatalf("Responses top-level citations were not normalized: %#v", responses)
+	}
+	authoritative := map[string]any{
+		"output": []any{
+			webSearchItem("ws_2", "current news", []any{map[string]any{
+				"type": "url", "url": "https://provider.example/source",
+				"title": "Provider", "encrypted_content": "search-state",
+			}}, "completed"),
+			messageItem("also see https://answer.example/extra", []any{map[string]any{
+				"type": "url_citation", "url": "https://answer.example/extra",
+			}}),
+		},
+	}
+	backfillResponseSearchSources(authoritative, true, "current news")
+	call := anySlice(authoritative["output"])[0].(map[string]any)
+	action := call["action"].(map[string]any)
+	sources := anySlice(action["sources"])
+	if len(sources) != 1 || sources[0].(map[string]any)["encrypted_content"] != "search-state" {
+		t.Fatalf("provider-native sources were mixed with citation-only URLs: %#v", authoritative)
 	}
 
 	chatVariants := []struct {

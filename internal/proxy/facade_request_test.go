@@ -411,6 +411,23 @@ func TestBuildClientSearchFingerprintUsesStableRequestShape(t *testing.T) {
 	}
 }
 
+func TestBuildClientSearchPreservesAutomaticToolChoiceForFinalText(t *testing.T) {
+	root, err := decodeRequestObject(buildClientSearchBody("current news"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	hosted, x := summarizeSearchCounts(root)
+	if !prepareClientSearchExecution(root, hosted, x) {
+		t.Fatal("WebSearchClient request was not recognized")
+	}
+	if _, exists := root["tool_choice"]; exists {
+		t.Fatalf("automatic tool choice was forced into a server-tool loop: %#v", root["tool_choice"])
+	}
+	if !strings.Contains(stringValue(root["instructions"]), "always return a concise final text synthesis") {
+		t.Fatalf("client search synthesis instruction missing: %#v", root["instructions"])
+	}
+}
+
 func TestSearchAdapterMapsMessagesAndChatDialects(t *testing.T) {
 	body := buildClientSearchBodyWithTool("q", map[string]any{
 		"type":          "web_search",
@@ -452,7 +469,7 @@ func TestSearchAdapterMapsMessagesAndChatDialects(t *testing.T) {
 	xaiRoot, _ := decodeRequestObject(xai.Body)
 	parameters, _ := xaiRoot["search_parameters"].(map[string]any)
 	sources := anySlice(parameters["sources"])
-	if parameters["mode"] != "on" || len(sources) != 1 ||
+	if parameters["mode"] != "auto" || len(sources) != 1 ||
 		len(anySlice(sources[0].(map[string]any)["allowed_websites"])) != 2 {
 		t.Fatalf("xAI search dialect=%#v", xaiRoot)
 	}
@@ -480,10 +497,10 @@ func TestChatSearchDialectUsesExplicitOrOfficialHostCapabilities(t *testing.T) {
 	if got := chatSearchDialect(config.Route{Host: "api.x.ai"}); got != config.ChatSearchDialectResponses {
 		t.Fatalf("official xAI host default=%q", got)
 	}
-	if got := chatSearchDialect(config.Route{Host: "api.deepseek.com", WireModel: "deepseek-v4-pro"}); got != config.ChatSearchDialectResponses {
+	if got := chatSearchDialect(config.Route{Host: "api.deepseek.com", WireModel: "deepseek-v4-pro"}); got != config.ChatSearchDialectMessages {
 		t.Fatalf("official DeepSeek V4 host default=%q", got)
 	}
-	if got := chatSearchDialect(config.Route{Host: "api.deepseek.com", WireModel: "deepseek-future-model"}); got != config.ChatSearchDialectResponses {
+	if got := chatSearchDialect(config.Route{Host: "api.deepseek.com", WireModel: "deepseek-future-model"}); got != config.ChatSearchDialectMessages {
 		t.Fatalf("future official DeepSeek model default=%q", got)
 	}
 	explicit := config.Route{Host: "api.deepseek.com", ChatSearchDialect: config.ChatSearchDialectWebSearchOptions}
@@ -502,7 +519,7 @@ func TestProviderSearchProtocolHonorsConfiguredNativeAPIAndExplicitChatDialect(t
 		want  wireProtocol
 	}{
 		{
-			name:  "official Responses stays Responses",
+			name:  "official Responses remains native without request evidence",
 			route: config.Route{Host: "api.deepseek.com", APIBackend: "responses", WireModel: "deepseek-v4-pro"},
 			want:  wireResponses,
 		},
@@ -512,9 +529,9 @@ func TestProviderSearchProtocolHonorsConfiguredNativeAPIAndExplicitChatDialect(t
 			want:  wireMessages,
 		},
 		{
-			name:  "official Chat uses documented Responses default",
+			name:  "official Chat uses source-preserving Messages default",
 			route: config.Route{Host: "api.deepseek.com", APIBackend: "chat_completions", WireModel: "deepseek-future-model"},
-			want:  wireResponses,
+			want:  wireMessages,
 		},
 		{
 			name: "explicit Chat dialect overrides host default",
@@ -531,6 +548,30 @@ func TestProviderSearchProtocolHonorsConfiguredNativeAPIAndExplicitChatDialect(t
 				ChatSearchDialect: config.ChatSearchDialectMessages,
 			},
 			want: wireMessages,
+		},
+		{
+			name: "explicit Responses search dialect opts out of host default",
+			route: config.Route{
+				Host: "api.deepseek.com", APIBackend: "responses", WireModel: "deepseek-future-model",
+				ChatSearchDialect: config.ChatSearchDialectResponses,
+			},
+			want: wireResponses,
+		},
+		{
+			name: "explicit Messages search dialect bridges Responses",
+			route: config.Route{
+				Host: "api.deepseek.com", APIBackend: "responses", WireModel: "deepseek-future-model",
+				ChatSearchDialect: config.ChatSearchDialectMessages,
+			},
+			want: wireMessages,
+		},
+		{
+			name: "explicit Responses search dialect bridges Messages",
+			route: config.Route{
+				Host: "api.deepseek.com", APIBackend: "messages", WireModel: "deepseek-future-model",
+				ChatSearchDialect: config.ChatSearchDialectResponses,
+			},
+			want: wireResponses,
 		},
 	}
 	for _, test := range tests {
@@ -558,6 +599,7 @@ func TestDeepSeekSearchHistoryRepairRequiresOfficialResponsesRoute(t *testing.T)
 			route: config.Route{
 				ChannelID: "future", Host: "api.deepseek.com", APIBackend: "responses",
 				WireModel: "deepseek-future-model", SupportsBackendSearch: true,
+				ChatSearchDialect: config.ChatSearchDialectResponses,
 			},
 			wantRepair: true,
 		},
@@ -609,6 +651,51 @@ func TestResponsesHostedSearchIsProtocolLocal(t *testing.T) {
 	includes := anySlice(root["include"])
 	if len(includes) != 1 || includes[0] != responsesWebSearchSourcesInclude {
 		t.Fatalf("Responses hosted search did not request source metadata: %#v", root)
+	}
+}
+
+func TestOfficialDeepSeekKeepsConfiguredProtocolWhenToolChoiceExcludesSearch(t *testing.T) {
+	for _, test := range []struct {
+		backend string
+		want    wireProtocol
+	}{
+		{backend: "responses", want: wireResponses},
+		{backend: "messages", want: wireMessages},
+		{backend: "chat_completions", want: wireChatCompletions},
+	} {
+		t.Run(test.backend, func(t *testing.T) {
+			route := config.Route{
+				ChannelID: "deepseek", Host: "api.deepseek.com", APIBackend: test.backend,
+				WireModel: "deepseek-future-model", SupportsBackendSearch: true,
+			}
+			request, err := adaptFacadeRequest([]byte(`{
+				"input":"return structured output",
+				"max_output_tokens":128,
+				"reasoning":{"effort":"high"},
+				"tools":[
+					{"type":"function","name":"structured","parameters":{"type":"object"}},
+					{"type":"web_search"}
+				],
+				"tool_choice":{"type":"function","name":"structured"}
+			}`), route, wireResponses)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if request.Protocol != test.want || request.ProxyAddedWebSearch || !request.HostedWebSearch {
+				t.Fatalf("non-search DeepSeek request changed protocol: %#v", request)
+			}
+			root, err := decodeRequestObject(request.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			encoded, _ := json.Marshal(root["tools"])
+			if !bytes.Contains(encoded, []byte(`"structured"`)) {
+				t.Fatalf("configured protocol lost the ordinary function declaration: %#v", root)
+			}
+			if test.want == wireChatCompletions && (root["web_search_options"] != nil || root["search_parameters"] != nil) {
+				t.Fatalf("excluded search gained a Chat hosted-search extension: %#v", root)
+			}
+		})
 	}
 }
 
@@ -957,30 +1044,35 @@ func TestResponsesUserIsolationSurvivesProtocolConversion(t *testing.T) {
 	}
 }
 
-func TestResponsesSearchHistoryRebuildsAdjacentMessagesBlocks(t *testing.T) {
-	blocks := responseWebSearchToMessagesBlocks(map[string]any{
-		"type": "web_search_call", "id": "ws_1",
-		"action": map[string]any{
-			"type": "search", "query": "current news",
-			"sources": []any{map[string]any{"type": "url", "url": "https://example.test", "title": "Example"}},
+func TestResponsesSearchHistoryMatchesGrokMessagesSummary(t *testing.T) {
+	converted, err := responsesToMessagesRequest(map[string]any{
+		"model": "wire", "max_output_tokens": 128,
+		"input": []any{
+			map[string]any{"role": "user", "content": "find current news"},
+			map[string]any{
+				"type": "web_search_call", "id": "ws_1", "status": "completed",
+				"action": map[string]any{
+					"type": "search", "query": "current news",
+					"sources": []any{map[string]any{"type": "url", "url": "https://example.test"}},
+				},
+			},
+			map[string]any{"role": "assistant", "content": "answer"},
+			map[string]any{"role": "user", "content": "continue"},
 		},
-	}, 4)
-	if len(blocks) != 2 || blocks[0]["type"] != "server_tool_use" ||
-		blocks[1]["type"] != "web_search_tool_result" || blocks[1]["tool_use_id"] != "ws_1" {
-		t.Fatalf("search history blocks=%#v", blocks)
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
-	results := anySlice(blocks[1]["content"])
-	if len(results) != 1 || results[0].(map[string]any)["url"] != "https://example.test" {
-		t.Fatalf("search sources were lost: %#v", blocks)
+	messages := anySlice(converted["messages"])
+	if len(messages) != 3 {
+		t.Fatalf("messages=%#v", messages)
 	}
-	fallbackA := responseWebSearchToMessagesBlocks(map[string]any{
-		"type": "web_search_call", "action": map[string]any{"type": "search", "query": "stable"},
-	}, 4)
-	fallbackB := responseWebSearchToMessagesBlocks(map[string]any{
-		"type": "web_search_call", "action": map[string]any{"type": "search", "query": "stable"},
-	}, 4)
-	if fallbackA[0]["id"] != "srv_4" || fallbackB[0]["id"] != fallbackA[0]["id"] {
-		t.Fatalf("missing search id produced unstable history: %#v %#v", fallbackA, fallbackB)
+	assistant := messages[1].(map[string]any)
+	blocks := contentBlocks(assistant["content"])
+	if len(blocks) != 2 || blocks[0]["type"] != "text" ||
+		blocks[0]["text"] != "[backend web_search] search: current news" ||
+		blocks[1]["text"] != "answer" {
+		t.Fatalf("search history did not match Grok Messages summary: %#v", messages)
 	}
 }
 

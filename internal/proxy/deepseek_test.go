@@ -565,10 +565,11 @@ func TestNormalizeDeepSeekChatStructuredOutputUsesDocumentedJSONMode(t *testing.
 	}
 }
 
-func TestDeepSeekResponsesDoesNotInventUnsupportedInclude(t *testing.T) {
+func TestDeepSeekResponsesRequestsSourcesWithoutReplacingCallerIncludes(t *testing.T) {
 	route := config.Route{
 		ChannelID: "deepseek", Host: "api.deepseek.com", WireModel: "deepseek-v4-pro",
 		APIBackend: "responses", SupportsBackendSearch: true,
+		ChatSearchDialect: config.ChatSearchDialectResponses,
 	}
 	request, err := adaptFacadeRequest([]byte(`{
 		"model":"display",
@@ -584,8 +585,8 @@ func TestDeepSeekResponsesDoesNotInventUnsupportedInclude(t *testing.T) {
 		t.Fatal(err)
 	}
 	includes := anySlice(root["include"])
-	if len(includes) != 1 || includes[0] != "caller.owned" {
-		t.Fatalf("unsupported DeepSeek include was injected or caller value changed: %#v", includes)
+	if len(includes) != 2 || includes[0] != "caller.owned" || includes[1] != responsesWebSearchSourcesInclude {
+		t.Fatalf("DeepSeek source hint or caller include changed: %#v", includes)
 	}
 }
 
@@ -627,6 +628,7 @@ func TestDeepSeekResponsesPreservesIncompleteAndFailedTerminalEvents(t *testing.
 
 			route := facadeRoute("deepseek-terminal", "responses", "deepseek-v4-pro", "key", upstream.URL)
 			route.Host = "api.deepseek.com"
+			route.ChatSearchDialect = config.ChatSearchDialectResponses
 			s := New(log.New(io.Discard, "", 0))
 			s.SetRoutes([]config.Route{route})
 			startPathTestServer(t, s)
@@ -700,6 +702,7 @@ func TestDeepSeekResponsesExposeLiveContextToGrokBuild(t *testing.T) {
 			route := facadeRoute("deepseek-context", "responses", "deepseek-v4-pro", "key", upstream.URL)
 			if test.official {
 				route.Host = "api.deepseek.com"
+				route.ChatSearchDialect = config.ChatSearchDialectResponses
 			}
 			s := New(log.New(io.Discard, "", 0))
 			s.SetRoutes([]config.Route{route})
@@ -800,6 +803,7 @@ func TestDeepSeekResponsesPreserveProviderUsageExtensions(t *testing.T) {
 
 			route := facadeRoute("deepseek-usage-extensions", "responses", "deepseek-v4-pro", "key", upstream.URL)
 			route.Host = "api.deepseek.com"
+			route.ChatSearchDialect = config.ChatSearchDialectResponses
 			s := New(log.New(io.Discard, "", 0))
 			s.SetRoutes([]config.Route{route})
 			startPathTestServer(t, s)

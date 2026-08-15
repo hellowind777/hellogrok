@@ -87,13 +87,18 @@ func effectiveRouteProtocol(route config.Route, incoming wireProtocol) (wireProt
 }
 
 // providerSearchProtocol selects the provider API that can actually execute
-// hosted search. Responses and Messages remain on their configured native API.
-// Chat channels may explicitly bridge to Responses or Messages, with host-based
-// defaults used only when no dialect was configured.
+// hosted search. An explicit protocol dialect bridges any configured backend;
+// otherwise Responses and Messages remain native and Chat uses a host default.
 func providerSearchProtocol(route config.Route) (wireProtocol, error) {
 	native, err := routeProtocol(route)
 	if err != nil {
 		return native, err
+	}
+	switch route.ChatSearchDialect {
+	case config.ChatSearchDialectResponses:
+		return wireResponses, nil
+	case config.ChatSearchDialectMessages:
+		return wireMessages, nil
 	}
 	if native != wireChatCompletions {
 		return native, nil
@@ -235,7 +240,16 @@ func adaptFacadeRequestWithReasoning(
 		if preparedSearch {
 			request.Kind = clientSearchRequest
 		}
-		if catalogHostedSearch {
+		searchEligible := request.HostedWebSearch && toolChoiceAllowsHostedSearch(root["tool_choice"])
+		deepSeekSourceSearch := isOfficialDeepSeekRoute(route) && route.ChatSearchDialect == "" && searchEligible
+		if !searchEligible {
+			request.Protocol = native
+		} else if deepSeekSourceSearch {
+			// DeepSeek Responses currently omits source URLs even when the standard
+			// include hint is sent. Its official Messages result blocks retain those
+			// URLs for Grok Build's native expandable display.
+			request.Protocol = wireMessages
+		} else if catalogHostedSearch {
 			request.Protocol = native
 		} else {
 			request.Protocol, err = providerSearchProtocol(route)
@@ -245,11 +259,9 @@ func adaptFacadeRequestWithReasoning(
 		}
 		switch request.Protocol {
 		case wireResponses:
-			// DeepSeek documents include as unsupported and silently ignored. Its
-			// native web_search_call is normalized from the returned action instead.
-			if !isOfficialDeepSeekRoute(route) {
-				includeResponsesWebSearchSources(root)
-			}
+			// Providers that do not implement this standard hint may ignore it. Sending
+			// it keeps source discovery forward-compatible when support is added.
+			includeResponsesWebSearchSources(root)
 			normalizeDeepSeekRequest(root, route, request.Protocol)
 			request.Body, err = encodeRequestObject(root)
 		case wireMessages:
@@ -330,9 +342,9 @@ func describeClientWebTools(root map[string]any) {
 
 // prepareClientSearchExecution recognizes the small, non-streaming hosted
 // request emitted by Build's WebSearchClient after the main model calls the
-// client web_search function. Requiring a final synthesis prevents agentic
-// search providers from exhausting the turn with search/reasoning items and no
-// OutputText, which Build otherwise reports as "No search results found."
+// client web_search function. The added instruction asks agentic providers for
+// the OutputText that Build consumes without changing Build's automatic tool
+// choice into a permanently forced server-tool loop.
 func prepareClientSearchExecution(root map[string]any, buildHostedSearch, buildXSearch int) bool {
 	if root == nil || buildHostedSearch != 1 || buildXSearch != 0 || toolChoiceDisablesTools(root["tool_choice"]) {
 		return false
@@ -361,9 +373,6 @@ func prepareClientSearchExecution(root map[string]any, buildHostedSearch, buildX
 	} else if !strings.Contains(instructions, clientSearchExecutionInstructions) {
 		root["instructions"] = instructions + "\n\n" + clientSearchExecutionInstructions
 	}
-	if automaticToolChoice(root["tool_choice"]) {
-		root["tool_choice"] = map[string]any{"type": "web_search"}
-	}
 	return true
 }
 
@@ -373,22 +382,6 @@ func setFunctionToolDescription(tool map[string]any, description string) {
 		return
 	}
 	tool["description"] = description
-}
-
-func automaticToolChoice(choice any) bool {
-	if choice == nil {
-		return true
-	}
-	if value, ok := choice.(string); ok {
-		value = strings.ToLower(strings.TrimSpace(value))
-		return value == "" || value == "auto" || value == "required"
-	}
-	value, ok := choice.(map[string]any)
-	if !ok || strings.ToLower(strings.TrimSpace(stringValue(value["type"]))) != "allowed_tools" {
-		return false
-	}
-	mode := strings.ToLower(strings.TrimSpace(stringValue(value["mode"])))
-	return mode == "" || mode == "auto" || mode == "required"
 }
 
 func allowedToolNames(choice any) (map[string]struct{}, string, bool) {
@@ -430,16 +423,36 @@ func toolChoiceAllowsFunction(choice any, name string) bool {
 }
 
 func toolChoiceAllowsHostedSearch(choice any) bool {
+	if toolChoiceDisablesTools(choice) {
+		return false
+	}
 	allowed, _, constrained := allowedToolNames(choice)
-	if !constrained {
+	if constrained {
+		if _, ok := allowed["hosted:web_search"]; ok {
+			return true
+		}
+		_, webSearch := allowed["function:web_search"]
+		_, xSearch := allowed["function:x_search"]
+		return webSearch || xSearch
+	}
+	value, ok := choice.(map[string]any)
+	if !ok {
 		return true
 	}
-	if _, ok := allowed["hosted:web_search"]; ok {
+	typ := strings.ToLower(strings.TrimSpace(stringValue(value["type"])))
+	switch {
+	case typ == "", typ == "auto", typ == "required":
 		return true
+	case typ == "x_search", isHostedWebSearchType(typ):
+		return true
+	case typ == "function":
+		name := strings.ToLower(strings.TrimSpace(functionToolName(value)))
+		return name == "web_search" || name == "x_search"
+	default:
+		// A named non-search tool choice cannot execute hosted search in this
+		// request, even when the declaration remains in the tools list.
+		return false
 	}
-	_, webSearch := allowed["function:web_search"]
-	_, xSearch := allowed["function:x_search"]
-	return webSearch || xSearch
 }
 
 func routeHostedSearchCapabilities(route config.Route) hostedSearchCapabilities {
@@ -772,7 +785,7 @@ func responsesInputToMessages(input any, anthropic bool) ([]any, []string, error
 		return []any{map[string]any{"role": "user", "content": content}}, nil, nil
 	}
 	items := anySlice(input)
-	for itemIndex, raw := range items {
+	for _, raw := range items {
 		item, _ := raw.(map[string]any)
 		if item == nil {
 			continue
@@ -841,8 +854,12 @@ func responsesInputToMessages(input any, anthropic bool) ([]any, []string, error
 			}
 		case "web_search_call":
 			if anthropic {
-				for _, block := range responseWebSearchToMessagesBlocks(item, itemIndex) {
-					appendBlockToRole(&messages, "assistant", block)
+				// Match Grok Build's native Messages conversion: backend calls have
+				// no lossless Messages history equivalent, so retain their stable
+				// human-readable summary in the assistant turn. The live call/result
+				// still uses provider-native server tool blocks on the response path.
+				if summary := backendToolSummary(item); summary != "" {
+					appendBlockToRole(&messages, "assistant", map[string]any{"type": "text", "text": summary})
 				}
 				continue
 			}
@@ -866,44 +883,6 @@ func responsesInputToMessages(input any, anthropic bool) ([]any, []string, error
 		}
 	}
 	return messages, system, nil
-}
-
-// responseWebSearchToMessagesBlocks reconstructs the provider-neutral search
-// history carried by a Responses web_search_call. Keeping the tool-use block
-// adjacent to its result avoids relying on process-local replay state and makes
-// continued Messages conversations deterministic after restarts.
-func responseWebSearchToMessagesBlocks(item map[string]any, itemIndex int) []map[string]any {
-	action, _ := item["action"].(map[string]any)
-	if action == nil {
-		return nil
-	}
-	query := strings.TrimSpace(firstString(action, "query"))
-	if query == "" {
-		query = firstSearchQuery(action["queries"])
-	}
-	id := firstString(item, "id")
-	if id == "" {
-		id = fmt.Sprintf("srv_%d", itemIndex)
-	}
-	use := map[string]any{
-		"type": "server_tool_use", "id": id, "name": "web_search",
-		"input": map[string]any{"query": query},
-	}
-	results := make([]any, 0)
-	for _, raw := range anySlice(action["sources"]) {
-		source, _ := raw.(map[string]any)
-		url := strings.TrimSpace(firstString(source, "url"))
-		if url == "" {
-			continue
-		}
-		result := map[string]any{"type": "web_search_result", "url": url}
-		copyIfPresent(result, source, "title", "page_age", "encrypted_content")
-		results = append(results, result)
-	}
-	result := map[string]any{
-		"type": "web_search_tool_result", "tool_use_id": id, "content": results,
-	}
-	return []map[string]any{use, result}
 }
 
 func appendAnthropicAssistantContent(messages *[]any, content any) {
@@ -1364,7 +1343,7 @@ func chatSearchDialect(route config.Route) config.ChatSearchDialect {
 		return route.ChatSearchDialect
 	}
 	if isOfficialDeepSeekRoute(route) {
-		return config.ChatSearchDialectResponses
+		return config.ChatSearchDialectMessages
 	}
 	if isOfficialXAIHost(route.Host) {
 		return config.ChatSearchDialectResponses

@@ -1,27 +1,21 @@
-# 发布说明 — v0.1.8
+# 发布说明 — v0.1.9
 
-## Grok Build 自动压缩现在使用可信的上下文用量
+## DeepSeek Web Search 默认保留 Grok Build 来源详情
 
-hellogrok 不再把缺失或不完整的供应商用量补成看似有效的零值。Responses、Anthropic Messages 和 Chat Completions 现在会保留完整的输入、输出、总量、缓存和推理 token；无法采信的测量统一输出 `usage: null`，让 Grok Build 保留已有 token 基线，而不是每轮都把自动压缩进度重置为零。
+当 `api.deepseek.com` 官方请求可以执行 hosted 搜索且没有配置搜索协议覆盖时，hellogrok 现在会让该搜索轮次使用官方 Anthropic Messages API。DeepSeek Messages 会返回结构化 `web_search_tool_result` URL，Grok Build 因而可以原生显示站点数量、来源域名和可展开的编号链接。
 
-模型或 provider 显式配置的 `context_window` 始终优先，冲突的上游元数据不能覆盖该值；两处均未配置时，继续由供应商或 Grok Build 模型元数据决定。`max_completion_tokens` 只限制输出，不会作为自动压缩分母。
+这一协议选择只在当前请求确实允许 hosted 搜索时生效。若 `tool_choice` 禁用搜索或指定其他函数，请求仍使用渠道配置的 Responses、Messages 或 Chat Completions API。显式设置的 `chat_search_dialect = "responses"` 或 `"messages"` 始终优先，并可从任意已配置后端桥接。
 
-## DeepSeek 兼容能力由官方端点和实际协议驱动
+## Responses 来源发现面向未来兼容
 
-精确位于 `api.deepseek.com` 的路由现在会获得官方 Responses、Chat Completions 和 Anthropic Messages 适配，不依赖模型 ID 白名单。滚动别名和未来模型会自动继承相同的鉴权、端点、服务端搜索、思考、用量、排队保活和流式行为；模型容量仍完全由配置或元数据决定。
+每个 Responses hosted 搜索请求现在都会请求 `web_search_call.action.sources`，同时保留调用方已有的 `include` 项目且不重复追加。DeepSeek 当前会接受但静默忽略该提示；保留这一标准字段后，供应商未来实现支持时，来源 URL 会自动进入现有归一化链路。hellogrok 不会伪造上游省略的来源。
 
-当前 DeepSeek 思考档位已覆盖全部支持格式，包括显式关闭思考。工具调用推理历史、结构化输出、函数工具、原生服务端 Web Search、调用方显式提供的自定义 `apply_patch` 请求、终止失败事件和标准 Anthropic 端点都会按目标协议规范化；不会虚构 Responses `include` 等官方不支持的字段。
+DeepSeek Responses 返回的 `action.queries` 会映射到 Grok Build 用于显示的单值 `action.query`，原始数组仍保留用于后续回传。Messages 搜索结果还会保留 `title`、`page_age`、`encrypted_content` 等供应商元数据；已有权威来源时，不再混入只有引用语义的 URL。
 
-## 各供应商格式继续保留搜索与 Grok Build 工具
+## 客户端搜索能够返回最终文本
 
-所有供应商格式都能携带 Grok Build 本地函数工具及其并行调用/结果历史。设置 `supports_backend_search = true` 的渠道会收到对应协议的原生服务端搜索请求；自定义渠道被选为默认搜索模型时，即使原配置为 false，也会在代理运行期间临时启用同一路由。上游拒绝或静默忽略服务端搜索时，现在会明确失败，不再被报告为成功的 `web_search`。
+Grok Build WebSearchClient 适配器不再把自动工具选择改成永久强制的服务端搜索工具。具备 Agent 行为的供应商可以先完成 Web Search，再返回 Grok Build 所需的最终文本，避免重复搜索直到轮次结束却没有可用输出。
 
-原生和桥接请求会保持确定的会话、工具、推理与缓存前缀。供应商返回的缓存 token 细节会得到保留；上游没有报告缓存命中时，hellogrok 也不会自行声称命中。
+## 桥接搜索历史保持缓存稳定
 
-## 长任务具有明确的空闲边界
-
-响应头和响应正文空闲保护现已覆盖流式及非流式的成功和错误响应。普通路由的边界保持在 Grok Build 配置的推理空闲时限之后，DeepSeek 官方路由则覆盖文档规定的排队窗口，并由排队空行或 SSE 保活刷新计时。静默上游不能再无限占住代理请求，持续有数据的长响应仍不受总时长限制。
-
-## 发布二进制使用已修复的 Go 标准库
-
-所有发布二进制均使用 Go 1.26.6 构建，包含 `GO-2026-6218`、`GO-2026-6090`、`GO-2026-6089`、`GO-2026-5972` 和 `GO-2026-5026` 的标准库修复；使用 Go 1.26.5 构建时，这些问题可通过 hellogrok 的 HTTP 或 TLS 调用链触达。
+Responses 转 Messages 时，历史 backend Web Search 调用现在使用与 Grok Build 相同的稳定可读摘要，不再重建并非由 Messages API 返回的虚假供应商服务端工具块。实时调用和结果仍使用供应商原生格式；Responses、Messages 与 Chat Completions 的原生及桥接缓存前缀继续由矩阵测试覆盖。

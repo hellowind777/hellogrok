@@ -548,7 +548,7 @@ func TestWrongSessionProtocolIsRejectedWithoutCallingUpstream(t *testing.T) {
 	}
 }
 
-func TestDeepSeekV4ChatSearchUsesNativeResponsesSearch(t *testing.T) {
+func TestOfficialDeepSeekHostedSearchDefaultsToMessagesSources(t *testing.T) {
 	var gotPath, gotAuthorization, gotAPIKey string
 	var gotBody []byte
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
@@ -557,35 +557,37 @@ func TestDeepSeekV4ChatSearchUsesNativeResponsesSearch(t *testing.T) {
 		gotAPIKey = request.Header.Get("X-Api-Key")
 		gotBody, _ = io.ReadAll(request.Body)
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"id":"resp_ds","object":"response","created_at":1,"status":"completed","model":"deepseek-v4-pro","output":[{"type":"web_search_call","id":"ws_ds","status":"completed","action":{"type":"search","query":"DeepSeek V4","sources":[{"type":"url","url":"https://api-docs.deepseek.com/zh-cn/quick_start/pricing/","title":"DeepSeek V4"}]}},{"type":"message","id":"msg_ds","status":"completed","role":"assistant","content":[{"type":"output_text","text":"answer","annotations":[]}]}],"usage":{"input_tokens":3,"output_tokens":4,"total_tokens":7}}`)
+		_, _ = io.WriteString(w, `{"id":"msg_ds","type":"message","role":"assistant","content":[{"type":"server_tool_use","id":"ws_ds","name":"web_search","input":{"query":"DeepSeek docs"}},{"type":"web_search_tool_result","tool_use_id":"ws_ds","content":[{"type":"web_search_result","url":"https://api-docs.deepseek.com/zh-cn/guides/anthropic_api/","title":"DeepSeek Anthropic API","page_age":"1 day ago","encrypted_content":"search-state"}]},{"type":"text","text":"answer"}],"model":"deepseek-future-model","stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":3,"output_tokens":4}}`)
 	}))
 	defer upstream.Close()
 
-	route := facadeRoute("deepseek-v4-pro", "chat_completions", "deepseek-v4-pro", "channel-key", upstream.URL)
+	route := facadeRoute("deepseek-future", "responses", "deepseek-future-model", "channel-key", upstream.URL)
 	route.Host = "api.deepseek.com"
 	route.SupportsBackendSearch = true
 	s := New(log.New(io.Discard, "", 0))
 	s.SetRoutes([]config.Route{route})
 	startPathTestServer(t, s)
 
-	data, status := postFacade(t, s, route.ChannelID, []byte(`{"input":"search DeepSeek V4","stream":false}`), "")
+	data, status := postFacade(t, s, route.ChannelID, []byte(`{"input":"search DeepSeek docs","max_output_tokens":128,"tools":[{"type":"web_search"}],"stream":false}`), "")
 	if status != http.StatusOK {
 		t.Fatalf("status=%d body=%s", status, data)
 	}
-	if gotPath != "/responses" || gotAuthorization != "Bearer channel-key" || gotAPIKey != "" {
+	if gotPath != "/anthropic/v1/messages" || gotAuthorization != "" || gotAPIKey != "channel-key" {
 		t.Fatalf("path=%q authorization=%q x-api-key=%q", gotPath, gotAuthorization, gotAPIKey)
 	}
 	wire, err := decodeRequestObject(gotBody)
-	if err != nil || wire["input"] == nil {
-		t.Fatalf("DeepSeek Responses body=%s err=%v", gotBody, err)
+	if err != nil || wire["messages"] == nil {
+		t.Fatalf("DeepSeek Messages body=%s err=%v", gotBody, err)
 	}
 	tools := anySlice(wire["tools"])
-	if len(tools) != 1 || tools[0].(map[string]any)["type"] != "web_search" {
+	if len(tools) != 1 || tools[0].(map[string]any)["type"] != "web_search_20250305" {
 		t.Fatalf("DeepSeek hosted search tool missing: %#v", wire)
 	}
 	response, err := decodeJSONMap(data)
 	if err != nil || response["object"] != "response" ||
-		!bytes.Contains(data, []byte("https://api-docs.deepseek.com/zh-cn/quick_start/pricing/")) ||
+		!bytes.Contains(data, []byte(`"encrypted_content":"search-state"`)) ||
+		!bytes.Contains(data, []byte(`"page_age":"1 day ago"`)) ||
+		!bytes.Contains(data, []byte(`"url":"https://api-docs.deepseek.com/zh-cn/guides/anthropic_api/"`)) ||
 		!bytes.Contains(data, []byte("web_search_call")) {
 		t.Fatalf("DeepSeek search was not converted for Build: body=%s err=%v", data, err)
 	}
@@ -631,7 +633,7 @@ func TestDeepSeekV4AnthropicAliasUsesNativeMessagesHostedSearch(t *testing.T) {
 	}
 }
 
-func TestDeepSeekV4ResponsesPassesThroughDocumentedCustomToolShape(t *testing.T) {
+func TestDeepSeekV4ExplicitResponsesSearchDialectPreservesCustomToolShape(t *testing.T) {
 	var gotPath, gotAuthorization, gotAPIKey string
 	var gotBody []byte
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
@@ -647,6 +649,7 @@ func TestDeepSeekV4ResponsesPassesThroughDocumentedCustomToolShape(t *testing.T)
 	route := facadeRoute("deepseek-tools", "responses", "deepseek-v4-pro", "channel-key", upstream.URL)
 	route.Host = "api.deepseek.com"
 	route.SupportsBackendSearch = true
+	route.ChatSearchDialect = config.ChatSearchDialectResponses
 	s := New(log.New(io.Discard, "", 0))
 	s.SetRoutes([]config.Route{route})
 	startPathTestServer(t, s)
@@ -771,6 +774,7 @@ func TestFacadeAdvertisesConfiguredOrProviderModelLimitsOnEveryResponsePath(t *t
 			route := facadeRoute("deepseek-model-limits", "responses", "deepseek-v4-pro", "key", upstream.URL)
 			if test.official {
 				route.Host = "api.deepseek.com"
+				route.ChatSearchDialect = config.ChatSearchDialectResponses
 			}
 			if test.configuredContext != 0 {
 				route.ContextWindow = test.configuredContext
@@ -1378,6 +1382,7 @@ func TestDeepSeekNonStreamingQueueEmptyLinesAreAccepted(t *testing.T) {
 
 	route := facadeRoute("deepseek-queue", "responses", "deepseek-v4-pro", "key", upstream.URL)
 	route.Host = "api.deepseek.com"
+	route.ChatSearchDialect = config.ChatSearchDialectResponses
 	s := New(log.New(io.Discard, "", 0))
 	// A route-selection regression would hit the deliberately shorter generic
 	// header timeout before the simulated DeepSeek queue returns headers.
@@ -1414,6 +1419,7 @@ func TestDeepSeekNonStreamingBodyIdleTimeoutCancelsUpstream(t *testing.T) {
 
 	route := facadeRoute("deepseek-body-idle", "responses", "deepseek-v4-pro", "key", upstream.URL)
 	route.Host = "api.deepseek.com"
+	route.ChatSearchDialect = config.ChatSearchDialectResponses
 	s := New(log.New(io.Discard, "", 0))
 	s.bodyIdleTimeout = 5 * time.Second
 	s.deepSeekBodyIdleTimeout = 50 * time.Millisecond
@@ -1449,6 +1455,7 @@ func TestDeepSeekStreamingQueueKeepAlivesResetDedicatedIdleTimeout(t *testing.T)
 
 	route := facadeRoute("deepseek-stream-queue", "responses", "deepseek-v4-pro", "key", upstream.URL)
 	route.Host = "api.deepseek.com"
+	route.ChatSearchDialect = config.ChatSearchDialectResponses
 	s := New(log.New(io.Discard, "", 0))
 	s.bodyIdleTimeout = 5 * time.Millisecond
 	s.deepSeekBodyIdleTimeout = 80 * time.Millisecond

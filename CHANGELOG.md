@@ -6,6 +6,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.1.9] — 2026-08-15
+
+### Changed
+
+- First-party DeepSeek hosted search now defaults to the official Anthropic Messages API whenever the current request can search and no explicit search dialect is configured. This preserves structured result URLs for Grok Build's native site count, domain summary, and expandable source display; non-search requests retain their configured protocol, and explicit `messages` or `responses` dialects can bridge any backend.
+- Responses hosted search now always requests `web_search_call.action.sources` while preserving and deduplicating caller `include` values. Providers that currently ignore the standard hint remain usable, and future support flows into the existing source normalization without a model-specific update.
+- Responses-to-Messages history uses Grok Build's stable backend-search summary instead of synthesizing provider server-tool call/result blocks that were never returned on the Messages wire.
+
+### Fixed
+
+- Grok Build WebSearchClient requests no longer force automatic tool choice into a repeated server-search loop, allowing providers to return the final text consumed by the client.
+- DeepSeek Responses `action.queries` is exposed through the canonical singular `action.query` field without removing the provider array, so Grok Build can display each search action.
+- Messages result metadata now retains `title`, `page_age`, and `encrypted_content`; authoritative provider source lists are no longer mixed with citation-only URLs.
+- Search-protocol selection now respects `tool_choice` exclusions, so a request that selects an ordinary function stays on its configured Responses, Messages, or Chat Completions API.
+
 ## [0.1.8] — 2026-08-15
 
 ### Added
@@ -179,7 +194,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - CC Switch compatibility detection and conflict warnings.
 - Builds for Windows, Linux, and macOS on amd64 and arm64.
 
-[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.8...HEAD
+[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.9...HEAD
+[0.1.9]: https://github.com/hellowind777/hellogrok/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/hellowind777/hellogrok/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/hellowind777/hellogrok/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/hellowind777/hellogrok/compare/v0.1.5...v0.1.6

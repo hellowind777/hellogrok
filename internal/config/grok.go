@@ -61,8 +61,8 @@ type Model struct {
 	EnvHTTPHeaders                 map[string]string
 }
 
-// ChatSearchDialect identifies the provider extension used to enable hosted
-// web search on a Chat Completions request.
+// ChatSearchDialect identifies the provider extension or protocol bridge used
+// to enable hosted web search. The name matches Grok Build's config field.
 type ChatSearchDialect string
 
 const (
@@ -93,8 +93,8 @@ type Route struct {
 	// effective protocol from its local or remote model catalog. In that case
 	// the facade follows the protocol of the request Grok Build actually sends.
 	APIBackendConfigured bool
-	// ChatSearchDialect selects the provider extension used both by the fixed
-	// Responses-to-Chat WebSearchClient adapter and native Chat search promotion.
+	// ChatSearchDialect selects the provider extension or protocol bridge used
+	// by hosted search and the fixed Responses WebSearchClient adapter.
 	ChatSearchDialect ChatSearchDialect
 	WireModel         string // model value sent to the upstream
 	APIKey            string // resolved channel credential

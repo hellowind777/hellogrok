@@ -227,7 +227,7 @@ func TestBridgedToolHistoryCachePrefixStabilityMatrix(t *testing.T) {
 		history string
 		dialect config.ChatSearchDialect
 	}{
-		{name: "responses", backend: "responses", history: "input"},
+		{name: "responses", backend: "responses", history: "input", dialect: config.ChatSearchDialectResponses},
 		{name: "messages", backend: "messages", history: "messages"},
 		{name: "chat", backend: "chat_completions", history: "messages", dialect: config.ChatSearchDialectWebSearchOptions},
 	}
