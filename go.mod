@@ -1,6 +1,6 @@
 module github.com/hellowind777/hellogrok
 
-go 1.26.5
+go 1.26.6
 
 require (
 	github.com/getlantern/systray v1.2.2

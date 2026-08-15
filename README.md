@@ -7,7 +7,7 @@
 A cross-platform local proxy that makes Grok Build custom model channels work with common API formats, native Web tools, isolated authentication, and automatic configuration recovery.
 
 [![Version](https://img.shields.io/badge/version-0.1.8-2f6feb.svg)](./internal/appinfo/appinfo.go)
-[![Go](https://img.shields.io/badge/Go-1.26.5-00ADD8.svg)](./go.mod)
+[![Go](https://img.shields.io/badge/Go-1.26.6-00ADD8.svg)](./go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#platform-support)
 [![LINUX DO](https://img.shields.io/badge/LINUX_DO-recognized-0A84FF?logo=linux&logoColor=white)](https://linux.do)
@@ -229,7 +229,7 @@ The final command must print `True`. On Linux use `sha256sum -c <file>.sha256`; 
 
 - Grok Build with a readable `~/.grok/config.toml` containing at least one custom model URL.
 - A valid credential source for every custom channel.
-- Go **1.26.5** when building from source.
+- Go **1.26.6** when building from source.
 
 Compatibility is verified against the latest fetched Grok Build `origin/main`, not against an older release branch. The exact tested revision is reported with the test results because the local Grok Build checkout may update independently.
 

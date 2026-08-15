@@ -21,3 +21,7 @@ Native and bridged requests preserve deterministic conversation, tool, reasoning
 ## Long-running provider requests have bounded idle behavior
 
 Response-header and response-body idle protection now covers streaming and non-streaming success and error bodies. Ordinary routes stay just behind Grok Build's configured inference idle timeout, while first-party DeepSeek routes allow the documented queue window and renew the deadline on queue newlines or SSE keep-alives. A silent upstream can no longer hold the proxy request indefinitely, and continuously active long responses still have no total-duration cap.
+
+## Release binaries use the patched Go standard library
+
+All published binaries are built with Go 1.26.6. This includes the standard-library fixes for `GO-2026-6218`, `GO-2026-6090`, `GO-2026-6089`, `GO-2026-5972`, and `GO-2026-5026` that are reachable through hellogrok's HTTP and TLS paths when built with Go 1.26.5.

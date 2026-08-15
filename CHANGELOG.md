@@ -22,6 +22,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Configuration rewrite recovery uses one strict named format and records provider-inherited maximum-completion projections alongside temporary protocol, search, reasoning, feature, and route fields. Unknown state formats are rejected instead of being interpreted by the current schema.
 - First-party DeepSeek models expose the documented `None`, `Low`, `High`, and `Max` menu even when Grok Build resolves the wire protocol from its catalog; explicit user menus still win. Messages turns Grok Build's omitted `None` into `thinking.type=disabled` and sends only `output_config.effort`. All three protocols follow the current official effort mapping (`minimal`/`low` to `low`, `medium`/`high`/`xhigh` to `high`, and `max` to `max`; `minimal` is Responses-only), and every format encodes disabled thinking natively. Chat documents the provider's separate `/beta` requirement for strict function schemas. Explicit Responses user-isolation IDs survive Chat and Messages protocol bridges.
 
+### Security
+
+- Release builds now use Go 1.26.6, which fixes the reachable standard-library vulnerabilities `GO-2026-6218`, `GO-2026-6090`, `GO-2026-6089`, `GO-2026-5972`, and `GO-2026-5026` reported against Go 1.26.5 HTTP and TLS call paths.
+
 ### Fixed
 
 - Backend-search declarations now have explicit cross-format failure coverage: every provider protocol receives its native search shape, unsupported upstream HTTP errors remain visible, and a selected search model that silently ignores the hosted tool returns a non-retryable error naming the missing backend `web_search` execution. Grok Build local tools, including arbitrary MCP names, retain declaration, selection, call, and replay semantics through every bridge.

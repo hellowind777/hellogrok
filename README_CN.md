@@ -7,7 +7,7 @@
 跨平台 Grok Build 本地代理，让自定义模型渠道兼容常见 API 格式、Build 原生 Web 工具、独立鉴权和自动配置恢复。
 
 [![Version](https://img.shields.io/badge/version-0.1.8-2f6feb.svg)](./internal/appinfo/appinfo.go)
-[![Go](https://img.shields.io/badge/Go-1.26.5-00ADD8.svg)](./go.mod)
+[![Go](https://img.shields.io/badge/Go-1.26.6-00ADD8.svg)](./go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#平台支持)
 [![LINUX DO](https://img.shields.io/badge/LINUX_DO-链接认可-0A84FF?logo=linux&logoColor=white)](https://linux.do)
@@ -229,7 +229,7 @@ $actual -eq $expected
 
 - Grok Build 可以读取 `~/.grok/config.toml`，其中至少配置了一个自定义模型 URL。
 - 每个自定义渠道均有有效的凭据来源。
-- 从源码编译需要 Go **1.26.5**。
+- 从源码编译需要 Go **1.26.6**。
 
 兼容性以每次获取到的 Grok Build 最新 `origin/main` 为验证基线，不针对旧发布分支；本机 Grok Build 可独立更新，因此交付测试结果会记录实际验证的提交。
 
