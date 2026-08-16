@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hellowind777/hellogrok/internal/capacity"
 	"github.com/hellowind777/hellogrok/internal/config"
 	"github.com/hellowind777/hellogrok/internal/patch"
 )
@@ -46,9 +47,10 @@ type Server struct {
 	bodyIdleTimeout         time.Duration
 	deepSeekBodyIdleTimeout time.Duration
 
-	probedMu  sync.Mutex
-	probed    map[string]bool
-	reasoning *reasoningProvenanceStore
+	probedMu         sync.Mutex
+	probed           map[string]bool
+	reasoning        *reasoningProvenanceStore
+	capacityObserver func(string, capacity.Observation)
 }
 
 const maxSSEEventBytes = 16 << 20
@@ -109,6 +111,27 @@ func (s *Server) SetRoutes(routes []config.Route) {
 		}
 	}
 	s.mu.Unlock()
+}
+
+// SetCapacityObserver receives model-capacity evidence discovered while
+// forwarding requests. The observer must return promptly; it can be called by
+// concurrent request handlers.
+func (s *Server) SetCapacityObserver(observer func(string, capacity.Observation)) {
+	s.mu.Lock()
+	s.capacityObserver = observer
+	s.mu.Unlock()
+}
+
+func (s *Server) observeCapacity(channelID string, observation capacity.Observation) {
+	if observation.ContextWindow == 0 && observation.MaxCompletionTokens == 0 {
+		return
+	}
+	s.mu.RLock()
+	observer := s.capacityObserver
+	s.mu.RUnlock()
+	if observer != nil {
+		observer(channelID, observation)
+	}
 }
 
 func (s *Server) lookupChannel(id string) (config.Route, bool) {

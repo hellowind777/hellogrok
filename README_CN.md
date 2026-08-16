@@ -6,7 +6,7 @@
 
 跨平台 Grok Build 本地代理，让自定义模型渠道兼容常见 API 格式、Build 原生 Web 工具、独立鉴权和自动配置恢复。
 
-[![Version](https://img.shields.io/badge/version-0.1.11-2f6feb.svg)](./internal/appinfo/appinfo.go)
+[![Version](https://img.shields.io/badge/version-0.1.12-2f6feb.svg)](./internal/appinfo/appinfo.go)
 [![Go](https://img.shields.io/badge/Go-1.26.6-00ADD8.svg)](./go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#平台支持)
@@ -81,6 +81,7 @@ hellogrok 为这些自定义渠道提供统一的本地兼容层。运行时准�
 - 避免把 Grok 官方登录令牌发送给无关的自定义渠道。
 - 加载配置时校验渠道请求头名称和值；请求分帧、内容和连接请求头仍由代理控制。
 - 代理启动时检查并临时补全 Grok 必需设置。
+- 根据每个自定义模型的有效上下文窗口和最大输出分别计算自动压缩预算；只临时降低不安全的阈值，不会提高用户设置的较低值，停止代理时恢复全部受管值。
 - 正常停止、退出托盘、Ctrl+C、SIGTERM 或启动失败时恢复未被用户改动的临时值，并通过字段级三方合并保留代理运行期间的用户修改。无关修改使整份 TOML 无效时，逐行恢复仍会撤销可独立解析的受管字段，不改写用户的无效字节。
 - 托盘“退出”始终会在尝试清理后结束进程。若文件无法访问或仍有不属于原事务结构的本地路由，恢复事务会留在磁盘供下次启动处理，不会把用户困在托盘程序中。
 - 异常退出后可以使用 `hellogrok restore` 恢复代理管理的设置。
@@ -150,12 +151,34 @@ supports_backend_search = false
 | `extra_headers` | 否 | 空 | 额外的渠道自有 HTTP 请求头，包括供应商专用鉴权字段。拒绝由代理控制的分帧、内容和连接请求头；名称按大小写不敏感处理。 |
 | `env_http_headers` | 否 | 空 | 从环境变量读取的 HTTP 请求头；解析后的值使用与 `extra_headers` 相同的请求头规则。 |
 | `supports_backend_search` | 否 | 模型目录/供应商默认 | 为 true 时，三种上游格式都使用当前渠道自身的 hosted 搜索，并向 Grok Build 输出规范 Responses 搜索事件；为 false 时，Grok Build 使用配置或登录回退的客户端搜索路径，但被 `[models].web_search` 或 `GROK_WEB_SEARCH_MODEL` 选中的自定义模型会临时覆盖为 true。精确的 DeepSeek 官方端点不依赖模型 ID 而默认为 true；其他未知模型继续由显式配置或 Grok Build 模型目录决定。 |
+| `context_window` | 否 | 供应商/模型目录 | 输入与输出共享的总上下文容量。显式模型/provider 值优先；缺失时，hellogrok 可以学习可信上游值并临时物化到模型级，使 Grok Build 使用相同的自动压缩分母。 |
+| `max_completion_tokens` | 否 | 模型元数据 | 最大生成 token 额度。显式配置优先；缺失时，hellogrok 根据实际发出的请求和可信上游元数据计算预算，但不会把请求中观察到的值写回为模型输出上限。 |
+| `auto_compact_threshold_percent` | 否 | 模型值，其次 `[session]`，最后 `85` | Grok Build 相对于 `context_window` 的首选压缩触发百分比。安全时保持原值；需要为最大输出和安全余量预留空间时，按模型临时降低。有效范围为 `0` 到 `100`。 |
+| `inference_idle_timeout_secs` | 否 | Grok Build/供应商策略 | 等待上游响应头或正文数据时允许的最长空闲间隔。模型值优先于全局 `[models]` 值；DeepSeek 官方端点未显式设置时使用 660 秒。 |
 
 模型设置可以直接写在 `[model.<id>]` 下，也可以从引用的 `[model_providers.<id>]` 继承；模型级设置优先。若模型和 provider 都没有设置 `api_backend`，hellogrok 会让该字段在 Grok Build 的活动配置中继续缺省，并跟随 Grok Build 当前模型目录解析后实际发来的协议；模型目录也不认识该模型时，才使用 Grok Build 的 `chat_completions` 回退。解析后的 Responses 请求若实际携带 hosted-search 工具，代理会把请求事实作为能力信号，因此未来目录新增模型不需要 hellogrok 增加模型 ID。
 
 渠道 ID 含点号时，推荐按 TOML 语法引用完整 ID，例如 `[model."provider.v1-beta"]`。连字符不需要引用。`name = "Provider.v1-beta"` 只是显示名称，点号和连字符均可直接使用。hellogrok 也会在代理运行期间兼容旧的未引用点号表头，并在停止时恢复原文。
 
 不要手动把自定义渠道 URL 设置成 hellogrok 的本地地址。本地临时 URL 只应由应用在代理运行期间管理。
+
+### 自动压缩容量
+
+Grok Build 根据完整上下文窗口计算触发点：`context_window * auto_compact_threshold_percent / 100`，不会先减去最大输出额度。因此，hellogrok 会在 Grok 下一个采样轮次前按模型计算安全百分比：
+
+```text
+margin    = max(8192, ceil(context_window / 20))
+safe      = floor(100 * (context_window - max_completion_tokens - margin) / context_window)
+effective = min(user_or_default_threshold, safe)
+```
+
+首选阈值依次来自 `[model.<id>]`、`[session]` 和 Grok Build 默认值 `85`。5% 安全余量且最低为 8K，用于覆盖 token 估算和压缩摘要开销。两项容量已知且用户阈值更低时，hellogrok 保持原值；最大输出与安全余量已经占满窗口时，不存在安全的正百分比，hellogrok 会报告容量冲突并保持现有阈值，不会注入 `0`。
+
+显式模型/provider 容量始终优先。字段缺失时，hellogrok 从实际发出的 `max_output_tokens` 或 `max_tokens`、有效上游 `X-Grok-Context-Window` 与 `X-Grok-Max-Completion-Tokens` 响应头，或唯一且无歧义的结构化上下文上限中学习。可信窗口会临时写成模型级 `context_window`，因为 Grok Build 必须使用相同分母，安全百分比才成立；请求中观察到的输出额度只参与计算，不会写成 `max_completion_tokens`。
+
+一个或两个容量仍未知时，hellogrok 会把模型标记为“容量学习中”，不会根据模型名称猜测阈值。因此首个请求仍可能使用 Grok Build 的模型目录或回退值；现有结构化上下文错误路径可以降低该请求的输出额度并重试一次。学习记录只保存哈希路由标识，不含 URL、模型名或凭据，30 天后过期，并以 `capacity_cache.json` 存放在 hellogrok 私有数据目录中。
+
+阈值和学习窗口都使用与本地路由相同的恢复事务。模型目录重载并重选当前模型后，已空闲的打开会话会采用新值；活动会话则通过有界延迟重试，空闲后再刷新。停止代理会先取消该工作器，再恢复原始配置。`GROK_AUTO_COMPACT_THRESHOLD_PERCENT` 在 Grok Build 内仍高于 TOML；hellogrok 继承到该环境变量时可以提示不安全值，但无法替换已经运行的 Grok 进程环境。
 
 ## DeepSeek
 
@@ -187,7 +210,7 @@ inference_idle_timeout_secs = 660
 
 缺省 `supports_backend_search` 即使用 DeepSeek 原生 hosted Web Search；显式设为 `false` 则改用 Grok Build 客户端搜索。Responses 与 Messages 搜索请求保持各自配置的原生 API。由于 DeepSeek Chat 目前只记录 function 工具，Chat 默认桥接到 Responses；只有明确需要 Messages 桥接时才设置 `chat_search_dialect = "messages"`。hellogrok 会向 Responses 请求 `web_search_call.action.sources`，保留 DeepSeek 实际返回的 URL，但不会虚构被省略的来源。原生 Responses 与 Chat 使用 Bearer 鉴权；Messages 使用官方文档中的 SDK base URL `https://api.deepseek.com/anthropic`（实际端点为 `/anthropic/v1/messages`）和 `X-Api-Key`。`[1m]` 后缀只是 DeepSeek 文档中的 Anthropic 集成别名，不能用于 Responses。
 
-上面两个容量上限对应 DeepSeek 文档中的 1M 总上下文和 384K 最大输出；`1,048,576` 来自其结构化上下文错误中实际报告的服务边界，不是 hellogrok 按模型 ID 写死的常量。660 秒是覆盖 DeepSeek 官方最长十分钟排队的空闲策略。模型级配置优先于继承的 provider 配置；未显式配置时，hellogrok 接受有效的上游 `X-Grok-Context-Window`、`X-Grok-Max-Completion-Tokens`，或错误中无歧义的结构化上下文上限字段，不根据模型名称猜测。最后才使用 Grok Build 自己的模型目录；未知自定义模型缺少 `context_window` 时默认只有 200,000 token。DeepSeek 没有公开这两个 Grok 私有响应头，因此建议显式填写两项上限，确保首轮行为可预测。未来模型或滚动别名改变容量时无需发布新版 hellogrok。
+上面两个容量上限对应 DeepSeek 文档中的 1M 总上下文和 384K 最大输出；`1,048,576` 来自其结构化上下文错误中实际报告的服务边界，不是 hellogrok 按模型 ID 写死的常量。使用这两个值时，85% 首选阈值会被自动预算临时限制为 58%。660 秒是覆盖 DeepSeek 官方最长十分钟排队的空闲策略。模型级配置优先于继承的 provider 配置；未显式配置时，hellogrok 接受有效的上游 `X-Grok-Context-Window`、`X-Grok-Max-Completion-Tokens`，或错误中无歧义的结构化上下文上限字段，不根据模型名称猜测。最后才使用 Grok Build 自己的模型目录；未知自定义模型缺少 `context_window` 时先使用 200,000 token 回退，直到 hellogrok 学到可信窗口。DeepSeek 没有公开这两个 Grok 私有响应头，因此建议显式填写两项上限，确保首轮行为可预测。未来模型或滚动别名改变容量时无需发布新版 hellogrok。
 
 当前 DeepSeek 推理菜单默认选择 `High`。Grok Build 原生接受紧凑的 `reasoning_efforts = ["none", "low", "high", "max"]` 写法，并会从非空菜单推导推理支持，因此 hellogrok 不再添加冗余的 `supports_reasoning_effort`，也不再写四段对象表。hellogrok 把所有用户显式赋值视为用户所有，包括不含 `none` 的列表、空列表以及自定义标签、顺序或默认值的对象菜单，既不替换也不追加。当前 Grok Build 在合并模型目录默认值时会忽略空集合覆盖，因此 `reasoning_efforts = []` 能保证 hellogrok 不注入菜单，但不一定能清除 Grok Build 自己继承的菜单。旧版 hellogrok 精确生成的冗长菜单只会迁移一次；已有模型级或全局推理选择时保持原值，否则写入 `reasoning_effort = "high"` 维持原默认值。三种协议仍统一采用官方映射：`minimal`/`low` 映射为 `low`，`medium`/`high`/`xhigh` 映射为 `high`，`max` 保持不变，`none` 关闭思考（`minimal` 仅是 Responses 的输入值）。
 
@@ -441,15 +464,15 @@ hellogrok 按这套合同统一处理所有渠道，而不是按供应商名称�
 
 DeepSeek 的 1M 上下文是输入与生成输出共享的总预算，Responses 的 `max_output_tokens` 同时包含隐藏推理和可见输出。用尽单次输出上限时，Responses 返回 `status = "incomplete"` 且原因为 `max_output_tokens`；Chat 返回 `finish_reason = "length"`，hellogrok 会映射为同一种不完整结果。已生成的部分仍可使用，但若推理消耗了额度，可见正文可能很少。此时可以在下一轮继续、降低推理档位，或仅在总上下文剩余空间足够时提高输出额度。只达到输出上限本身不应触发自动压缩。
 
-在 `664K / 1.0M` 附近出现上下文过长，不代表存在隐藏的 `500K` 上限，也不能据此认定统计错误。当窗口为 `1,048,576` 且 `max_completion_tokens = 384000` 时，供应商会同时预留完整输出额度，所以消息一旦超过 `664,576` 就可能拒绝。例如 `664,712 + 384,000 = 1,048,712`，虽然消息占用约 63%，总请求仍比窗口多 136 token。hellogrok 现在只在识别到这个精确、结构化且数字自洽的供应商错误时，把本次输出额度改为“最大窗口 - 消息 token”，透明重试一次；不会伪造界面统计、缩小配置窗口或改变自动压缩阈值。
+在 `664K / 1.0M` 附近出现上下文过长，不代表存在隐藏的 `500K` 上限，也不能据此认定统计错误。当窗口为 `1,048,576` 且 `max_completion_tokens = 384000` 时，供应商会同时预留完整输出额度，所以消息一旦超过 `664,576` 就可能拒绝。例如 `664,712 + 384,000 = 1,048,712`，虽然消息占用约 63%，总请求仍比窗口多 136 token。自动预算会预留该输出额度和 5% 安全余量，把 85% 首选值限制为 58%，让后续轮次更早压缩。若本次请求前还不知道正确容量，hellogrok 仍会识别精确、结构化且数字自洽的供应商错误，只把当前请求的输出额度改为“最大窗口 - 消息 token”，透明重试一次，不会伪造界面统计。
 
 活动工具循环中显示超过 100% 是另一条路径。Grok Build 的常规阈值检查发生在采样前，而工具结果后的独立预检只有在估算值已经大于上下文窗口时才触发。一次较大的工具输出因此可能让活动上下文从阈值以下直接增长到明显超过 100%，随后才压缩。这是当前活动上下文的估算值，不是累计计费用量。
 
 旧版 hellogrok 会把供应商缺失的用量补成全零字段。这样语法有效的响应就会报告 `total_tokens: 0`，导致 Grok Build 每轮都把基线重置为零，始终无法达到配置阈值。当前版本会保留可信的供应商总量；只有输入和输出测量都完整时才推导总量；缺失、不完整、负数、小数、全零占位或其他不可信用量统一输出 `usage: null`。原生 Responses 若带有完整且为正数的 `context_details`，即使独立的计费计数为零，仍可作为实时上下文计量使用。
 
-对于 DeepSeek 官方端点，hellogrok 还会请求流式终止用量并保留供应商计费 `total_tokens`。容量元数据对 DeepSeek、GPT、Claude、Grok、Gemini 及其他渠道统一遵循一个规则：显式 `[model.*]` 或继承的 `[model_providers.*]` 值优先；没有配置时才透传有效的上游 `X-Grok-*` 响应头。上下文拒绝还可能通过 `context_window`、`max_context_tokens`、`maximum_context_length`、`maximum_context_tokens`、`model_context_window` 或 `max_model_len` 暴露窗口；hellogrok 只接受唯一、正数、无歧义且不溢出的值。`max_completion_tokens` 使用同样的配置优先级；由于当前 Grok Build 不继承 provider 的该字段，hellogrok 会临时物化到 `[model.*]`。终止用量更新分子，配置、远端元数据或 Grok Build 模型目录提供分母。Grok Build 的常规触发值是 `context_window * auto_compact_threshold_percent / 100`，不会先减去 `max_completion_tokens`；hellogrok 不改写这个百分比。
+对于 DeepSeek 官方端点，hellogrok 还会请求流式终止用量并保留供应商计费 `total_tokens`。容量元数据对 DeepSeek、GPT、Claude、Grok、Gemini 及其他渠道统一遵循一个规则：显式 `[model.*]` 或继承的 `[model_providers.*]` 值优先；没有配置时才透传并学习有效的上游 `X-Grok-*` 响应头。上下文拒绝还可能通过 `context_window`、`max_context_tokens`、`maximum_context_length`、`maximum_context_tokens`、`model_context_window` 或 `max_model_len` 暴露窗口；hellogrok 只接受唯一、正数、无歧义且不溢出的值。供应商级 `max_completion_tokens` 和可信学习到的 `context_window` 会在当前 Grok Build 无法正确继承或处理响应头降级时临时物化到 `[model.*]`。终止用量更新分子；Grok Build 依据完整分母计算触发点，因此 hellogrok 会按文档中的输出预留和安全余量临时降低每个不安全的模型阈值。
 
-当前 Grok Build 会有意忽略响应头对上下文窗口的降级。因此，若模型不在其目录中且供应商真实上限低于 Grok Build 回退值，仅靠代理转发首次响应头无法在事后纠正分母，必须显式设置 `context_window`。若某个中转完全不返回用量，代理在没有供应商 tokenizer 和隐藏提示开销的情况下也无法制造精确结果；`usage: null` 的目的就是保留 Grok Build 既有基线，而不是再次破坏它。升级后先发起一次新的 DeepSeek 请求，让真实终止用量覆盖已打开会话中可能保存的零基线。
+当前 Grok Build 会有意忽略响应头对上下文窗口的降级。单纯转发响应头因此无法纠正模型目录或回退分母；hellogrok 现在会把可信学习窗口写入临时模型配置，并刷新已打开会话。该修正只能在供应商暴露容量后生效，因此显式设置 `context_window` 与 `max_completion_tokens` 仍是首轮行为可预测的唯一方式。若某个中转同时不返回容量和用量，代理在没有供应商元数据、tokenizer 和隐藏提示开销的情况下仍无法制造精确结果；`usage: null` 会保留 Grok Build 既有基线，而不是再次破坏它。
 
 这也是内置 `grok-4.5` 通常显示正确的原因：Grok Build 模型目录提供 500,000 token 窗口和该模型专用的 80% 阈值，xAI 原生 Responses 流又提供采样器所需的实时上下文 `context_details`。未知自定义模型若未配置或发现容量，只会回退到 200,000 token；旧版 hellogrok 还可能把它的实时基线重置为零。系统不存在通用的隐藏 500K 截止点。
 

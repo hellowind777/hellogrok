@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/hellowind777/hellogrok/internal/appinfo"
+	"github.com/hellowind777/hellogrok/internal/capacity"
 	"github.com/hellowind777/hellogrok/internal/config"
 	"github.com/hellowind777/hellogrok/internal/patch"
 )
@@ -52,6 +53,12 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
+	}
+	if completion := completionLimitFromRequest(request.Body, request.Protocol); completion > 0 {
+		s.observeCapacity(route.ChannelID, capacity.Observation{
+			MaxCompletionTokens: completion,
+			CompletionSource:    capacity.SourceRequest,
+		})
 	}
 	target, err := upstreamTarget(route, request.Protocol, incoming.URL.RawQuery)
 	if err != nil {
@@ -138,6 +145,9 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 			return
 		}
 		s.log.Printf("UP channel=%s status=%d ct=%s %s", route.ChannelID, response.StatusCode, response.Header.Get("Content-Type"), time.Since(started).Round(time.Millisecond))
+		if response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices {
+			s.observeCapacity(route.ChannelID, capacityObservationFromHeaders(response.Header))
+		}
 		if encoding := strings.TrimSpace(response.Header.Get("Content-Encoding")); encoding != "" && !strings.EqualFold(encoding, "identity") {
 			_ = response.Body.Close()
 			writeJSONError(w, http.StatusBadGateway, "upstream returned unsupported content encoding "+encoding)
@@ -167,6 +177,17 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 		}
 
 		observation, observedContextBudget := inspectContextBudgetError(response.StatusCode, data)
+		if observedContextBudget {
+			learned := capacity.Observation{
+				ContextWindow: observation.MaximumTokens,
+				ContextSource: capacity.SourceContextError,
+			}
+			if observation.ExactRequest {
+				learned.MaxCompletionTokens = observation.CompletionTokens
+				learned.CompletionSource = capacity.SourceRequest
+			}
+			s.observeCapacity(route.ChannelID, learned)
+		}
 		if observedContextBudget && discoveredContextWindow == 0 {
 			discoveredContextWindow = observation.MaximumTokens
 		}

@@ -71,6 +71,7 @@ sessions*.json
 /*.token
 /config_rewrite_state.json
 /reasoning_provenance.json
+/capacity_cache.json
 /last_request.json
 /last_request_meta.json
 /last_request_meta.txt

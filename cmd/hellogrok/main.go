@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/hellowind777/hellogrok/internal/appinfo"
 	"github.com/hellowind777/hellogrok/internal/autostart"
+	"github.com/hellowind777/hellogrok/internal/capacity"
 	"github.com/hellowind777/hellogrok/internal/cfgpatch"
 	"github.com/hellowind777/hellogrok/internal/config"
 	"github.com/hellowind777/hellogrok/internal/console"
@@ -323,15 +325,31 @@ type App struct {
 	server              *proxy.Server
 	refreshGrokSessions func(context.Context, map[string]string) (groksync.Result, error)
 
-	mu             sync.Mutex
-	running        bool
-	lastError      string
-	patchedIDs     []string
-	modelAliases   map[string]string
-	grokSyncStatus string
+	mu                     sync.Mutex
+	running                bool
+	lastError              string
+	patchedIDs             []string
+	modelAliases           map[string]string
+	grokSyncStatus         string
+	models                 []config.Model
+	routes                 []config.Route
+	capacityCache          *capacity.Cache
+	capacityKeys           map[string]string
+	managedContextWindows  map[string]uint64
+	managedThresholds      map[string]uint8
+	autoCompactEnvironment *uint8
 
-	cfgMu  sync.Mutex
-	prefMu sync.Mutex
+	cfgMu             sync.Mutex
+	prefMu            sync.Mutex
+	backgroundMu      sync.Mutex
+	backgroundCtx     context.Context
+	backgroundCancel  context.CancelFunc
+	backgroundWG      sync.WaitGroup
+	capacityPending   map[string]capacity.Observation
+	capacitySignal    chan struct{}
+	refreshPending    *grokRefreshRequest
+	refreshSignal     chan struct{}
+	refreshRetryDelay func(int) time.Duration
 }
 
 func (a *App) beginSessionLog() {
@@ -381,6 +399,7 @@ func (a *App) StatusDetail() string {
 		"【协议与搜索】 Grok 消费：搜索开启时投影为 Responses\n" +
 		"上游协议：保持渠道真实格式\n" +
 		"搜索分流：开启走当前渠道，关闭走客户端搜索\n\n" +
+		a.autoCompactStatus() + "\n\n" +
 		fmt.Sprintf("【配置恢复】 临时改写：%d 个渠道，停止代理：恢复原值", len(patched))
 	if a.lastError != "" {
 		detail += "\n\n【当前警告】 " + a.lastError
@@ -461,12 +480,56 @@ func (a *App) Start() error {
 		return a.abortStart(fmt.Errorf("load web search model: %w", err))
 	}
 	routes = a.resolveSearchRoutes(routes, searchSelection)
+	capacityCache, err := capacity.Open(a.dataDir)
+	if err != nil {
+		return a.abortStart(fmt.Errorf("load model capacity cache: %w", err))
+	}
+	autoCompactEnvironment, err := configuredAutoCompactEnvironment()
+	if err != nil {
+		return a.abortStart(err)
+	}
+	a.capacityCache = capacityCache
+	a.capacityKeys = make(map[string]string, len(routes))
+	a.managedContextWindows = make(map[string]uint64)
+	a.managedThresholds = make(map[string]uint8)
+	a.autoCompactEnvironment = autoCompactEnvironment
+	for _, route := range routes {
+		key := capacity.RouteKey(route.OriginBase, route.WireModel, route.APIBackend)
+		a.capacityKeys[route.ChannelID] = key
+		learned, _ := capacityCache.Lookup(key)
+		if !route.ContextWindowConfigured && learned.ContextWindow > 0 && learned.ContextSource >= capacity.SourceResponseHeader {
+			a.managedContextWindows[route.ChannelID] = learned.ContextWindow
+		}
+		budget := a.capacityBudget(route)
+		switch {
+		case budget.Conflict:
+			a.logger.Printf("auto compact capacity conflict model=%s context_window=%d max_completion_tokens=%d margin=%d; threshold unchanged",
+				route.ChannelID, budget.ContextWindow, budget.MaxCompletionTokens, budget.Margin)
+		case !budget.Ready:
+			a.logger.Printf("auto compact capacity learning model=%s context_known=%t completion_known=%t; threshold unchanged",
+				route.ChannelID, budget.ContextWindow > 0, budget.MaxCompletionTokens > 0)
+		case autoCompactEnvironment != nil:
+			if budget.EffectiveThreshold < *autoCompactEnvironment {
+				a.logger.Printf("auto compact environment override model=%s configured=%d safe=%d; TOML cannot override GROK_AUTO_COMPACT_THRESHOLD_PERCENT",
+					route.ChannelID, *autoCompactEnvironment, budget.SafeThreshold)
+			}
+		case budget.EffectiveThreshold < budget.DesiredThreshold:
+			a.managedThresholds[route.ChannelID] = budget.EffectiveThreshold
+			a.logger.Printf("auto compact threshold model=%s desired=%d safe=%d effective=%d context_window=%d max_completion_tokens=%d margin=%d",
+				route.ChannelID, budget.DesiredThreshold, budget.SafeThreshold, budget.EffectiveThreshold,
+				budget.ContextWindow, budget.MaxCompletionTokens, budget.Margin)
+		default:
+			a.logger.Printf("auto compact threshold model=%s desired=%d safe=%d effective=%d; user threshold retained",
+				route.ChannelID, budget.DesiredThreshold, budget.SafeThreshold, budget.EffectiveThreshold)
+		}
+	}
 	if takeover, err := cfgpatch.DetectCCSwitchTakeover(cfgPath); err != nil {
 		return a.abortStart(fmt.Errorf("recheck config ownership before rewrite: %w", err))
 	} else if takeover.Active() {
 		return a.abortStart(ccSwitchConflictError(takeover, "启动 hellogrok"))
 	}
 	a.server.SetRoutes(routes)
+	a.server.SetCapacityObserver(a.queueCapacityObservation)
 	if err := a.server.ServePath(); err != nil {
 		return a.abortStart(fmt.Errorf("start local facade: %w", err))
 	}
@@ -479,28 +542,7 @@ func (a *App) Start() error {
 	for _, route := range routes {
 		effectiveRoutes[route.ChannelID] = route
 	}
-	targets := make([]cfgpatch.Target, 0, len(models))
-	for _, model := range models {
-		if strings.TrimSpace(model.BaseURL) == "" && strings.TrimSpace(model.APIBaseURL) == "" {
-			continue
-		}
-		route, ok := effectiveRoutes[model.ID]
-		if !ok {
-			continue
-		}
-		targets = append(targets, cfgpatch.Target{
-			ID:                         model.ID,
-			APIBaseURL:                 strings.TrimSpace(model.APIBaseURL) != "",
-			APIBackend:                 route.APIBackend,
-			BuildAPIBackend:            buildAPIBackend(route),
-			SupportsBackendSearch:      buildSupportsBackendSearch(route),
-			ProjectBackendSearch:       projectBackendSearch(route),
-			ReasoningEfforts:           buildDeepSeekReasoningEfforts(route),
-			ReasoningEffortDefault:     buildDeepSeekReasoningEffortDefault(route),
-			MigrateLegacyReasoningMenu: route.LegacyGeneratedReasoningMenu,
-			MaxCompletionTokens:        configuredMaxCompletionTokens(route),
-		})
-	}
+	targets := buildConfigTargets(models, effectiveRoutes, a.managedContextWindows, a.managedThresholds)
 	res, err := cfgpatch.ApplyTargets(cfgPath, stPath, targets)
 	a.cfgMu.Unlock()
 	if err != nil {
@@ -517,10 +559,11 @@ func (a *App) Start() error {
 	a.patchedIDs = append([]string(nil), res.Targets...)
 	sort.Strings(a.patchedIDs)
 	a.modelAliases = cloneStringMap(res.LegacyModelAliases)
-	a.logger.Printf("config rewrite all: model_sections=%d base=%d api_base=%d api_backend=%d max_completion_tokens=%d backend_search=%d reasoning_effort=%d reasoning_efforts=%d backend_tools=%d web_fetch=%d subagents_enabled=%d targets=%v",
-		res.ModelSections, res.BaseURLs, res.APIBaseURLs, res.APIBackends, res.MaxCompletionTokens, res.BackendSearch, res.ReasoningEffort, res.ReasoningEfforts, res.BackendTools, res.WebFetch, res.SubagentsEnabled, res.Targets)
+	a.logger.Printf("config rewrite all: model_sections=%d base=%d api_base=%d api_backend=%d context_windows=%d max_completion_tokens=%d auto_compact_thresholds=%d backend_search=%d reasoning_effort=%d reasoning_efforts=%d backend_tools=%d web_fetch=%d subagents_enabled=%d targets=%v",
+		res.ModelSections, res.BaseURLs, res.APIBaseURLs, res.APIBackends, res.ContextWindows, res.MaxCompletionTokens, res.AutoCompactThresholds, res.BackendSearch, res.ReasoningEffort, res.ReasoningEfforts, res.BackendTools, res.WebFetch, res.SubagentsEnabled, res.Targets)
 	a.logger.Printf("config validation passed: backend_protocols=capability-projected backend_tools=true web_fetch=true backend_search=configured-or-selected-or-documented-default model_limits=configured-first-otherwise-remote deepseek_efforts=protocol-native-if-unconfigured subagent_defaults=repaired-if-needed targets=%d", res.ValidatedTargets)
-	a.refreshOpenGrokSessions("enable", enableGrokSessionSelections(a.patchedIDs, a.modelAliases))
+	a.models = append([]config.Model(nil), models...)
+	a.routes = append([]config.Route(nil), routes...)
 	for _, route := range routes {
 		backend := strings.TrimSpace(route.APIBackend)
 		a.logger.Printf("channel facade: model=%s build_backend=%s upstream_backend=%s", route.ChannelID, buildAPIBackend(route), backend)
@@ -538,6 +581,8 @@ func (a *App) Start() error {
 	}
 
 	a.running = true
+	a.startBackgroundWorkersLocked()
+	a.refreshOpenGrokSessions("enable", enableGrokSessionSelections(a.patchedIDs, a.modelAliases))
 	a.logger.Printf("started path=%s mode=capability-projected-facade+search-adapter+auth-isolate", a.server.PathAddr)
 	return nil
 }
@@ -611,6 +656,53 @@ func configuredMaxCompletionTokens(route config.Route) uint64 {
 	return route.MaxCompletionTokens
 }
 
+func buildConfigTargets(models []config.Model, routes map[string]config.Route, contextWindows map[string]uint64, thresholds map[string]uint8) []cfgpatch.Target {
+	targets := make([]cfgpatch.Target, 0, len(models))
+	for _, model := range models {
+		if strings.TrimSpace(model.BaseURL) == "" && strings.TrimSpace(model.APIBaseURL) == "" {
+			continue
+		}
+		route, ok := routes[model.ID]
+		if !ok {
+			continue
+		}
+		target := cfgpatch.Target{
+			ID:                         model.ID,
+			APIBaseURL:                 strings.TrimSpace(model.APIBaseURL) != "",
+			APIBackend:                 route.APIBackend,
+			BuildAPIBackend:            buildAPIBackend(route),
+			SupportsBackendSearch:      buildSupportsBackendSearch(route),
+			ProjectBackendSearch:       projectBackendSearch(route),
+			ReasoningEfforts:           buildDeepSeekReasoningEfforts(route),
+			ReasoningEffortDefault:     buildDeepSeekReasoningEffortDefault(route),
+			MigrateLegacyReasoningMenu: route.LegacyGeneratedReasoningMenu,
+			MaxCompletionTokens:        configuredMaxCompletionTokens(route),
+		}
+		if contextWindow, ok := contextWindows[model.ID]; ok {
+			target.ContextWindow = contextWindow
+		}
+		if threshold, ok := thresholds[model.ID]; ok {
+			value := threshold
+			target.AutoCompactThresholdPercent = &value
+		}
+		targets = append(targets, target)
+	}
+	return targets
+}
+
+func configuredAutoCompactEnvironment() (*uint8, error) {
+	raw, exists := os.LookupEnv("GROK_AUTO_COMPACT_THRESHOLD_PERCENT")
+	if !exists || strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	value, err := strconv.ParseUint(strings.TrimSpace(raw), 10, 8)
+	if err != nil || value > 100 {
+		return nil, fmt.Errorf("GROK_AUTO_COMPACT_THRESHOLD_PERCENT must be an integer between 0 and 100")
+	}
+	threshold := uint8(value)
+	return &threshold, nil
+}
+
 func buildDeepSeekReasoningEfforts(route config.Route) []cfgpatch.ReasoningEffortOption {
 	if !config.IsOfficialDeepSeekRoute(route) ||
 		(route.ReasoningEffortConfigured && !route.LegacyGeneratedReasoningMenu) {
@@ -645,7 +737,13 @@ func (a *App) refreshOpenGrokSessions(phase string, selections map[string]string
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
 	result, err := a.refreshGrokSessions(ctx, selections)
+	a.recordGrokRefresh(phase, result, err)
+	if result.SkippedActiveSessions > 0 {
+		a.queueGrokRefresh(phase, selections)
+	}
+}
 
+func (a *App) recordGrokRefresh(phase string, result groksync.Result, err error) {
 	switch {
 	case !result.GrokFound:
 		a.grokSyncStatus = "未找到 grok 可执行文件；新窗口仍会读取配置，已打开窗口需在 /model 中重选当前模型"
@@ -668,6 +766,379 @@ func (a *App) refreshOpenGrokSessions(phase string, selections map[string]string
 	}
 	a.logger.Printf("grok session hot reload phase=%s leaders=%d targets=%d refreshed=%d active_skipped=%d failed=%d",
 		phase, result.ReachableLeaders, result.TargetSessions, result.RefreshedSessions, result.SkippedActiveSessions, result.FailedSessions)
+}
+
+type grokRefreshRequest struct {
+	phase      string
+	selections map[string]string
+}
+
+const maxGrokRefreshRetries = 18
+
+func (a *App) startBackgroundWorkersLocked() {
+	a.backgroundMu.Lock()
+	defer a.backgroundMu.Unlock()
+	if a.backgroundCtx != nil && a.backgroundCtx.Err() == nil {
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	a.backgroundCtx = ctx
+	a.backgroundCancel = cancel
+	a.capacityPending = make(map[string]capacity.Observation)
+	a.capacitySignal = make(chan struct{}, 1)
+	a.refreshPending = nil
+	a.refreshSignal = make(chan struct{}, 1)
+	a.server.SetCapacityObserver(a.queueCapacityObservation)
+	a.backgroundWG.Add(2)
+	go a.runCapacityWorker(ctx)
+	go a.runGrokRefreshWorker(ctx)
+}
+
+func (a *App) stopBackgroundWorkers() {
+	a.backgroundMu.Lock()
+	cancel := a.backgroundCancel
+	workerContext := a.backgroundCtx
+	a.backgroundMu.Unlock()
+	if cancel == nil {
+		return
+	}
+	cancel()
+	a.backgroundWG.Wait()
+	a.backgroundMu.Lock()
+	if a.backgroundCtx == workerContext {
+		a.backgroundCtx = nil
+		a.backgroundCancel = nil
+		a.capacityPending = nil
+		a.capacitySignal = nil
+		a.refreshPending = nil
+		a.refreshSignal = nil
+	}
+	a.backgroundMu.Unlock()
+}
+
+func (a *App) queueCapacityObservation(channelID string, observation capacity.Observation) {
+	channelID = strings.TrimSpace(channelID)
+	if channelID == "" {
+		return
+	}
+	a.backgroundMu.Lock()
+	if a.backgroundCtx == nil || a.backgroundCtx.Err() != nil {
+		a.backgroundMu.Unlock()
+		return
+	}
+	a.capacityPending[channelID] = capacity.MergeObservations(a.capacityPending[channelID], observation)
+	signal := a.capacitySignal
+	a.backgroundMu.Unlock()
+	select {
+	case signal <- struct{}{}:
+	default:
+	}
+}
+
+func (a *App) takeCapacityPending() map[string]capacity.Observation {
+	a.backgroundMu.Lock()
+	defer a.backgroundMu.Unlock()
+	pending := a.capacityPending
+	a.capacityPending = make(map[string]capacity.Observation)
+	return pending
+}
+
+func (a *App) runCapacityWorker(ctx context.Context) {
+	defer a.backgroundWG.Done()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-a.capacitySignal:
+			for channelID, observation := range a.takeCapacityPending() {
+				a.applyCapacityObservation(channelID, observation)
+			}
+		}
+	}
+}
+
+func (a *App) applyCapacityObservation(channelID string, observation capacity.Observation) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if !a.running || a.capacityCache == nil {
+		return
+	}
+	key, ok := a.capacityKeys[channelID]
+	if !ok {
+		return
+	}
+	values, changed, err := a.capacityCache.Observe(key, observation)
+	if err != nil {
+		a.lastError = "更新模型容量缓存失败: " + err.Error()
+		a.logger.Printf("model capacity cache update failed model=%s: %v", channelID, err)
+		return
+	}
+	if !changed {
+		return
+	}
+	route, ok := routeByID(a.routes, channelID)
+	if !ok {
+		return
+	}
+	_, thresholdManaged := a.managedThresholds[channelID]
+	_, contextManaged := a.managedContextWindows[channelID]
+	if !thresholdManaged || !contextManaged {
+		currentModels, loadErr := config.LoadModels(config.ConfigPath())
+		if loadErr != nil {
+			a.lastError = "重新读取自动压缩配置失败: " + loadErr.Error()
+			a.logger.Printf("auto compact config reload failed model=%s: %v", channelID, loadErr)
+			return
+		}
+		foundCurrent := false
+		for _, currentModel := range currentModels {
+			if currentModel.ID != channelID {
+				continue
+			}
+			foundCurrent = true
+			if !contextManaged {
+				route.ContextWindow = currentModel.ContextWindow
+				route.ContextWindowConfigured = currentModel.ContextWindowConfigured
+			}
+			route.MaxCompletionTokens = currentModel.MaxCompletionTokens
+			route.MaxCompletionTokensConfigured = currentModel.MaxCompletionTokensConfigured
+			if !thresholdManaged {
+				route.AutoCompactThresholdPercent = currentModel.AutoCompactThresholdPercent
+				route.AutoCompactThresholdConfigured = currentModel.AutoCompactThresholdConfigured
+			}
+			break
+		}
+		if !foundCurrent {
+			a.logger.Printf("auto compact capacity ignored model=%s: model was removed from the live config", channelID)
+			return
+		}
+	}
+	nextContextWindows := make(map[string]uint64, len(a.managedContextWindows)+1)
+	for id, contextWindow := range a.managedContextWindows {
+		nextContextWindows[id] = contextWindow
+	}
+	contextChanged := false
+	if !route.ContextWindowConfigured && values.ContextWindow > 0 && values.ContextSource >= capacity.SourceResponseHeader {
+		if current, managed := nextContextWindows[channelID]; !managed || current != values.ContextWindow {
+			nextContextWindows[channelID] = values.ContextWindow
+			contextChanged = true
+		}
+	}
+	nextThresholds := make(map[string]uint8, len(a.managedThresholds)+1)
+	for id, threshold := range a.managedThresholds {
+		nextThresholds[id] = threshold
+	}
+	thresholdChanged := false
+	budget := budgetForRoute(route, values, a.autoCompactEnvironment)
+	switch {
+	case budget.Conflict:
+		a.lastError = fmt.Sprintf("模型 %s 的上下文容量不足以同时保留最大输出和安全余量；已保持原自动压缩阈值", channelID)
+		a.logger.Printf("auto compact capacity conflict model=%s context_window=%d max_completion_tokens=%d margin=%d",
+			channelID, budget.ContextWindow, budget.MaxCompletionTokens, budget.Margin)
+	case !budget.Ready:
+		a.logger.Printf("model capacity learned model=%s context_window=%d max_completion_tokens=%d; waiting for remaining value",
+			channelID, values.ContextWindow, values.MaxCompletionTokens)
+	case a.autoCompactEnvironment != nil:
+		if budget.EffectiveThreshold < *a.autoCompactEnvironment {
+			a.lastError = fmt.Sprintf("环境变量 GROK_AUTO_COMPACT_THRESHOLD_PERCENT=%d 高于模型 %s 的安全阈值 %d；配置文件无法覆盖该环境变量",
+				*a.autoCompactEnvironment, channelID, budget.SafeThreshold)
+		}
+	default:
+		current, managed := a.managedThresholds[channelID]
+		needsClamp := budget.EffectiveThreshold < budget.DesiredThreshold
+		if !needsClamp && !managed {
+			a.logger.Printf("model capacity learned model=%s context_window=%d max_completion_tokens=%d safe_threshold=%d; user threshold=%d retained",
+				channelID, budget.ContextWindow, budget.MaxCompletionTokens, budget.SafeThreshold, budget.DesiredThreshold)
+		} else if !managed || current != budget.EffectiveThreshold {
+			nextThresholds[channelID] = budget.EffectiveThreshold
+			thresholdChanged = true
+		}
+	}
+	if !contextChanged && !thresholdChanged {
+		return
+	}
+	routeMap := make(map[string]config.Route, len(a.routes))
+	for _, currentRoute := range a.routes {
+		routeMap[currentRoute.ChannelID] = currentRoute
+	}
+	targets := buildConfigTargets(a.models, routeMap, nextContextWindows, nextThresholds)
+	a.cfgMu.Lock()
+	result, err := cfgpatch.ApplyTargets(config.ConfigPath(), cfgpatch.StatePath(a.dataDir), targets)
+	a.cfgMu.Unlock()
+	if err != nil {
+		a.lastError = "更新自动压缩配置失败: " + err.Error()
+		a.logger.Printf("auto compact configuration update failed model=%s: %v", channelID, err)
+		return
+	}
+	a.managedContextWindows = nextContextWindows
+	a.managedThresholds = nextThresholds
+	a.lastError = ""
+	a.logger.Printf("auto compact configuration updated model=%s desired=%d safe=%d effective=%d context_window=%d max_completion_tokens=%d margin=%d context_changed=%d threshold_changed=%d",
+		channelID, budget.DesiredThreshold, budget.SafeThreshold, budget.EffectiveThreshold,
+		budget.ContextWindow, budget.MaxCompletionTokens, budget.Margin, result.ContextWindows, result.AutoCompactThresholds)
+	a.queueGrokRefresh("capacity", enableGrokSessionSelections(a.patchedIDs, a.modelAliases))
+}
+
+func (a *App) capacityBudget(route config.Route) capacity.Budget {
+	values := capacity.Values{}
+	if key := a.capacityKeys[route.ChannelID]; key != "" && a.capacityCache != nil {
+		values, _ = a.capacityCache.Lookup(key)
+	}
+	return budgetForRoute(route, values, a.autoCompactEnvironment)
+}
+
+func budgetForRoute(route config.Route, learned capacity.Values, environment *uint8) capacity.Budget {
+	contextWindow := learned.ContextWindow
+	if route.ContextWindowConfigured {
+		contextWindow = route.ContextWindow
+	}
+	maxCompletionTokens := learned.MaxCompletionTokens
+	if route.MaxCompletionTokensConfigured {
+		maxCompletionTokens = route.MaxCompletionTokens
+	}
+	desired := route.AutoCompactThresholdPercent
+	if environment != nil {
+		desired = *environment
+	}
+	return capacity.Calculate(contextWindow, maxCompletionTokens, desired)
+}
+
+func routeByID(routes []config.Route, channelID string) (config.Route, bool) {
+	for _, route := range routes {
+		if route.ChannelID == channelID {
+			return route, true
+		}
+	}
+	return config.Route{}, false
+}
+
+func (a *App) autoCompactStatus() string {
+	learning, conflicts := 0, 0
+	for _, route := range a.routes {
+		budget := a.capacityBudget(route)
+		if budget.Conflict {
+			conflicts++
+		} else if !budget.Ready {
+			learning++
+		}
+	}
+	status := fmt.Sprintf("【自动压缩】按模型安全预算：已校正 %d 个上下文窗口、%d 个阈值；容量学习中 %d 个；容量冲突 %d 个",
+		len(a.managedContextWindows), len(a.managedThresholds), learning, conflicts)
+	if a.autoCompactEnvironment != nil {
+		status += "；检测到环境变量优先设置，配置文件无法覆盖"
+	}
+	return status
+}
+
+func (a *App) queueGrokRefresh(phase string, selections map[string]string) {
+	a.backgroundMu.Lock()
+	if a.backgroundCtx == nil || a.backgroundCtx.Err() != nil {
+		a.backgroundMu.Unlock()
+		return
+	}
+	if a.refreshPending == nil {
+		a.refreshPending = &grokRefreshRequest{phase: phase, selections: cloneStringMap(selections)}
+	} else {
+		a.refreshPending.phase = phase
+		for current, desired := range selections {
+			a.refreshPending.selections[current] = desired
+		}
+	}
+	signal := a.refreshSignal
+	a.backgroundMu.Unlock()
+	select {
+	case signal <- struct{}{}:
+	default:
+	}
+}
+
+func (a *App) takeGrokRefresh() *grokRefreshRequest {
+	a.backgroundMu.Lock()
+	defer a.backgroundMu.Unlock()
+	pending := a.refreshPending
+	a.refreshPending = nil
+	return pending
+}
+
+func (a *App) runGrokRefreshWorker(ctx context.Context) {
+	defer a.backgroundWG.Done()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-a.refreshSignal:
+		}
+		request := a.takeGrokRefresh()
+		attempt := 1
+		for request != nil {
+			if attempt > 0 {
+				timer := time.NewTimer(a.grokRefreshRetryDelay(attempt))
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return
+				case <-a.refreshSignal:
+					timer.Stop()
+					if newer := a.takeGrokRefresh(); newer != nil {
+						request = newer
+						attempt = 1
+					}
+					continue
+				case <-timer.C:
+				}
+			}
+			if a.refreshGrokSessions == nil {
+				request = nil
+				continue
+			}
+			refreshCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+			result, err := a.refreshGrokSessions(refreshCtx, request.selections)
+			cancel()
+			a.mu.Lock()
+			if a.running {
+				a.recordGrokRefresh(request.phase+"-retry", result, err)
+			}
+			a.mu.Unlock()
+			if newer := a.takeGrokRefresh(); newer != nil {
+				request = newer
+				attempt = 1
+				continue
+			}
+			if result.SkippedActiveSessions == 0 || attempt >= maxGrokRefreshRetries || ctx.Err() != nil {
+				if result.SkippedActiveSessions > 0 && attempt >= maxGrokRefreshRetries && ctx.Err() == nil {
+					a.mu.Lock()
+					if a.running {
+						a.grokSyncStatus += "；活动会话持续未空闲，已停止本轮自动刷新"
+					}
+					a.mu.Unlock()
+					a.logger.Printf("grok session hot reload retries exhausted phase=%s attempts=%d", request.phase, attempt)
+				}
+				request = nil
+				continue
+			}
+			attempt++
+		}
+	}
+}
+
+func grokRefreshRetryDelay(attempt int) time.Duration {
+	if attempt <= 0 {
+		return 0
+	}
+	delay := 2 * time.Second
+	for index := 1; index < attempt && delay < time.Minute; index++ {
+		delay *= 2
+		if delay > time.Minute {
+			delay = time.Minute
+		}
+	}
+	return delay
+}
+
+func (a *App) grokRefreshRetryDelay(attempt int) time.Duration {
+	if a.refreshRetryDelay != nil {
+		return a.refreshRetryDelay(attempt)
+	}
+	return grokRefreshRetryDelay(attempt)
 }
 
 func enableGrokSessionSelections(targetIDs []string, legacyAliases map[string]string) map[string]string {
@@ -744,6 +1215,17 @@ func cloneStringMap(values map[string]string) map[string]string {
 
 func (a *App) Stop() error {
 	a.mu.Lock()
+	if !a.running {
+		a.mu.Unlock()
+		return nil
+	}
+	a.mu.Unlock()
+
+	// Runtime capacity and delayed session-refresh workers may briefly hold the
+	// application lock while applying a transaction. Cancel and join them before
+	// starting the final restore transaction so no new rewrite can race shutdown.
+	a.stopBackgroundWorkers()
+	a.mu.Lock()
 	defer a.mu.Unlock()
 	if !a.running {
 		return nil
@@ -758,6 +1240,7 @@ func (a *App) Stop() error {
 		err := ccSwitchConflictError(takeover, "停止 hellogrok")
 		a.lastError = err.Error()
 		a.logger.Printf("stop deferred while config has another owner: %v", err)
+		a.startBackgroundWorkersLocked()
 		return err
 	}
 	if takeoverErr != nil {
@@ -792,6 +1275,7 @@ func (a *App) Stop() error {
 	if err != nil {
 		a.lastError = err.Error()
 		a.logger.Printf("config restore deferred; proxy remains active: %v", err)
+		a.startBackgroundWorkersLocked()
 		return err
 	}
 	if relinquished {
@@ -808,6 +1292,13 @@ func (a *App) Stop() error {
 	a.patchedIDs = nil
 	a.modelAliases = nil
 	a.grokSyncStatus = ""
+	a.models = nil
+	a.routes = nil
+	a.capacityCache = nil
+	a.capacityKeys = nil
+	a.managedContextWindows = nil
+	a.managedThresholds = nil
+	a.autoCompactEnvironment = nil
 	a.lastError = ""
 	a.logger.Printf("stopped")
 	return nil

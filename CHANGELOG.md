@@ -6,6 +6,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.1.12] — 2026-08-16
+
+### Changed
+
+- Auto-compaction is now budgeted per custom model. hellogrok resolves the model-level, global session, or default 85% preference, reserves the active maximum output plus a 5% context margin with an 8K minimum, and temporarily lowers only unsafe model thresholds. A lower user threshold is never raised.
+- Missing capacity is learned without model-name allowlists from actual request output limits, valid upstream model-capacity headers, and unambiguous structured context errors. Trusted learned context windows are temporarily projected onto the model so Grok Build uses the same denominator; privacy-preserving hashed capacity records expire after 30 days.
+
+### Fixed
+
+- Switching between channels with different context and output limits now reloads each model's own compaction budget instead of sharing one global minimum. Active Grok sessions are refreshed after they become idle through bounded, cancellable, coalesced retries, and proxy shutdown cancels those workers before restoring configuration.
+- Capacity learning, threshold updates, and context-window projection use the existing recovery transaction. A failed runtime update keeps the previous active configuration and recovery state, while proxy stop restores original bytes, preserves concurrent user edits even when TOML is temporarily invalid, and leaves request-derived output limits in the private cache instead of turning them into a model output cap.
+
 ## [0.1.11] — 2026-08-16
 
 ### Fixed
@@ -216,7 +228,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - CC Switch compatibility detection and conflict warnings.
 - Builds for Windows, Linux, and macOS on amd64 and arm64.
 
-[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.11...HEAD
+[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.12...HEAD
+[0.1.12]: https://github.com/hellowind777/hellogrok/compare/v0.1.11...v0.1.12
 [0.1.11]: https://github.com/hellowind777/hellogrok/compare/v0.1.10...v0.1.11
 [0.1.10]: https://github.com/hellowind777/hellogrok/compare/v0.1.9...v0.1.10
 [0.1.9]: https://github.com/hellowind777/hellogrok/compare/v0.1.8...v0.1.9

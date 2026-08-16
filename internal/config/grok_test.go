@@ -142,6 +142,66 @@ func TestBuildRoutesRecordsWireModels(t *testing.T) {
 	}
 }
 
+func TestLoadModelsResolvesAutoCompactThresholdPerModel(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	raw := `[session]
+auto_compact_threshold_percent = 80
+
+[model.inherited]
+base_url = "https://one.example/v1"
+
+[model.explicit]
+base_url = "https://two.example/v1"
+auto_compact_threshold_percent = 65
+`
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	models, err := LoadModels(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := map[string]Model{}
+	for _, model := range models {
+		byID[model.ID] = model
+	}
+	if got := byID["inherited"]; got.AutoCompactThresholdPercent != 80 || !got.AutoCompactThresholdConfigured {
+		t.Fatalf("global threshold was not inherited: %+v", got)
+	}
+	if got := byID["explicit"]; got.AutoCompactThresholdPercent != 65 || !got.AutoCompactThresholdConfigured {
+		t.Fatalf("model threshold did not win: %+v", got)
+	}
+	routes, err := BuildRoutes(models)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, route := range routes {
+		if route.AutoCompactThresholdPercent != byID[route.ChannelID].AutoCompactThresholdPercent {
+			t.Fatalf("route lost threshold: %+v", route)
+		}
+	}
+}
+
+func TestLoadModelsDefaultsAutoCompactThresholdTo85AndValidatesRange(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte("[model.one]\nbase_url = \"https://example.test/v1\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	models, err := LoadModels(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(models) != 1 || models[0].AutoCompactThresholdPercent != 85 || models[0].AutoCompactThresholdConfigured {
+		t.Fatalf("default threshold = %+v", models)
+	}
+	if err := os.WriteFile(path, []byte("[model.one]\nbase_url = \"https://example.test/v1\"\nauto_compact_threshold_percent = 101\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadModels(path); err == nil || !strings.Contains(err.Error(), "between 0 and 100") {
+		t.Fatalf("out-of-range threshold was accepted: %v", err)
+	}
+}
+
 func TestOfficialDeepSeekRouteRecognitionUsesExactAPIHost(t *testing.T) {
 	tests := []struct {
 		name  string

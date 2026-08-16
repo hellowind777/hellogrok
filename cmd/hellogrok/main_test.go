@@ -14,8 +14,10 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/hellowind777/hellogrok/internal/appinfo"
+	"github.com/hellowind777/hellogrok/internal/capacity"
 	"github.com/hellowind777/hellogrok/internal/cfgpatch"
 	"github.com/hellowind777/hellogrok/internal/config"
 	"github.com/hellowind777/hellogrok/internal/groksync"
@@ -28,6 +30,497 @@ func TestUsageIncludesApplicationVersion(t *testing.T) {
 	if !strings.Contains(output.String(), "hellogrok "+appinfo.Version) ||
 		!strings.Contains(output.String(), "version               print the application version") {
 		t.Fatalf("usage does not expose the application version:\n%s", output.String())
+	}
+}
+
+func TestConfiguredAutoCompactEnvironment(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   string
+		want    uint8
+		wantNil bool
+		wantErr bool
+	}{
+		{name: "empty", value: "", wantNil: true},
+		{name: "zero", value: "0", want: 0},
+		{name: "upper boundary", value: "100", want: 100},
+		{name: "out of range", value: "101", wantErr: true},
+		{name: "not an integer", value: "85.5", wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("GROK_AUTO_COMPACT_THRESHOLD_PERCENT", test.value)
+			got, err := configuredAutoCompactEnvironment()
+			if (err != nil) != test.wantErr {
+				t.Fatalf("configuredAutoCompactEnvironment() err=%v", err)
+			}
+			if test.wantErr {
+				return
+			}
+			if test.wantNil {
+				if got != nil {
+					t.Fatalf("configuredAutoCompactEnvironment() = %d, want nil", *got)
+				}
+				return
+			}
+			if got == nil || *got != test.want {
+				t.Fatalf("configuredAutoCompactEnvironment() = %v, want %d", got, test.want)
+			}
+		})
+	}
+}
+
+func TestAppProjectsIndependentSafeAutoCompactThresholdsAndRestores(t *testing.T) {
+	dir := t.TempDir()
+	grokHome := filepath.Join(dir, "grok")
+	dataDir := filepath.Join(dir, "data")
+	if err := os.MkdirAll(grokHome, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GROK_HOME", grokHome)
+	t.Setenv("GROK_AUTO_COMPACT_THRESHOLD_PERCENT", "")
+	configPath := filepath.Join(grokHome, "config.toml")
+	original := "[session]\nauto_compact_threshold_percent = 85\n\n" +
+		"[model.one]\nbase_url = \"https://one.example/v1\"\napi_key = \"test-key\"\ncontext_window = 1048576\nmax_completion_tokens = 384000\nauto_compact_threshold_percent = 90\n\n" +
+		"[model.two]\nbase_url = \"https://two.example/v1\"\napi_key = \"test-key\"\ncontext_window = 393216\nmax_completion_tokens = 65536\n"
+	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	server := proxy.New(log.New(io.Discard, "", 0))
+	server.PathAddr = "127.0.0.1:0"
+	app := &App{logger: log.New(io.Discard, "", 0), dataDir: dataDir, server: server}
+	if err := app.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if app.IsRunning() {
+			_ = app.Stop()
+		}
+	})
+	patched, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(patched)
+	oneStart := strings.Index(text, "[model.one]")
+	twoStart := strings.Index(text, "[model.two]")
+	if oneStart < 0 || twoStart <= oneStart ||
+		!strings.Contains(text[oneStart:twoStart], "auto_compact_threshold_percent = 58") ||
+		!strings.Contains(text[twoStart:], "auto_compact_threshold_percent = 78") {
+		t.Fatalf("per-model safe thresholds were not applied:\n%s", text)
+	}
+	if err := app.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(restored) != original {
+		t.Fatalf("config was not restored exactly\nwant: %q\ngot:  %q", original, restored)
+	}
+}
+
+func TestAppLeavesThresholdUnchangedUntilCapacityIsKnown(t *testing.T) {
+	dir := t.TempDir()
+	grokHome := filepath.Join(dir, "grok")
+	if err := os.MkdirAll(grokHome, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GROK_HOME", grokHome)
+	t.Setenv("GROK_AUTO_COMPACT_THRESHOLD_PERCENT", "")
+	configPath := filepath.Join(grokHome, "config.toml")
+	original := "[model.one]\nbase_url = \"https://one.example/v1\"\napi_key = \"test-key\"\n"
+	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	server := proxy.New(log.New(io.Discard, "", 0))
+	server.PathAddr = "127.0.0.1:0"
+	app := &App{logger: log.New(io.Discard, "", 0), dataDir: filepath.Join(dir, "data"), server: server}
+	if err := app.Start(); err != nil {
+		t.Fatal(err)
+	}
+	patched, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(patched), "auto_compact_threshold_percent") {
+		t.Fatalf("unknown capacity produced a guessed threshold:\n%s", patched)
+	}
+	if err := app.Stop(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAppLearnsRuntimeCapacityAndUpdatesThreshold(t *testing.T) {
+	dir := t.TempDir()
+	grokHome := filepath.Join(dir, "grok")
+	dataDir := filepath.Join(dir, "data")
+	if err := os.MkdirAll(grokHome, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GROK_HOME", grokHome)
+	t.Setenv("GROK_AUTO_COMPACT_THRESHOLD_PERCENT", "")
+	configPath := filepath.Join(grokHome, "config.toml")
+	original := "[model.one]\nbase_url = \"https://one.example/v1\"\napi_key = \"test-key\"\n"
+	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	server := proxy.New(log.New(io.Discard, "", 0))
+	server.PathAddr = "127.0.0.1:0"
+	app := &App{logger: log.New(io.Discard, "", 0), dataDir: dataDir, server: server}
+	if err := app.Start(); err != nil {
+		t.Fatal(err)
+	}
+	app.queueCapacityObservation("one", capacity.Observation{
+		ContextWindow: 1_048_576, ContextSource: capacity.SourceResponseHeader,
+		MaxCompletionTokens: 384_000, CompletionSource: capacity.SourceResponseHeader,
+	})
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		patched, err := os.ReadFile(configPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(patched), "auto_compact_threshold_percent = 58") &&
+			strings.Contains(string(patched), "context_window = 1048576") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("runtime capacity did not update threshold:\n%s", patched)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := app.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(restored) != original {
+		t.Fatalf("runtime threshold was not restored exactly\nwant: %q\ngot:  %q", original, restored)
+	}
+}
+
+func TestAppUsesTrustedCapacityCacheAtStartup(t *testing.T) {
+	dir := t.TempDir()
+	grokHome := filepath.Join(dir, "grok")
+	dataDir := filepath.Join(dir, "data")
+	if err := os.MkdirAll(grokHome, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GROK_HOME", grokHome)
+	t.Setenv("GROK_AUTO_COMPACT_THRESHOLD_PERCENT", "")
+	configPath := filepath.Join(grokHome, "config.toml")
+	original := "[model.one]\nbase_url = \"https://one.example/v1\"\napi_key = \"test-key\"\nmax_completion_tokens = 384000\n"
+	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	models, err := config.LoadModels(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	routes, err := config.BuildRoutes(models)
+	if err != nil || len(routes) != 1 {
+		t.Fatalf("BuildRoutes() routes=%d err=%v", len(routes), err)
+	}
+	cache, err := capacity.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := capacity.RouteKey(routes[0].OriginBase, routes[0].WireModel, routes[0].APIBackend)
+	if _, changed, err := cache.Observe(key, capacity.Observation{
+		ContextWindow: 1_048_576, ContextSource: capacity.SourceResponseHeader,
+	}); err != nil || !changed {
+		t.Fatalf("seed capacity cache changed=%t err=%v", changed, err)
+	}
+
+	server := proxy.New(log.New(io.Discard, "", 0))
+	server.PathAddr = "127.0.0.1:0"
+	app := &App{logger: log.New(io.Discard, "", 0), dataDir: dataDir, server: server}
+	if err := app.Start(); err != nil {
+		t.Fatal(err)
+	}
+	patched, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(patched), "context_window = 1048576") ||
+		!strings.Contains(string(patched), "auto_compact_threshold_percent = 58") {
+		t.Fatalf("cached capacity was not projected at startup:\n%s", patched)
+	}
+	if err := app.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(restored) != original {
+		t.Fatalf("cached startup projection was not restored exactly\nwant: %q\ngot:  %q", original, restored)
+	}
+}
+
+func TestAppUpdatesManagedCapacityWithoutLosingOriginalBytes(t *testing.T) {
+	dir := t.TempDir()
+	grokHome := filepath.Join(dir, "grok")
+	if err := os.MkdirAll(grokHome, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GROK_HOME", grokHome)
+	t.Setenv("GROK_AUTO_COMPACT_THRESHOLD_PERCENT", "")
+	configPath := filepath.Join(grokHome, "config.toml")
+	original := "[model.one]\r\nbase_url = \"https://one.example/v1\"\r\napi_key = \"test-key\"\r\nauto_compact_threshold_percent = 92 # personal\r\n"
+	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	server := proxy.New(log.New(io.Discard, "", 0))
+	server.PathAddr = "127.0.0.1:0"
+	app := &App{logger: log.New(io.Discard, "", 0), dataDir: filepath.Join(dir, "data"), server: server}
+	if err := app.Start(); err != nil {
+		t.Fatal(err)
+	}
+	waitFor := func(contextWindow, threshold string) {
+		t.Helper()
+		deadline := time.Now().Add(3 * time.Second)
+		for {
+			current, err := os.ReadFile(configPath)
+			if err != nil {
+				if time.Now().After(deadline) {
+					t.Fatal(err)
+				}
+				time.Sleep(10 * time.Millisecond)
+				continue
+			}
+			text := string(current)
+			if strings.Contains(text, contextWindow) && strings.Contains(text, threshold) {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("capacity update missing %q or %q:\n%s", contextWindow, threshold, text)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	app.queueCapacityObservation("one", capacity.Observation{
+		ContextWindow: 1_048_576, ContextSource: capacity.SourceResponseHeader,
+		MaxCompletionTokens: 384_000, CompletionSource: capacity.SourceResponseHeader,
+	})
+	waitFor("context_window = 1048576", "auto_compact_threshold_percent = 58")
+	app.queueCapacityObservation("one", capacity.Observation{
+		ContextWindow: 524_288, ContextSource: capacity.SourceResponseHeader,
+		MaxCompletionTokens: 65_536, CompletionSource: capacity.SourceResponseHeader,
+	})
+	waitFor("context_window = 524288", "auto_compact_threshold_percent = 82")
+	if err := app.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(restored) != original {
+		t.Fatalf("repeated capacity updates lost original bytes\nwant: %q\ngot:  %q", original, restored)
+	}
+}
+
+func TestAppPreservesRuntimeUserThresholdBeforeCapacityLearning(t *testing.T) {
+	dir := t.TempDir()
+	grokHome := filepath.Join(dir, "grok")
+	if err := os.MkdirAll(grokHome, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GROK_HOME", grokHome)
+	t.Setenv("GROK_AUTO_COMPACT_THRESHOLD_PERCENT", "")
+	configPath := filepath.Join(grokHome, "config.toml")
+	original := "[model.one]\nbase_url = \"https://one.example/v1\"\napi_key = \"test-key\"\n"
+	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	server := proxy.New(log.New(io.Discard, "", 0))
+	server.PathAddr = "127.0.0.1:0"
+	app := &App{logger: log.New(io.Discard, "", 0), dataDir: filepath.Join(dir, "data"), server: server}
+	if err := app.Start(); err != nil {
+		t.Fatal(err)
+	}
+	patched, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	userEdited := strings.Replace(string(patched), "api_key = \"test-key\"", "api_key = \"test-key\"\nauto_compact_threshold_percent = 40", 1)
+	if err := os.WriteFile(configPath, []byte(userEdited), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	app.queueCapacityObservation("one", capacity.Observation{
+		ContextWindow: 1_048_576, ContextSource: capacity.SourceResponseHeader,
+		MaxCompletionTokens: 384_000, CompletionSource: capacity.SourceResponseHeader,
+	})
+	time.Sleep(100 * time.Millisecond)
+	current, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(current), "auto_compact_threshold_percent = 40") ||
+		strings.Contains(string(current), "auto_compact_threshold_percent = 58") {
+		t.Fatalf("runtime user threshold was overwritten:\n%s", current)
+	}
+	if err := app.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(restored), "base_url = \"https://one.example/v1\"") ||
+		!strings.Contains(string(restored), "auto_compact_threshold_percent = 40") {
+		t.Fatalf("runtime user threshold did not survive shutdown:\n%s", restored)
+	}
+}
+
+func TestAppUsesRequestOutputForBudgetWithoutCreatingOutputCap(t *testing.T) {
+	dir := t.TempDir()
+	grokHome := filepath.Join(dir, "grok")
+	if err := os.MkdirAll(grokHome, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GROK_HOME", grokHome)
+	t.Setenv("GROK_AUTO_COMPACT_THRESHOLD_PERCENT", "")
+	configPath := filepath.Join(grokHome, "config.toml")
+	original := "[model.one]\nbase_url = \"https://one.example/v1\"\napi_key = \"test-key\"\ncontext_window = 1048576\n"
+	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	server := proxy.New(log.New(io.Discard, "", 0))
+	server.PathAddr = "127.0.0.1:0"
+	app := &App{logger: log.New(io.Discard, "", 0), dataDir: filepath.Join(dir, "data"), server: server}
+	if err := app.Start(); err != nil {
+		t.Fatal(err)
+	}
+	app.queueCapacityObservation("one", capacity.Observation{
+		MaxCompletionTokens: 384_000,
+		CompletionSource:    capacity.SourceRequest,
+	})
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		patched, err := os.ReadFile(configPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		text := string(patched)
+		if strings.Contains(text, "auto_compact_threshold_percent = 58") {
+			if strings.Contains(text, "max_completion_tokens") {
+				t.Fatalf("request-derived output was turned into a model cap:\n%s", text)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("request output did not produce a safe threshold:\n%s", text)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := app.Stop(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAppStopCancelsActiveSessionRefreshRetry(t *testing.T) {
+	dir := t.TempDir()
+	grokHome := filepath.Join(dir, "grok")
+	if err := os.MkdirAll(grokHome, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GROK_HOME", grokHome)
+	t.Setenv("GROK_AUTO_COMPACT_THRESHOLD_PERCENT", "")
+	configPath := filepath.Join(grokHome, "config.toml")
+	if err := os.WriteFile(configPath, []byte("[model.one]\nbase_url = \"https://one.example/v1\"\napi_key = \"test-key\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int32
+	retryStarted := make(chan struct{})
+	refresh := func(ctx context.Context, _ map[string]string) (groksync.Result, error) {
+		switch calls.Add(1) {
+		case 1:
+			return groksync.Result{GrokFound: true, ReachableLeaders: 1, TargetSessions: 1, SkippedActiveSessions: 1}, nil
+		case 2:
+			close(retryStarted)
+			<-ctx.Done()
+			return groksync.Result{GrokFound: true, ReachableLeaders: 1, TargetSessions: 1, SkippedActiveSessions: 1}, ctx.Err()
+		default:
+			return groksync.Result{GrokFound: true, ReachableLeaders: 1}, nil
+		}
+	}
+	server := proxy.New(log.New(io.Discard, "", 0))
+	server.PathAddr = "127.0.0.1:0"
+	app := &App{
+		logger: log.New(io.Discard, "", 0), dataDir: filepath.Join(dir, "data"), server: server,
+		refreshGrokSessions: refresh, refreshRetryDelay: func(int) time.Duration { return time.Millisecond },
+	}
+	if err := app.Start(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-retryStarted:
+	case <-time.After(time.Second):
+		t.Fatal("active-session refresh retry did not start")
+	}
+	started := time.Now()
+	if err := app.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("Stop waited too long for refresh cancellation: %s", elapsed)
+	}
+}
+
+func TestQueueGrokRefreshCoalescesPendingSelections(t *testing.T) {
+	app := &App{
+		backgroundCtx: context.Background(),
+		refreshSignal: make(chan struct{}, 1),
+	}
+	app.queueGrokRefresh("first", map[string]string{"one": "one"})
+	app.queueGrokRefresh("latest", map[string]string{"two": "two"})
+	request := app.takeGrokRefresh()
+	if request == nil || request.phase != "latest" ||
+		request.selections["one"] != "one" || request.selections["two"] != "two" {
+		t.Fatalf("coalesced request = %+v", request)
+	}
+	if len(app.refreshSignal) != 1 {
+		t.Fatalf("refresh signals = %d, want one coalesced signal", len(app.refreshSignal))
+	}
+}
+
+func TestGrokRefreshRetriesAreBounded(t *testing.T) {
+	var calls atomic.Int32
+	server := proxy.New(log.New(io.Discard, "", 0))
+	app := &App{
+		logger: log.New(io.Discard, "", 0), server: server, running: true,
+		refreshRetryDelay: func(int) time.Duration { return 0 },
+		refreshGrokSessions: func(context.Context, map[string]string) (groksync.Result, error) {
+			calls.Add(1)
+			return groksync.Result{
+				GrokFound: true, ReachableLeaders: 1, TargetSessions: 1, SkippedActiveSessions: 1,
+			}, nil
+		},
+	}
+	app.startBackgroundWorkersLocked()
+	t.Cleanup(app.stopBackgroundWorkers)
+	app.queueGrokRefresh("capacity", map[string]string{"one": "one"})
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		app.mu.Lock()
+		exhausted := strings.Contains(app.grokSyncStatus, "已停止本轮自动刷新")
+		app.mu.Unlock()
+		if exhausted {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("refresh retries did not finish: calls=%d", calls.Load())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if got := calls.Load(); got != maxGrokRefreshRetries {
+		t.Fatalf("refresh calls = %d, want %d", got, maxGrokRefreshRetries)
 	}
 }
 

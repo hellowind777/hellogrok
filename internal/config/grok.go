@@ -52,6 +52,11 @@ type Model struct {
 	// explicit model/provider output cap.
 	MaxCompletionTokens           uint64
 	MaxCompletionTokensConfigured bool
+	// AutoCompactThresholdPercent is the effective per-model, global session,
+	// or Grok Build default threshold. The configured flag distinguishes a user
+	// selection from the default value of 85.
+	AutoCompactThresholdPercent    uint8
+	AutoCompactThresholdConfigured bool
 	// InferenceIdleTimeoutSecs mirrors Grok Build's per-chunk timeout. The
 	// facade also uses it while waiting for upstream response headers, a phase
 	// Grok Build's stream-level timer does not cover.
@@ -136,6 +141,8 @@ type Route struct {
 	ContextWindowConfigured        bool
 	MaxCompletionTokens            uint64
 	MaxCompletionTokensConfigured  bool
+	AutoCompactThresholdPercent    uint8
+	AutoCompactThresholdConfigured bool
 	InferenceIdleTimeoutSecs       uint64
 	InferenceIdleTimeoutConfigured bool
 }
@@ -199,6 +206,7 @@ func LoadModels(path string) ([]Model, error) {
 		usableAuthProviders[name] = usableAuthProvider(rawProvider)
 	}
 	modelsConfig, _ := root["models"].(map[string]any)
+	sessionConfig, _ := root["session"].(map[string]any)
 	globalHeaders := map[string]string{}
 	if modelsConfig != nil {
 		var headerErr error
@@ -260,6 +268,13 @@ func LoadModels(path string) ([]Model, error) {
 		}
 		if maxCompletionTokens > uint64(^uint32(0)) {
 			return nil, fmt.Errorf("[model.%s].max_completion_tokens must be between 1 and %d", id, uint64(^uint32(0)))
+		}
+		autoCompactThreshold, autoCompactThresholdConfigured, err := inheritedUint64(m, sessionConfig, "auto_compact_threshold_percent")
+		if err != nil || autoCompactThreshold > 100 {
+			return nil, fmt.Errorf("[model.%s].auto_compact_threshold_percent must be an integer between 0 and 100", id)
+		}
+		if !autoCompactThresholdConfigured {
+			autoCompactThreshold = 85
 		}
 		inferenceIdleTimeoutSecs, inferenceIdleTimeoutConfigured, err := inheritedUint64(m, modelsConfig, "inference_idle_timeout_secs")
 		if err != nil {
@@ -340,6 +355,8 @@ func LoadModels(path string) ([]Model, error) {
 			ContextWindowConfigured:            contextWindowConfigured,
 			MaxCompletionTokens:                maxCompletionTokens,
 			MaxCompletionTokensConfigured:      maxCompletionTokensConfigured,
+			AutoCompactThresholdPercent:        uint8(autoCompactThreshold),
+			AutoCompactThresholdConfigured:     autoCompactThresholdConfigured,
 			InferenceIdleTimeoutSecs:           inferenceIdleTimeoutSecs,
 			InferenceIdleTimeoutConfigured:     inferenceIdleTimeoutConfigured,
 			AuthScheme:                         upstreamAuthScheme,
@@ -816,6 +833,8 @@ func BuildRoutes(models []Model) ([]Route, error) {
 			ContextWindowConfigured:            m.ContextWindowConfigured,
 			MaxCompletionTokens:                m.MaxCompletionTokens,
 			MaxCompletionTokensConfigured:      m.MaxCompletionTokensConfigured,
+			AutoCompactThresholdPercent:        m.AutoCompactThresholdPercent,
+			AutoCompactThresholdConfigured:     m.AutoCompactThresholdConfigured,
 			InferenceIdleTimeoutSecs:           m.InferenceIdleTimeoutSecs,
 			InferenceIdleTimeoutConfigured:     m.InferenceIdleTimeoutConfigured,
 		}

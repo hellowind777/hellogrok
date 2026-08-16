@@ -32,6 +32,117 @@ func TestChannelProxyURLRoundTrip(t *testing.T) {
 	}
 }
 
+func TestApplyTargetsTemporarilyProjectsPerModelAutoCompactThreshold(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	statePath := filepath.Join(dir, "state.json")
+	original := "[session]\nauto_compact_threshold_percent = 85\n\n" +
+		"[model.one]\nbase_url = \"https://one.example/v1\"\nauto_compact_threshold_percent = 90 # user value\n\n" +
+		"[model.two]\nbase_url = \"https://two.example/v1\"\n"
+	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	one, two := uint8(58), uint8(78)
+	result, err := ApplyTargets(configPath, statePath, []Target{
+		{ID: "one", ContextWindow: 1_048_576, AutoCompactThresholdPercent: &one},
+		{ID: "two", ContextWindow: 393_216, AutoCompactThresholdPercent: &two},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ContextWindows != 2 || result.AutoCompactThresholds != 2 {
+		t.Fatalf("rewrite result = %+v", result)
+	}
+	patched, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(patched)
+	if !strings.Contains(text, "auto_compact_threshold_percent = 58 # user value") ||
+		!strings.Contains(text, "context_window = 1048576") ||
+		!strings.Contains(text, "context_window = 393216") ||
+		!strings.Contains(text, "auto_compact_threshold_percent = 78") {
+		t.Fatalf("model thresholds were not projected independently:\n%s", text)
+	}
+	if _, err := Restore(configPath, statePath); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(restored) != original {
+		t.Fatalf("threshold lifecycle was not byte-exact\nwant: %q\ngot:  %q", original, restored)
+	}
+}
+
+func TestRestorePreservesConcurrentAutoCompactThresholdEdit(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	statePath := filepath.Join(dir, "state.json")
+	original := "[model.one]\nbase_url = \"https://one.example/v1\"\nauto_compact_threshold_percent = 90\n"
+	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	threshold := uint8(58)
+	if _, err := ApplyTargets(configPath, statePath, []Target{{ID: "one", AutoCompactThresholdPercent: &threshold}}); err != nil {
+		t.Fatal(err)
+	}
+	patched, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	userEdited := strings.Replace(string(patched), "auto_compact_threshold_percent = 58", "auto_compact_threshold_percent = 60", 1)
+	if err := os.WriteFile(configPath, []byte(userEdited), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Restore(configPath, statePath); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(restored), "auto_compact_threshold_percent = 60") ||
+		strings.Contains(string(restored), "auto_compact_threshold_percent = 90") {
+		t.Fatalf("concurrent user threshold was not preserved:\n%s", restored)
+	}
+}
+
+func TestRestoreAutoCompactThresholdFromInvalidTOML(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	statePath := filepath.Join(dir, "state.json")
+	original := "[model.one]\nbase_url = \"https://one.example/v1\"\nauto_compact_threshold_percent = 90\n"
+	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	threshold := uint8(58)
+	if _, err := ApplyTargets(configPath, statePath, []Target{{ID: "one", AutoCompactThresholdPercent: &threshold}}); err != nil {
+		t.Fatal(err)
+	}
+	patched, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalid := strings.Replace(string(patched), "auto_compact_threshold_percent = 58", "auto_compact_threshold_percent = 60", 1) + "broken = [\n"
+	if err := os.WriteFile(configPath, []byte(invalid), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Restore(configPath, statePath); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(restored), "base_url = \"https://one.example/v1\"") ||
+		!strings.Contains(string(restored), "auto_compact_threshold_percent = 60") ||
+		!strings.Contains(string(restored), "broken = [") {
+		t.Fatalf("invalid-TOML recovery lost user content:\n%s", restored)
+	}
+}
+
 func TestApplyTargetsQuotesLegacyDottedModelHeaderAndRestoresExactly(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.toml")
