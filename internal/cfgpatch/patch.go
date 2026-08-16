@@ -317,7 +317,7 @@ func ActiveProxyReferences(configPath string) ([]string, error) {
 func activeProxyReferences(raw []byte) ([]string, error) {
 	var root map[string]any
 	if err := toml.Unmarshal(raw, &root); err != nil {
-		return nil, fmt.Errorf("parse TOML: %w", err)
+		return activeProxyReferencesText(raw), nil
 	}
 	models := ModelTables(root)
 	refs := make([]string, 0)
@@ -1013,7 +1013,7 @@ func rewriteConfig(text string, targets map[string]Target, state *State) (string
 			continue
 		}
 		end := i + 1
-		for end < len(lines) && (!structural[end] || sectionRe.FindStringSubmatch(strings.TrimSpace(lines[end])) == nil) {
+		for end < len(lines) && (!structural[end] || tomlSection(lines[end]) == nil) {
 			end++
 		}
 		block := append([]string(nil), lines[i:end]...)
@@ -1424,9 +1424,14 @@ func Restore(configPath, statePath string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	original, err := matchesOriginalManagedState(raw, state)
-	if err != nil {
-		return 0, fmt.Errorf("validate original managed values: %w", err)
+	var parsed map[string]any
+	parseErr := toml.Unmarshal(raw, &parsed)
+	original := false
+	if parseErr == nil {
+		original, err = matchesOriginalManagedState(raw, state)
+		if err != nil {
+			return 0, fmt.Errorf("validate original managed values: %w", err)
+		}
 	}
 	if original {
 		if err := os.Remove(statePath); err != nil && !os.IsNotExist(err) {
@@ -1434,7 +1439,11 @@ func Restore(configPath, statePath string) (int, error) {
 		}
 		return 0, nil
 	}
-	state, err = prepareRestoreState(raw, state)
+	if parseErr == nil {
+		state, err = prepareRestoreState(raw, state)
+	} else {
+		state, err = prepareRestoreStateText(raw, state)
+	}
 	if err != nil {
 		return 0, fmt.Errorf("prepare config restore: %w", err)
 	}
@@ -1455,7 +1464,7 @@ func Restore(configPath, statePath string) (int, error) {
 			continue
 		}
 		end := i + 1
-		for end < len(lines) && (!structural[end] || sectionRe.FindStringSubmatch(strings.TrimSpace(lines[end])) == nil) {
+		for end < len(lines) && (!structural[end] || tomlSection(lines[end]) == nil) {
 			end++
 		}
 		block := append([]string(nil), lines[i:end]...)
@@ -1473,9 +1482,14 @@ func Restore(configPath, statePath string) (int, error) {
 	restored += featureRestored
 	text, subagentRestored := restoreSubagentEnabled(text, state.Subagents)
 	restored += subagentRestored
-	remaining, err := unexpectedProxyReferences([]byte(text), state)
-	if err != nil {
-		return 0, fmt.Errorf("validate restored config: %w", err)
+	var remaining []string
+	if parseErr == nil {
+		remaining, err = unexpectedProxyReferences([]byte(text), state)
+		if err != nil {
+			return 0, fmt.Errorf("validate restored config: %w", err)
+		}
+	} else {
+		remaining = activeProxyReferencesText([]byte(text))
 	}
 	if len(remaining) != 0 {
 		return 0, fmt.Errorf("config still contains temporary hellogrok routes after preserving concurrent edits: %s", strings.Join(remaining, ", "))
@@ -1700,6 +1714,209 @@ func prepareRestoreState(raw []byte, state State) (State, error) {
 	return state, nil
 }
 
+// prepareRestoreStateText is the invalid-TOML recovery path. It compares each
+// independently parseable managed assignment with the value hellogrok applied,
+// so unrelated half-written settings do not block shutdown or get discarded.
+func prepareRestoreStateText(raw []byte, state State) (State, error) {
+	lines := splitKeepNL(string(raw))
+	structural := tomlStructuralLines(lines)
+
+	if block := namedSectionBlock(lines, structural, "features"); block != nil {
+		state.Features.BackendTools = managedStateForText(block, "backend_tools", backendToolsAnyLine, state.Features.BackendTools)
+		state.Features.WebFetch = managedStateForText(block, "web_fetch", webFetchAnyLine, state.Features.WebFetch)
+	}
+	if state.Subagents.DottedLineCreated {
+		rootEnd := len(lines)
+		for index, line := range lines {
+			if structural[index] && tomlSection(line) != nil {
+				rootEnd = index
+				break
+			}
+		}
+		state.Subagents.Enabled = managedStateForText(lines[:rootEnd], "subagents.enabled", subagentsEnabledDottedAnyLine, state.Subagents.Enabled)
+	} else if block := namedSectionBlock(lines, structural, "subagents"); block != nil {
+		state.Subagents.Enabled = managedStateForText(block, "enabled", subagentsEnabledAnyLine, state.Subagents.Enabled)
+	}
+
+	ids := make([]string, 0, len(state.Models))
+	for id := range state.Models {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		block := modelSectionBlock(lines, structural, id)
+		if block == nil {
+			continue
+		}
+		modelState := state.Models[id]
+		if modelState.Section.Managed && block[0] != modelState.Section.AppliedLine {
+			modelState.Section.Managed = false
+		}
+		for _, field := range []struct {
+			key     string
+			pattern *regexp.Regexp
+			state   *ManagedLineState
+		}{
+			{"base_url", baseURLAnyLine, &modelState.BaseURL},
+			{"api_base_url", apiBaseURLAnyLine, &modelState.APIBaseURL},
+			{"api_backend", apiBackendAnyLine, &modelState.APIBackend},
+			{"max_completion_tokens", maxCompletionTokensAnyLine, &modelState.MaxCompletionTokens},
+			{"supports_backend_search", backendSearchAnyLine, &modelState.BackendSearch},
+			{"supports_reasoning_effort", supportsReasoningEffortAnyLine, &modelState.SupportsReasoningEffort},
+			{"reasoning_effort", reasoningEffortAnyLine, &modelState.ReasoningEffort},
+			{"reasoning_efforts", reasoningEffortsAnyLine, &modelState.ReasoningEfforts},
+		} {
+			*field.state = managedStateForText(block, field.key, field.pattern, *field.state)
+		}
+		state.Models[id] = modelState
+	}
+	return state, nil
+}
+
+func managedStateForText(block []string, key string, pattern *regexp.Regexp, state ManagedLineState) ManagedLineState {
+	if !state.Managed {
+		return state
+	}
+	value, exists, valid := managedTextValue(block, key, pattern)
+	if !exists || !valid || value != state.AppliedValue {
+		state.Managed = false
+	}
+	return state
+}
+
+func managedTextValue(block []string, key string, pattern *regexp.Regexp) (string, bool, bool) {
+	structural := tomlStructuralLines(block)
+	start := -1
+	for index, line := range block {
+		if !structural[index] || !pattern.MatchString(strings.TrimRight(line, "\r\n")) {
+			continue
+		}
+		if start >= 0 {
+			return "", true, false
+		}
+		start = index
+	}
+	if start < 0 {
+		return "", false, false
+	}
+
+	var assignment strings.Builder
+	for end := start; end < len(block); end++ {
+		assignment.WriteString(block[end])
+		var root map[string]any
+		if toml.Unmarshal([]byte("[managed]\n"+assignment.String()), &root) != nil {
+			continue
+		}
+		var value any = root["managed"]
+		found := true
+		for _, part := range strings.Split(key, ".") {
+			table, ok := value.(map[string]any)
+			if !ok {
+				found = false
+				break
+			}
+			value, found = table[part]
+			if !found {
+				break
+			}
+		}
+		if found {
+			semantic, ok := managedScalarString(value)
+			return semantic, true, ok
+		}
+	}
+	return "", true, false
+}
+
+func namedSectionBlock(lines []string, structural []bool, name string) []string {
+	start := -1
+	for index, line := range lines {
+		if !structural[index] {
+			continue
+		}
+		section := tomlSection(line)
+		if section == nil {
+			continue
+		}
+		if start >= 0 {
+			return lines[start:index]
+		}
+		if strings.EqualFold(strings.TrimSpace(section[1]), name) {
+			start = index
+		}
+	}
+	if start >= 0 {
+		return lines[start:]
+	}
+	return nil
+}
+
+func modelSectionBlock(lines []string, structural []bool, id string) []string {
+	start := -1
+	for index, line := range lines {
+		if !structural[index] || tomlSection(line) == nil {
+			continue
+		}
+		if start >= 0 {
+			return lines[start:index]
+		}
+		if modelSectionID(line) == id {
+			start = index
+		}
+	}
+	if start >= 0 {
+		return lines[start:]
+	}
+	return nil
+}
+
+func activeProxyReferencesText(raw []byte) []string {
+	lines := splitKeepNL(string(raw))
+	structural := tomlStructuralLines(lines)
+	currentModel := ""
+	seen := make(map[string]struct{})
+	for index, line := range lines {
+		if !structural[index] {
+			continue
+		}
+		if tomlSection(line) != nil {
+			currentModel = modelSectionID(line)
+			continue
+		}
+		bare := strings.TrimRight(line, "\r\n")
+		for _, field := range []struct {
+			key     string
+			pattern *regexp.Regexp
+		}{
+			{"base_url", baseURLAnyLine},
+			{"api_base_url", apiBaseURLAnyLine},
+		} {
+			if !field.pattern.MatchString(bare) {
+				continue
+			}
+			value, _, valid := managedTextValue([]string{line}, field.key, field.pattern)
+			isProxy := valid && IsProxyURL(value)
+			if !valid {
+				isProxy = strings.Contains(bare, "http://"+net.JoinHostPort(ProxyHost, ProxyPort)+"/c/")
+			}
+			if !isProxy {
+				continue
+			}
+			reference := field.key
+			if currentModel != "" {
+				reference = currentModel + "." + field.key
+			}
+			seen[reference] = struct{}{}
+		}
+	}
+	refs := make([]string, 0, len(seen))
+	for reference := range seen {
+		refs = append(refs, reference)
+	}
+	sort.Strings(refs)
+	return refs
+}
+
 func unexpectedProxyReferences(raw []byte, state State) ([]string, error) {
 	var root map[string]any
 	if err := toml.Unmarshal(raw, &root); err != nil {
@@ -1893,7 +2110,7 @@ func restoreFeatureFlags(text string, state FeatureState) (string, int) {
 		if !structural[index] {
 			continue
 		}
-		section := sectionRe.FindStringSubmatch(strings.TrimSpace(line))
+		section := tomlSection(line)
 		if section == nil {
 			continue
 		}
@@ -1993,7 +2210,7 @@ func restoreSubagentEnabled(text string, state SubagentState) (string, int) {
 		if !structural[index] {
 			continue
 		}
-		section := sectionRe.FindStringSubmatch(strings.TrimSpace(line))
+		section := tomlSection(line)
 		if section == nil {
 			continue
 		}
@@ -2268,7 +2485,7 @@ func skipTOMLLiteralString(line string, index int) int {
 }
 
 func modelSectionID(line string) string {
-	section := sectionRe.FindStringSubmatch(strings.TrimSpace(line))
+	section := tomlSection(line)
 	if section == nil {
 		return ""
 	}
@@ -2277,6 +2494,13 @@ func modelSectionID(line string) string {
 		return ""
 	}
 	return firstNonEmpty(model[1], model[2], model[3])
+}
+
+func tomlSection(line string) []string {
+	trimmed := strings.TrimSpace(line)
+	trimmed = strings.TrimPrefix(trimmed, "\ufeff")
+	trimmed = strings.TrimPrefix(trimmed, "\u00ef\u00bb\u00bf")
+	return sectionRe.FindStringSubmatch(strings.TrimSpace(trimmed))
 }
 
 func canonicalModelSectionLine(line, id string) (string, bool) {

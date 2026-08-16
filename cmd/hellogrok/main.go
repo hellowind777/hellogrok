@@ -752,15 +752,18 @@ func (a *App) Stop() error {
 	cfgPath := config.ConfigPath()
 	stPath := cfgpatch.StatePath(a.dataDir)
 	a.cfgMu.Lock()
-	takeover, err := cfgpatch.DetectCCSwitchTakeover(cfgPath)
-	if err == nil && takeover.Active() {
-		err = ccSwitchConflictError(takeover, "停止 hellogrok")
-	}
-	if err != nil {
+	takeover, takeoverErr := cfgpatch.DetectCCSwitchTakeover(cfgPath)
+	if takeoverErr == nil && takeover.Active() {
 		a.cfgMu.Unlock()
+		err := ccSwitchConflictError(takeover, "停止 hellogrok")
 		a.lastError = err.Error()
 		a.logger.Printf("stop deferred while config has another owner: %v", err)
 		return err
+	}
+	if takeoverErr != nil {
+		// A user may save config.toml while editing, leaving it temporarily
+		// invalid. The recovery transaction can still restore our own lines.
+		a.logger.Printf("config ownership inspection unavailable; continuing recovery: %v", takeoverErr)
 	}
 
 	activeReferences, err := cfgpatch.ActiveProxyReferences(cfgPath)

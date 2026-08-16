@@ -6,6 +6,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.1.11] — 2026-08-16
+
+### Fixed
+
+- Tray **Exit** now always terminates the application after attempting proxy cleanup, even when configuration restoration reports an ownership, access, or merge conflict. An unresolved recovery transaction remains available for the next launch instead of keeping the tray process alive.
+- Proxy-managed settings can now be restored when unrelated user edits make `config.toml` syntactically invalid, including malformed byte-order-mark text and incomplete values. Recovery compares independently parseable managed assignments, preserves user edits byte for byte, and refuses to discard its transaction if a temporary local route cannot be safely removed.
+
 ## [0.1.10] — 2026-08-16
 
 ### Changed
@@ -209,7 +216,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - CC Switch compatibility detection and conflict warnings.
 - Builds for Windows, Linux, and macOS on amd64 and arm64.
 
-[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.10...HEAD
+[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.11...HEAD
+[0.1.11]: https://github.com/hellowind777/hellogrok/compare/v0.1.10...v0.1.11
 [0.1.10]: https://github.com/hellowind777/hellogrok/compare/v0.1.9...v0.1.10
 [0.1.9]: https://github.com/hellowind777/hellogrok/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/hellowind777/hellogrok/compare/v0.1.7...v0.1.8

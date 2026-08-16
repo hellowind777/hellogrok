@@ -155,15 +155,19 @@ func onReady(c Controller, icon []byte, logger *log.Logger) {
 				}
 
 			case <-mQuit.ClickedCh:
-				if err := c.Stop(); err != nil {
-					logger.Printf("quit deferred: %v", err)
-					dialog.Info("hellogrok 无法退出", "为避免留下失效代理配置，hellogrok 仍保持运行:\n"+err.Error())
-					setRunningUI(c.IsRunning())
-					continue
+				if err := stopAndQuit(c.Stop, systray.Quit); err != nil {
+					// A recovery record remains on disk for the next launch. Quitting
+					// must never trap the user in the tray application.
+					logger.Printf("quit after cleanup warning: %v", err)
 				}
-				systray.Quit()
 				return
 			}
 		}
 	}()
+}
+
+func stopAndQuit(stop func() error, quit func()) error {
+	err := stop()
+	quit()
+	return err
 }

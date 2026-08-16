@@ -1718,6 +1718,179 @@ func TestRestorePreservesUnrelatedConcurrentEdit(t *testing.T) {
 	}
 }
 
+func TestRestoreRemovesProxyRoutesWhenUnrelatedTOMLIsInvalid(t *testing.T) {
+	tests := []struct {
+		name       string
+		corrupt    func(string) string
+		wantPrefix string
+		wantSuffix string
+	}{
+		{
+			name: "unfinished user setting",
+			corrupt: func(patched string) string {
+				return patched + "\n[user]\nunfinished = \"\n"
+			},
+			wantSuffix: "\n[user]\nunfinished = \"\n",
+		},
+		{
+			name: "mojibake byte order mark",
+			corrupt: func(patched string) string {
+				return "\u00ef\u00bb\u00bf" + patched
+			},
+			wantPrefix: "\u00ef\u00bb\u00bf",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			configPath := filepath.Join(dir, "config.toml")
+			statePath := filepath.Join(dir, "state.json")
+			original := "[model.one]\nbase_url = \"https://one.example/v1\"\n"
+			if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := ApplyTargets(configPath, statePath, []Target{{ID: "one"}}); err != nil {
+				t.Fatal(err)
+			}
+			patched, err := os.ReadFile(configPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			corrupt := test.corrupt(string(patched))
+			if err := os.WriteFile(configPath, []byte(corrupt), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := Restore(configPath, statePath); err != nil {
+				t.Fatal(err)
+			}
+			current, err := os.ReadFile(configPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := test.wantPrefix + original + test.wantSuffix
+			if string(current) != want {
+				t.Fatalf("invalid user edit was not preserved while restoring the route\nwant: %q\ngot:  %q", want, current)
+			}
+			if strings.Contains(string(current), "http://127.0.0.1:18787/c/") {
+				t.Fatalf("temporary proxy route remains: %q", current)
+			}
+			if _, err := os.Stat(statePath); !os.IsNotExist(err) {
+				t.Fatalf("rewrite state remains after recovery: %v", err)
+			}
+		})
+	}
+}
+
+func TestRestoreInvalidTOMLKeepsStateWhenProxyReferenceCannotBeOwned(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	statePath := filepath.Join(dir, "state.json")
+	original := "[model.one]\nbase_url = \"https://one.example/v1\"\n"
+	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ApplyTargets(configPath, statePath, []Target{{ID: "one"}}); err != nil {
+		t.Fatal(err)
+	}
+	patched, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conflicted := strings.Replace(string(patched), "[model.one]", "[model.renamed]", 1) + "invalid = \"\n"
+	if err := os.WriteFile(configPath, []byte(conflicted), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Restore(configPath, statePath); err == nil || !strings.Contains(err.Error(), "temporary hellogrok routes") {
+		t.Fatalf("unowned proxy reference error = %v", err)
+	}
+	current, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(current) != conflicted {
+		t.Fatalf("conflicted invalid config changed: %q", current)
+	}
+	if _, err := os.Stat(statePath); err != nil {
+		t.Fatalf("recovery state was lost after an unsafe restore: %v", err)
+	}
+}
+
+func TestRestoreInvalidTOMLPreservesUserOwnedManagedValue(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	statePath := filepath.Join(dir, "state.json")
+	original := "[model.one]\nbase_url = \"https://one.example/v1\"\n"
+	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ApplyTargets(configPath, statePath, []Target{{ID: "one"}}); err != nil {
+		t.Fatal(err)
+	}
+	patched, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	userURL := "https://user-owned.example/v1"
+	edited := strings.Replace(string(patched), "http://127.0.0.1:18787/c/one", userURL, 1) + "invalid = \"\n"
+	if err := os.WriteFile(configPath, []byte(edited), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Restore(configPath, statePath); err != nil {
+		t.Fatal(err)
+	}
+	current, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "[model.one]\nbase_url = \"" + userURL + "\"\n[features]\ninvalid = \"\n"
+	if string(current) != want {
+		t.Fatalf("invalid-TOML recovery did not preserve the user-owned managed value\nwant: %q\ngot:  %q", want, current)
+	}
+	if _, err := os.Stat(statePath); !os.IsNotExist(err) {
+		t.Fatalf("rewrite state remains after preserving the user-owned value: %v", err)
+	}
+}
+
+func TestRestoreInvalidTOMLDoesNotRewriteDuplicateManagedValue(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	statePath := filepath.Join(dir, "state.json")
+	original := "[model.one]\nbase_url = \"https://one.example/v1\"\n"
+	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ApplyTargets(configPath, statePath, []Target{{ID: "one"}}); err != nil {
+		t.Fatal(err)
+	}
+	patched, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxyLine := "base_url = \"http://127.0.0.1:18787/c/one\""
+	duplicate := proxyLine + "\nbase_url = \"https://user-owned.example/v1\""
+	edited := strings.Replace(string(patched), proxyLine, duplicate, 1) + "invalid = \"\n"
+	if err := os.WriteFile(configPath, []byte(edited), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Restore(configPath, statePath); err == nil || !strings.Contains(err.Error(), "temporary hellogrok routes") {
+		t.Fatalf("ambiguous duplicate managed value error = %v", err)
+	}
+	current, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(current) != edited {
+		t.Fatalf("ambiguous invalid config changed: %q", current)
+	}
+	if _, err := os.Stat(statePath); err != nil {
+		t.Fatalf("recovery state was lost after an ambiguous restore: %v", err)
+	}
+}
+
 func TestRestorePreservesConcurrentEditAfterOriginalFinalLine(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.toml")

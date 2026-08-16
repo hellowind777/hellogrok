@@ -6,7 +6,7 @@
 
 A cross-platform local proxy that makes Grok Build custom model channels work with common API formats, native Web tools, isolated authentication, and automatic configuration recovery.
 
-[![Version](https://img.shields.io/badge/version-0.1.10-2f6feb.svg)](./internal/appinfo/appinfo.go)
+[![Version](https://img.shields.io/badge/version-0.1.11-2f6feb.svg)](./internal/appinfo/appinfo.go)
 [![Go](https://img.shields.io/badge/Go-1.26.6-00ADD8.svg)](./go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#platform-support)
@@ -81,7 +81,8 @@ It is intended for users who maintain multiple third-party model channels and wa
 - Prevents an official Grok login token from being sent to an unrelated custom channel.
 - Validates channel-owned header names and values while loading configuration. Request framing, content, and connection headers remain controlled by the proxy.
 - Checks and temporarily completes required Grok settings when the proxy starts.
-- On normal stop, tray exit, Ctrl+C, SIGTERM, or failed startup, restores untouched temporary values while preserving concurrent user edits through a field-level three-way merge.
+- On normal stop, tray exit, Ctrl+C, SIGTERM, or failed startup, restores untouched temporary values while preserving concurrent user edits through a field-level three-way merge. If unrelated edits make the full TOML document invalid, line-scoped recovery still restores independently valid managed assignments without rewriting the invalid user bytes.
+- Always honors the tray **Exit** command after attempting cleanup. If safe restoration is impossible because the file cannot be accessed or an unowned local route remains, the recovery transaction stays on disk for the next launch instead of trapping the user in the tray process.
 - Recovers proxy-managed settings after an unclean exit with `hellogrok restore`.
 
 ### Desktop and operations
@@ -300,22 +301,22 @@ The Windows tray application and optional Unix tray build provide:
 - **Start proxy** — enabled by default on first launch; later starts and stops remember the selected state.
 - **Autostart** — enables or disables login startup.
 - **Status and logs** — opens the current status and live log window.
-- **Exit** — restores the configuration, stops the proxy, and exits. Defers when a config-ownership conflict exists.
+- **Exit** — attempts to restore the configuration and stop the proxy, then always exits the tray process. An unresolved recovery transaction remains available for the next launch.
 
 Only one tray instance runs in a login session; launching it again exits immediately instead of creating a second tray. The remembered tray state is independent from the foreground `hellogrok start` command.
 
 On Windows, the divider in **Status and logs** contains a retention selector and log search. Retention counts distinct dates on which hellogrok actually wrote logs rather than elapsed calendar days; the default keeps the latest 7 usage days, with `off`, 3, 7, 14, and 30 available. Cleanup runs at the next application start. Repeated **Search** clicks move to the next match and wrap to the beginning. Status text wraps; raw log lines remain unwrapped for reliable scanning.
 
-**Quit protection**: When a provider manager still owns Grok Build's configuration, the tray defers exit to avoid leaving an orphaned proxy route — resolve the configuration conflict first, then quit.
+**Stop protection**: The **Start proxy** toggle and foreground signal handler remain fail-closed when another provider manager owns Grok Build or a temporary hellogrok route cannot be restored safely. The tray **Exit** command is different: it always terminates after the cleanup attempt, so an external ownership conflict can never trap the user in the application.
 
-Configuration edits made while the proxy is active are merged field by field during shutdown. Values still matching hellogrok's temporary projection are restored to their startup values, while user-edited values and deleted model channels are preserved. Shutdown remains deferred when the merged configuration would leave one of the current takeover's temporary hellogrok routes behind or cannot be parsed safely.
+Configuration edits made while the proxy is active are merged field by field during shutdown. Values still matching hellogrok's temporary projection are restored to their startup values, while user-edited values and deleted model channels are preserved. When unrelated edits leave TOML temporarily invalid, hellogrok compares each managed assignment independently, restores only values it still owns, preserves the malformed user text byte for byte, and checks textually for remaining local routes. A cleanup that still cannot prove the route safe leaves the recovery state intact; tray exit nevertheless completes.
 
 ### Compatibility with CC Switch
 
 CC Switch and hellogrok can run at the same time only when CC Switch is not managing Grok Build. CC Switch's Grok Build proxy takeover and provider switch both write `~/.grok/config.toml`; using either operation while hellogrok owns that file creates a configuration-ownership conflict even though the proxies listen on different ports.
 
 - hellogrok refuses to start when it detects CC Switch's Grok Build takeover marker (`PROXY_MANAGED` on its `/grokbuild/v1` route).
-- If CC Switch takeover is enabled after hellogrok starts, hellogrok refuses to stop or exit until CC Switch releases Grok Build. This keeps CC Switch from later restoring a stopped `127.0.0.1:18787` route.
+- If CC Switch takeover is enabled after hellogrok starts, a normal proxy stop remains deferred until CC Switch releases Grok Build. Tray **Exit** still closes hellogrok and retains its recovery transaction; releasing CC Switch first remains the cleanest shutdown order.
 - If a provider manager completely replaces the live Grok config and no hellogrok route remains, hellogrok preserves the external config and relinquishes its obsolete recovery state.
 - CC Switch may continue managing Claude, Codex, Gemini, and other applications while hellogrok is active.
 
@@ -446,7 +447,7 @@ A display above 100% during an active tool loop has a different cause. Grok Buil
 
 Older hellogrok builds filled missing provider usage with zero-valued fields. That made a syntactically valid response report `total_tokens: 0`, so Grok Build repeatedly reset its baseline to zero and never reached the configured threshold. Current builds preserve trustworthy provider totals, derive a total only when complete input and output measurements exist, and emit `usage: null` for missing, partial, negative, fractional, all-zero placeholder, or otherwise untrustworthy accounting. A native Responses measurement with positive complete `context_details` remains usable even if its separate billing counters are zero.
 
-For first-party DeepSeek, hellogrok also requests streaming usage and preserves the provider's billing `total_tokens`. Capacity metadata follows one rule across DeepSeek, GPT, Claude, Grok, Gemini, and other channels: an explicit `[model.*]` or inherited `[model_providers.*]` value is authoritative; without one, valid upstream `X-Grok-*` headers are passed through. A context rejection may also disclose the window through `context_window`, `max_context_tokens`, `maximum_context_length`, `maximum_context_tokens`, `model_context_window`, or `max_model_len`; hellogrok accepts only one positive, unambiguous, non-overflowing value. `max_completion_tokens` uses the same configured-first priority, and a provider-only configured value is temporarily projected onto `[model.*]` because current Grok Build does not inherit it. The terminal usage updates the numerator while config, remote metadata, or Grok Build's catalog supplies the denominator. hellogrok does not rewrite `auto_compact_threshold_percent`.
+For first-party DeepSeek, hellogrok also requests streaming usage and preserves the provider's billing `total_tokens`. Capacity metadata follows one rule across DeepSeek, GPT, Claude, Grok, Gemini, and other channels: an explicit `[model.*]` or inherited `[model_providers.*]` value is authoritative; without one, valid upstream `X-Grok-*` headers are passed through. A context rejection may also disclose the window through `context_window`, `max_context_tokens`, `maximum_context_length`, `maximum_context_tokens`, `model_context_window`, or `max_model_len`; hellogrok accepts only one positive, unambiguous, non-overflowing value. `max_completion_tokens` uses the same configured-first priority, and a provider-only configured value is temporarily projected onto `[model.*]` because current Grok Build does not inherit it. The terminal usage updates the numerator while config, remote metadata, or Grok Build's catalog supplies the denominator. Grok Build computes the normal trigger as `context_window * auto_compact_threshold_percent / 100`; it does not subtract `max_completion_tokens` first. hellogrok does not rewrite that percentage.
 
 Current Grok Build deliberately ignores a context-window response-header downgrade. Therefore, if a model is absent from its catalog and the provider maximum is lower than Grok Build's fallback, no proxy can correct the denominator after the first response merely by forwarding that header; set `context_window` explicitly. A relay that omits usage also cannot be made exact without the provider's tokenizer and hidden prompt overhead. `usage: null` deliberately preserves Grok Build's prior baseline instead of corrupting it. After upgrading, start one new DeepSeek turn so its real terminal usage can replace any zero baseline already stored in the open session.
 
@@ -478,9 +479,9 @@ Grok Build replays all historical reasoning items, including provider-encrypted 
 
 Ensure no hellogrok process is running, then execute `hellogrok restore`. Do not run `restore` against an active proxy.
 
-### Stop or exit is deferred after editing the active configuration
+### Proxy stop is deferred after editing the active configuration
 
-hellogrok merges proxy-managed fields individually during shutdown, so an edit such as changing `supports_backend_search` does not need to be rolled back. If shutdown is still deferred, the edited TOML is invalid or a renamed/moved model still contains one of the current takeover's temporary `127.0.0.1:18787` routes. Restore a valid model structure or replace that temporary URL with the intended upstream URL, then stop again; do not force-terminate the process while Grok Build still points at it.
+hellogrok merges proxy-managed fields individually during shutdown, so changing `supports_backend_search` or leaving an unrelated TOML setting unfinished does not need to be rolled back before exit. A normal proxy stop is deferred only when recovery still finds an unowned `127.0.0.1:18787` route, the configuration file cannot be accessed, or another manager owns it. Restore the model header or replace the temporary URL with the intended upstream URL for a clean stop. Tray **Exit** always terminates and leaves unresolved recovery state for the next launch.
 
 ### Port `18787` is already in use
 
@@ -490,9 +491,9 @@ Stop the process that owns `127.0.0.1:18787` before enabling the proxy. hellogro
 
 Move shell-only environment variables into the persistent user or service environment, then restart the login service. The autostart process cannot inherit variables that existed only in an earlier terminal session.
 
-### Cannot quit while a provider manager owns Grok Build
+### A provider manager prevents a clean proxy stop
 
-Open the provider manager (e.g., CC Switch) and disable its Grok Build takeover first, then quit hellogrok. This prevents CC Switch from later restoring a route to a stopped proxy.
+Open the provider manager (for example, CC Switch) and disable its Grok Build takeover before stopping hellogrok. This preserves the intended restoration order. If immediate termination is required, tray **Exit** still closes hellogrok and retains the pending recovery transaction.
 
 ## Development
 

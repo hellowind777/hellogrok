@@ -870,6 +870,50 @@ func TestAppStopPreservesManagedConfigEdit(t *testing.T) {
 	}
 }
 
+func TestAppStopRestoresRoutesWhenUserConfigIsInvalid(t *testing.T) {
+	dir := t.TempDir()
+	grokHome := filepath.Join(dir, "grok")
+	dataDir := filepath.Join(dir, "data")
+	if err := os.MkdirAll(grokHome, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GROK_HOME", grokHome)
+	configPath := filepath.Join(grokHome, "config.toml")
+	original := "[model.one]\nbase_url = \"https://one.example/v1\"\napi_key = \"test-key\"\n"
+	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	server := proxy.New(log.New(io.Discard, "", 0))
+	server.PathAddr = "127.0.0.1:0"
+	app := &App{logger: log.New(io.Discard, "", 0), dataDir: dataDir, server: server}
+	if err := app.Start(); err != nil {
+		t.Fatal(err)
+	}
+	patched, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	userEdit := "\n[user]\nunfinished = \"\n"
+	if err := os.WriteFile(configPath, append(patched, []byte(userEdit)...), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := app.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	if app.IsRunning() {
+		t.Fatal("proxy remained active after invalid config recovery")
+	}
+	current, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := original + userEdit
+	if string(current) != want {
+		t.Fatalf("stop did not restore the proxy route while preserving the invalid user edit\nwant: %q\ngot:  %q", want, current)
+	}
+}
+
 func TestAppStopKeepsServingWhenRenamedModelStillReferencesHellogrok(t *testing.T) {
 	dir := t.TempDir()
 	grokHome := filepath.Join(dir, "grok")

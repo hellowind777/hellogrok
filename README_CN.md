@@ -6,7 +6,7 @@
 
 跨平台 Grok Build 本地代理，让自定义模型渠道兼容常见 API 格式、Build 原生 Web 工具、独立鉴权和自动配置恢复。
 
-[![Version](https://img.shields.io/badge/version-0.1.10-2f6feb.svg)](./internal/appinfo/appinfo.go)
+[![Version](https://img.shields.io/badge/version-0.1.11-2f6feb.svg)](./internal/appinfo/appinfo.go)
 [![Go](https://img.shields.io/badge/Go-1.26.6-00ADD8.svg)](./go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#平台支持)
@@ -81,7 +81,8 @@ hellogrok 为这些自定义渠道提供统一的本地兼容层。运行时准�
 - 避免把 Grok 官方登录令牌发送给无关的自定义渠道。
 - 加载配置时校验渠道请求头名称和值；请求分帧、内容和连接请求头仍由代理控制。
 - 代理启动时检查并临时补全 Grok 必需设置。
-- 正常停止、退出托盘、Ctrl+C、SIGTERM 或启动失败时恢复未被用户改动的临时值，并通过字段级三方合并保留代理运行期间的用户修改。
+- 正常停止、退出托盘、Ctrl+C、SIGTERM 或启动失败时恢复未被用户改动的临时值，并通过字段级三方合并保留代理运行期间的用户修改。无关修改使整份 TOML 无效时，逐行恢复仍会撤销可独立解析的受管字段，不改写用户的无效字节。
+- 托盘“退出”始终会在尝试清理后结束进程。若文件无法访问或仍有不属于原事务结构的本地路由，恢复事务会留在磁盘供下次启动处理，不会把用户困在托盘程序中。
 - 异常退出后可以使用 `hellogrok restore` 恢复代理管理的设置。
 
 ### 桌面与运维
@@ -300,22 +301,22 @@ Windows 托盘程序和可选 Unix 托盘版提供：
 - **启动代理**：首次打开默认启用；之后启动或停止代理时记住当前选择。
 - **开机启动**：启用或禁用登录自启动。
 - **状态与日志**：打开当前状态和实时日志窗口。
-- **退出**：恢复配置、停止代理并退出程序。配置所有权冲突时推迟退出。
+- **退出**：尝试恢复配置并停止代理，随后始终结束托盘进程；未完成的恢复事务会留给下次启动继续处理。
 
 同一登录会话只运行一个托盘实例；再次打开会直接退出，不会创建第二个托盘。托盘记忆状态与前台运行的 `hellogrok start` 命令相互独立。
 
 Windows 的“状态与日志”分割工具条提供自动清理天数选择和日志搜索。保留天数按 hellogrok 实际写过日志的不同日期计数，而不是按连续自然日计数；默认保留最近 7 个使用日，可选关闭、3、7、14、30。清理在下次启动应用时执行。重复点击“搜索”会跳到下一处匹配并在末尾回到开头。状态文本自动换行，原始日志行保持不换行，便于逐行检查。
 
-**退出保护：** 当供应商管理工具仍持有 Grok Build 配置所有权时，托盘会推迟退出以避免留下孤立代理地址——先解决配置冲突再退出。
+**停止保护：** 当其他供应商管理工具持有 Grok Build，或临时 hellogrok 路由无法安全恢复时，“启动代理”开关和前台信号处理仍会保持失败关闭。托盘“退出”不同：完成清理尝试后始终结束进程，外部所有权冲突不会再把用户困在程序中。
 
-代理运行期间产生的配置修改会在停止时按字段合并：仍等于 hellogrok 临时值的字段恢复为启动前值，用户改过的字段和已删除的模型渠道则原样保留。若合并后仍残留本次接管产生的 hellogrok 临时路由，或配置已无法安全解析，退出保护仍会生效。
+代理运行期间产生的配置修改会在停止时按字段合并：仍等于 hellogrok 临时值的字段恢复为启动前值，用户改过的字段和已删除的模型渠道则原样保留。无关编辑让 TOML 暂时无效时，hellogrok 会独立比较每个受管赋值，只恢复仍归自己所有的值，逐字节保留用户的无效文本，并通过文本检查确认是否还有本地路由。若仍无法证明恢复安全，恢复状态会原样保留，但托盘退出仍会完成。
 
 ### 与 CC Switch 兼容
 
 只有在 CC Switch 不管理 Grok Build 时，它才能与 hellogrok 同时运行。CC Switch 的 Grok Build 代理接管和供应商切换都会写入 `~/.grok/config.toml`；即使两个代理监听不同端口，同时操作仍会发生配置所有权冲突。
 
 - 检测到 CC Switch 的 Grok Build 接管标记（其 `/grokbuild/v1` 地址上的 `PROXY_MANAGED`）时，hellogrok 会拒绝启动。
-- 如果先启动 hellogrok、随后误开 CC Switch 接管，hellogrok 会拒绝停止或退出，直到 CC Switch 先释放 Grok Build，避免 CC Switch 日后恢复已停服的 `127.0.0.1:18787` 地址。
+- 如果先启动 hellogrok、随后误开 CC Switch 接管，普通停止代理操作仍会等待 CC Switch 先释放 Grok Build。托盘“退出”仍会关闭 hellogrok 并保留恢复事务；先释放 CC Switch 仍是最干净的停止顺序。
 - 如果供应商管理工具已整份替换 Grok 实时配置，且其中不再包含任何 hellogrok 地址，hellogrok 会保留外部配置并放弃过期的恢复状态。
 - hellogrok 运行期间，CC Switch 仍可管理 Claude、Codex、Gemini 等其他应用。
 
@@ -446,7 +447,7 @@ DeepSeek 的 1M 上下文是输入与生成输出共享的总预算，Responses 
 
 旧版 hellogrok 会把供应商缺失的用量补成全零字段。这样语法有效的响应就会报告 `total_tokens: 0`，导致 Grok Build 每轮都把基线重置为零，始终无法达到配置阈值。当前版本会保留可信的供应商总量；只有输入和输出测量都完整时才推导总量；缺失、不完整、负数、小数、全零占位或其他不可信用量统一输出 `usage: null`。原生 Responses 若带有完整且为正数的 `context_details`，即使独立的计费计数为零，仍可作为实时上下文计量使用。
 
-对于 DeepSeek 官方端点，hellogrok 还会请求流式终止用量并保留供应商计费 `total_tokens`。容量元数据对 DeepSeek、GPT、Claude、Grok、Gemini 及其他渠道统一遵循一个规则：显式 `[model.*]` 或继承的 `[model_providers.*]` 值优先；没有配置时才透传有效的上游 `X-Grok-*` 响应头。上下文拒绝还可能通过 `context_window`、`max_context_tokens`、`maximum_context_length`、`maximum_context_tokens`、`model_context_window` 或 `max_model_len` 暴露窗口；hellogrok 只接受唯一、正数、无歧义且不溢出的值。`max_completion_tokens` 使用同样的配置优先级；由于当前 Grok Build 不继承 provider 的该字段，hellogrok 会临时物化到 `[model.*]`。终止用量更新分子，配置、远端元数据或 Grok Build 模型目录提供分母。hellogrok 不改写 `auto_compact_threshold_percent`。
+对于 DeepSeek 官方端点，hellogrok 还会请求流式终止用量并保留供应商计费 `total_tokens`。容量元数据对 DeepSeek、GPT、Claude、Grok、Gemini 及其他渠道统一遵循一个规则：显式 `[model.*]` 或继承的 `[model_providers.*]` 值优先；没有配置时才透传有效的上游 `X-Grok-*` 响应头。上下文拒绝还可能通过 `context_window`、`max_context_tokens`、`maximum_context_length`、`maximum_context_tokens`、`model_context_window` 或 `max_model_len` 暴露窗口；hellogrok 只接受唯一、正数、无歧义且不溢出的值。`max_completion_tokens` 使用同样的配置优先级；由于当前 Grok Build 不继承 provider 的该字段，hellogrok 会临时物化到 `[model.*]`。终止用量更新分子，配置、远端元数据或 Grok Build 模型目录提供分母。Grok Build 的常规触发值是 `context_window * auto_compact_threshold_percent / 100`，不会先减去 `max_completion_tokens`；hellogrok 不改写这个百分比。
 
 当前 Grok Build 会有意忽略响应头对上下文窗口的降级。因此，若模型不在其目录中且供应商真实上限低于 Grok Build 回退值，仅靠代理转发首次响应头无法在事后纠正分母，必须显式设置 `context_window`。若某个中转完全不返回用量，代理在没有供应商 tokenizer 和隐藏提示开销的情况下也无法制造精确结果；`usage: null` 的目的就是保留 Grok Build 既有基线，而不是再次破坏它。升级后先发起一次新的 DeepSeek 请求，让真实终止用量覆盖已打开会话中可能保存的零基线。
 
@@ -478,9 +479,9 @@ Grok Build 在 `/model` 切换后会重放全部历史推理项，其中可能�
 
 先确认没有 hellogrok 进程正在运行，再执行 `hellogrok restore`。不要对正在运行的代理执行 `restore`。
 
-### 修改运行中的配置后仍无法停止或退出
+### 修改运行中的配置后仍无法停止代理
 
-hellogrok 会在停止时逐字段合并代理受管配置，因此修改 `supports_backend_search` 等字段后无需手动回滚。若仍推迟退出，说明修改后的 TOML 无法解析，或改名/移动后的模型仍保留本次接管产生的 `127.0.0.1:18787` 临时路由。恢复有效的模型结构，或把该临时 URL 改成预期的上游 URL 后再停止；Grok Build 仍指向代理时不要强制结束进程。
+hellogrok 会在停止时逐字段合并代理受管配置，因此修改 `supports_backend_search` 或让无关 TOML 设置暂时未完成，都不需要在退出前手动回滚。只有恢复后仍发现不属于原事务结构的 `127.0.0.1:18787` 路由、配置文件无法访问，或其他工具持有配置时，普通停止才会推迟。恢复模型表头或把临时 URL 改为预期上游地址即可干净停止。托盘“退出”始终结束进程，并把未解决的恢复状态留给下次启动。
 
 ### 端口 `18787` 已占用
 
@@ -490,9 +491,9 @@ hellogrok 会在停止时逐字段合并代理受管配置，因此修改 `suppo
 
 把只在终端中存在的环境变量写入持久用户环境或服务环境，然后重新启动登录服务。自启动进程无法继承先前终端会话里的临时变量。
 
-### 供应商管理工具持有 Grok Build 时无法退出
+### 供应商管理工具阻止干净停止代理
 
-先打开供应商管理工具（如 CC Switch）关闭其 Grok Build 接管，再退出 hellogrok。这避免 CC Switch 日后恢复指向已停服代理的路由。
+先打开供应商管理工具（如 CC Switch）关闭其 Grok Build 接管，再停止 hellogrok，以保持正确的配置恢复顺序。若必须立即结束，托盘“退出”仍会关闭 hellogrok，并保留待处理的恢复事务。
 
 ## 开发与测试
 
