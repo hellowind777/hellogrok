@@ -739,13 +739,13 @@ func TestDeepSeekResponsesExposeLiveContextToGrokBuild(t *testing.T) {
 			}
 			usage, _ := response["usage"].(map[string]any)
 			contextDetails, hasContext := usage["context_details"].(map[string]any)
-			if hasContext != test.official {
-				t.Fatalf("context_details presence=%t want %t: %s", hasContext, test.official, data)
+			if !hasContext {
+				t.Fatalf("context_details missing: %s", data)
 			}
 			if numberInt(usage["total_tokens"]) != 99 {
 				t.Fatalf("billing total changed: %s", data)
 			}
-			if test.official && (numberInt(contextDetails["input_tokens"]) != 40 || numberInt(contextDetails["output_tokens"]) != 2) {
+			if numberInt(contextDetails["input_tokens"]) != 40 || numberInt(contextDetails["output_tokens"]) != 2 {
 				t.Fatalf("live context details are wrong: %s", data)
 			}
 		})

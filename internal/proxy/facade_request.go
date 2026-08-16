@@ -241,14 +241,8 @@ func adaptFacadeRequestWithReasoning(
 			request.Kind = clientSearchRequest
 		}
 		searchEligible := request.HostedWebSearch && toolChoiceAllowsHostedSearch(root["tool_choice"])
-		deepSeekSourceSearch := isOfficialDeepSeekRoute(route) && route.ChatSearchDialect == "" && searchEligible
 		if !searchEligible {
 			request.Protocol = native
-		} else if deepSeekSourceSearch {
-			// DeepSeek Responses currently omits source URLs even when the standard
-			// include hint is sent. Its official Messages result blocks retain those
-			// URLs for Grok Build's native expandable display.
-			request.Protocol = wireMessages
 		} else if catalogHostedSearch {
 			request.Protocol = native
 		} else {
@@ -1342,10 +1336,7 @@ func chatSearchDialect(route config.Route) config.ChatSearchDialect {
 	if route.ChatSearchDialect != "" {
 		return route.ChatSearchDialect
 	}
-	if isOfficialDeepSeekRoute(route) {
-		return config.ChatSearchDialectMessages
-	}
-	if isOfficialXAIHost(route.Host) {
+	if isOfficialDeepSeekRoute(route) || isOfficialXAIHost(route.Host) {
 		return config.ChatSearchDialectResponses
 	}
 	return config.ChatSearchDialectWebSearchOptions

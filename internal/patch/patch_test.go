@@ -549,6 +549,7 @@ func TestContextDetailsAreDerivedOnlyFromCompleteRealUsage(t *testing.T) {
 		wantNull    bool
 	}{
 		{name: "complete", usage: `{"input_tokens":40,"output_tokens":2,"total_tokens":99}`, wantContext: true},
+		{name: "chat-compatible aliases", usage: `{"prompt_tokens":40,"completion_tokens":2,"total_tokens":99,"prompt_tokens_details":{"cached_tokens":7},"completion_tokens_details":{"reasoning_tokens":1}}`, wantContext: true},
 		{name: "all-zero placeholder", usage: `{"input_tokens":0,"output_tokens":0,"total_tokens":0}`, wantNull: true},
 		{name: "overflowing sum", usage: `{"input_tokens":4294967295,"output_tokens":1,"total_tokens":4294967295}`},
 	}
@@ -574,6 +575,13 @@ func TestContextDetailsAreDerivedOnlyFromCompleteRealUsage(t *testing.T) {
 			if test.wantContext && (contextDetails["input_tokens"] != usage["input_tokens"] ||
 				contextDetails["output_tokens"] != usage["output_tokens"]) {
 				t.Fatalf("context_details did not use real input/output: %s", patched)
+			}
+			if test.name == "chat-compatible aliases" {
+				inputDetails, _ := usage["input_tokens_details"].(map[string]any)
+				outputDetails, _ := usage["output_tokens_details"].(map[string]any)
+				if inputDetails["cached_tokens"] != float64(7) || outputDetails["reasoning_tokens"] != float64(1) {
+					t.Fatalf("usage detail aliases were not normalized: %s", patched)
+				}
 			}
 			if test.name == "complete" && usage["total_tokens"] != float64(99) {
 				t.Fatalf("billing total was overwritten by live context: %s", patched)

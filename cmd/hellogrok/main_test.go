@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -409,8 +410,8 @@ func TestAppDoesNotInventDeepSeekLimits(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, expected := range []string{
-		"supports_reasoning_effort = true",
-		`reasoning_efforts = [{ value = "none", label = "None" }, { value = "low", label = "Low" }, { value = "high", label = "High", default = true }, { value = "max", label = "Max" }]`,
+		`reasoning_efforts = ["none", "low", "high", "max"]`,
+		`reasoning_effort = "high"`,
 	} {
 		if !strings.Contains(string(patched), expected) {
 			t.Fatalf("pre-response DeepSeek config missing %q:\n%s", expected, patched)
@@ -430,6 +431,113 @@ func TestAppDoesNotInventDeepSeekLimits(t *testing.T) {
 	}
 	if string(restored) != original {
 		t.Fatalf("DeepSeek config was not restored exactly\nwant: %q\ngot:  %q", original, restored)
+	}
+}
+
+func TestAppPreservesExplicitReasoningMenusWithoutAddingDefaults(t *testing.T) {
+	tests := []struct {
+		name string
+		menu string
+	}{
+		{"full compact list", `reasoning_efforts = ["none", "low", "high", "max"]`},
+		{"compact list without none", `reasoning_efforts = ["low", "high", "max"]`},
+		{"empty list", `reasoning_efforts = []`},
+		{"custom object menu", `reasoning_efforts = [{ value = "max", label = "Only Max", default = true }]`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			grokHome := filepath.Join(dir, "grok")
+			dataDir := filepath.Join(dir, "data")
+			if err := os.MkdirAll(grokHome, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("GROK_HOME", grokHome)
+			configPath := filepath.Join(grokHome, "config.toml")
+			original := "[model.deepseek]\n" +
+				"model = \"deepseek-v4-pro\"\n" +
+				"base_url = \"https://api.deepseek.com\"\n" +
+				"api_key = \"test-key\"\n" + test.menu + "\n"
+			if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			server := proxy.New(log.New(io.Discard, "", 0))
+			server.PathAddr = "127.0.0.1:0"
+			app := &App{logger: log.New(io.Discard, "", 0), dataDir: dataDir, server: server}
+			if err := app.Start(); err != nil {
+				t.Fatal(err)
+			}
+			patched, err := os.ReadFile(configPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(patched), test.menu) ||
+				strings.Contains(string(patched), `reasoning_effort = "high"`) ||
+				strings.Count(string(patched), "reasoning_efforts") != 1 {
+				t.Fatalf("explicit menu was not authoritative:\n%s", patched)
+			}
+			if err := app.Stop(); err != nil {
+				t.Fatal(err)
+			}
+			restored, _ := os.ReadFile(configPath)
+			if string(restored) != original {
+				t.Fatalf("explicit menu lifecycle was not byte-exact\nwant: %q\ngot:  %q", original, restored)
+			}
+		})
+	}
+}
+
+func TestAppMigratesLegacyReasoningArrayTablesOnce(t *testing.T) {
+	dir := t.TempDir()
+	grokHome := filepath.Join(dir, "grok")
+	dataDir := filepath.Join(dir, "data")
+	if err := os.MkdirAll(grokHome, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GROK_HOME", grokHome)
+	configPath := filepath.Join(grokHome, "config.toml")
+	var original strings.Builder
+	for _, id := range []string{"deepseek-v4-pro", "deepseek-v4-flash", "deepseek-v4-chat"} {
+		fmt.Fprintf(&original, "[model.%s]\nmodel = %q\nbase_url = \"https://api.deepseek.com\"\napi_key = \"test-key\"\nreasoning_effort = \"max\"\n", id, id)
+		for index, value := range []string{"none", "low", "high", "max"} {
+			fmt.Fprintf(&original, "[[model.%s.reasoning_efforts]]\nvalue = %q\nlabel = %q\n", id, value, strings.ToUpper(value[:1])+value[1:])
+			if index == 2 {
+				original.WriteString("default = true\n")
+			}
+		}
+		original.WriteString("\n")
+	}
+	if err := os.WriteFile(configPath, []byte(original.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	runLifecycle := func() string {
+		t.Helper()
+		server := proxy.New(log.New(io.Discard, "", 0))
+		server.PathAddr = "127.0.0.1:0"
+		app := &App{logger: log.New(io.Discard, "", 0), dataDir: dataDir, server: server}
+		if err := app.Start(); err != nil {
+			t.Fatal(err)
+		}
+		if err := app.Stop(); err != nil {
+			t.Fatal(err)
+		}
+		current, err := os.ReadFile(configPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(current)
+	}
+
+	first := runLifecycle()
+	if strings.Contains(first, "[[model.") || strings.Contains(first, "label =") ||
+		strings.Count(first, `reasoning_efforts = ["none", "low", "high", "max"]`) != 3 ||
+		strings.Count(first, `reasoning_effort = "max"`) != 3 {
+		t.Fatalf("legacy menus were not compacted exactly once:\n%s", first)
+	}
+	second := runLifecycle()
+	if second != first {
+		t.Fatalf("second lifecycle changed migrated config\nfirst:  %q\nsecond: %q", first, second)
 	}
 }
 

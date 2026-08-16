@@ -489,14 +489,16 @@ func (a *App) Start() error {
 			continue
 		}
 		targets = append(targets, cfgpatch.Target{
-			ID:                    model.ID,
-			APIBaseURL:            strings.TrimSpace(model.APIBaseURL) != "",
-			APIBackend:            route.APIBackend,
-			BuildAPIBackend:       buildAPIBackend(route),
-			SupportsBackendSearch: buildSupportsBackendSearch(route),
-			ProjectBackendSearch:  projectBackendSearch(route),
-			ReasoningEfforts:      buildDeepSeekReasoningEfforts(route),
-			MaxCompletionTokens:   configuredMaxCompletionTokens(route),
+			ID:                         model.ID,
+			APIBaseURL:                 strings.TrimSpace(model.APIBaseURL) != "",
+			APIBackend:                 route.APIBackend,
+			BuildAPIBackend:            buildAPIBackend(route),
+			SupportsBackendSearch:      buildSupportsBackendSearch(route),
+			ProjectBackendSearch:       projectBackendSearch(route),
+			ReasoningEfforts:           buildDeepSeekReasoningEfforts(route),
+			ReasoningEffortDefault:     buildDeepSeekReasoningEffortDefault(route),
+			MigrateLegacyReasoningMenu: route.LegacyGeneratedReasoningMenu,
+			MaxCompletionTokens:        configuredMaxCompletionTokens(route),
 		})
 	}
 	res, err := cfgpatch.ApplyTargets(cfgPath, stPath, targets)
@@ -515,8 +517,8 @@ func (a *App) Start() error {
 	a.patchedIDs = append([]string(nil), res.Targets...)
 	sort.Strings(a.patchedIDs)
 	a.modelAliases = cloneStringMap(res.LegacyModelAliases)
-	a.logger.Printf("config rewrite all: model_sections=%d base=%d api_base=%d api_backend=%d max_completion_tokens=%d backend_search=%d reasoning_support=%d reasoning_efforts=%d backend_tools=%d web_fetch=%d subagents_enabled=%d targets=%v",
-		res.ModelSections, res.BaseURLs, res.APIBaseURLs, res.APIBackends, res.MaxCompletionTokens, res.BackendSearch, res.SupportsReasoningEffort, res.ReasoningEfforts, res.BackendTools, res.WebFetch, res.SubagentsEnabled, res.Targets)
+	a.logger.Printf("config rewrite all: model_sections=%d base=%d api_base=%d api_backend=%d max_completion_tokens=%d backend_search=%d reasoning_effort=%d reasoning_efforts=%d backend_tools=%d web_fetch=%d subagents_enabled=%d targets=%v",
+		res.ModelSections, res.BaseURLs, res.APIBaseURLs, res.APIBackends, res.MaxCompletionTokens, res.BackendSearch, res.ReasoningEffort, res.ReasoningEfforts, res.BackendTools, res.WebFetch, res.SubagentsEnabled, res.Targets)
 	a.logger.Printf("config validation passed: backend_protocols=capability-projected backend_tools=true web_fetch=true backend_search=configured-or-selected-or-documented-default model_limits=configured-first-otherwise-remote deepseek_efforts=protocol-native-if-unconfigured subagent_defaults=repaired-if-needed targets=%d", res.ValidatedTargets)
 	a.refreshOpenGrokSessions("enable", enableGrokSessionSelections(a.patchedIDs, a.modelAliases))
 	for _, route := range routes {
@@ -610,7 +612,8 @@ func configuredMaxCompletionTokens(route config.Route) uint64 {
 }
 
 func buildDeepSeekReasoningEfforts(route config.Route) []cfgpatch.ReasoningEffortOption {
-	if !config.IsOfficialDeepSeekRoute(route) || route.ReasoningEffortConfigured {
+	if !config.IsOfficialDeepSeekRoute(route) ||
+		(route.ReasoningEffortConfigured && !route.LegacyGeneratedReasoningMenu) {
 		return nil
 	}
 	return []cfgpatch.ReasoningEffortOption{
@@ -619,6 +622,13 @@ func buildDeepSeekReasoningEfforts(route config.Route) []cfgpatch.ReasoningEffor
 		{Value: "high", Label: "High", Default: true},
 		{Value: "max", Label: "Max"},
 	}
+}
+
+func buildDeepSeekReasoningEffortDefault(route config.Route) string {
+	if len(buildDeepSeekReasoningEfforts(route)) == 0 || route.ReasoningEffortSelectionConfigured {
+		return ""
+	}
+	return "high"
 }
 
 func (a *App) abortStart(err error) error {

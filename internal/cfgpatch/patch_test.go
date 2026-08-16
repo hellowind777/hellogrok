@@ -327,15 +327,15 @@ func TestApplyTargetsProjectsDeepSeekReasoningMenuAndRestoresMultilineValue(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.SupportsReasoningEffort != 1 || result.ReasoningEfforts != 1 {
+	if result.SupportsReasoningEffort != 0 || result.ReasoningEfforts != 1 {
 		t.Fatalf("reasoning projection result = %+v", result)
 	}
 	patched, err := os.ReadFile(configPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantMenu := `reasoning_efforts = [{ value = "none", label = "None" }, { value = "high", label = "High", default = true }, { value = "max", label = "Max" }]`
-	if !strings.Contains(string(patched), "supports_reasoning_effort = true # preserve original support flag") ||
+	wantMenu := `reasoning_efforts = ["none", "high", "max"]`
+	if !strings.Contains(string(patched), "supports_reasoning_effort = false # preserve original support flag") ||
 		!strings.Contains(string(patched), wantMenu) || strings.Contains(string(patched), "Legacy Low") {
 		t.Fatalf("DeepSeek reasoning menu was not projected:\n%s", patched)
 	}
@@ -377,9 +377,8 @@ func TestRestorePreservesConcurrentDeepSeekReasoningMenuEdit(t *testing.T) {
 	}
 	patched, _ := os.ReadFile(configPath)
 	userEdited := strings.ReplaceAll(string(patched),
-		`reasoning_efforts = [{ value = "none", label = "None" }, { value = "high", label = "High", default = true }, { value = "max", label = "Max" }]`,
+		`reasoning_efforts = ["none", "high", "max"]`,
 		"reasoning_efforts = [\n  { value = \"high\", label = \"Focused\", default = true },\n]\n")
-	userEdited = strings.ReplaceAll(userEdited, "supports_reasoning_effort = true", "supports_reasoning_effort = false")
 	if err := os.WriteFile(configPath, []byte(userEdited), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -387,10 +386,57 @@ func TestRestorePreservesConcurrentDeepSeekReasoningMenuEdit(t *testing.T) {
 		t.Fatal(err)
 	}
 	current, _ := os.ReadFile(configPath)
-	if !strings.Contains(string(current), "supports_reasoning_effort = false") ||
-		!strings.Contains(string(current), `label = "Focused"`) ||
+	if !strings.Contains(string(current), `label = "Focused"`) ||
 		strings.Contains(string(current), "127.0.0.1:18787") {
 		t.Fatalf("concurrent reasoning edit was not preserved while the route was restored:\n%s", current)
+	}
+}
+
+func TestLegacyReasoningMigrationRecoversStateBeforeConfigCrashWindow(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	statePath := filepath.Join(dir, "state.json")
+	original := "[model.pro]\nbase_url = \"https://api.deepseek.com\"\n" +
+		"[[model.pro.reasoning_efforts]]\nvalue = \"none\"\nlabel = \"None\"\n" +
+		"[[model.pro.reasoning_efforts]]\nvalue = \"low\"\nlabel = \"Low\"\n" +
+		"[[model.pro.reasoning_efforts]]\nvalue = \"high\"\nlabel = \"High\"\ndefault = true\n" +
+		"[[model.pro.reasoning_efforts]]\nvalue = \"max\"\nlabel = \"Max\"\n"
+	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	target := Target{
+		ID: "pro",
+		ReasoningEfforts: []ReasoningEffortOption{
+			{Value: "none", Label: "None"},
+			{Value: "low", Label: "Low"},
+			{Value: "high", Label: "High", Default: true},
+			{Value: "max", Label: "Max"},
+		},
+		ReasoningEffortDefault:     "high",
+		MigrateLegacyReasoningMenu: true,
+	}
+	if _, err := ApplyTargets(configPath, statePath, []Target{target}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ApplyTargets(configPath, statePath, []Target{target}); err != nil {
+		stateBytes, _ := os.ReadFile(statePath)
+		t.Fatalf("reapply after state-before-config crash window: %v\nstate=%s", err, stateBytes)
+	}
+	if _, err := Restore(configPath, statePath); err != nil {
+		t.Fatal(err)
+	}
+	current, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(current), "[[model.pro.reasoning_efforts]]") ||
+		!strings.Contains(string(current), `reasoning_efforts = ["none", "low", "high", "max"]`) ||
+		!strings.Contains(string(current), `reasoning_effort = "high"`) ||
+		strings.Contains(string(current), "127.0.0.1:18787") {
+		t.Fatalf("migration did not recover to compact durable config:\n%s", current)
 	}
 }
 

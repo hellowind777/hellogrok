@@ -516,11 +516,11 @@ func TestGrokBuildNativeUsageCompatibilityMatrix(t *testing.T) {
 					response, _ := payloads[len(payloads)-1]["response"].(map[string]any)
 					usage, _ := response["usage"].(map[string]any)
 					context, hasContext := usage["context_details"].(map[string]any)
-					if numberInt(usage["total_tokens"]) != 123 || hasContext != model.official {
+					if numberInt(usage["total_tokens"]) != 123 || !hasContext {
 						t.Fatalf("Responses usage=%#v", usage)
 					}
-					if model.official && (numberInt(context["input_tokens"]) != 80 || numberInt(context["output_tokens"]) != 5) {
-						t.Fatalf("DeepSeek live context=%#v", context)
+					if numberInt(context["input_tokens"]) != 80 || numberInt(context["output_tokens"]) != 5 {
+						t.Fatalf("live context=%#v", context)
 					}
 				case "chat_completions":
 					usage, _ := payloads[len(payloads)-1]["usage"].(map[string]any)

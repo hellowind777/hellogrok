@@ -32,6 +32,28 @@ func setGrokModelHeaders(header http.Header, route config.Route) {
 	}
 }
 
+// mergeGrokModelHeaders keeps explicit model/provider config authoritative and
+// otherwise accepts valid capacity metadata from any upstream channel.
+func mergeGrokModelHeaders(header, upstream http.Header) {
+	mergePositiveModelHeader(header, upstream, grokContextWindowHeader, 64)
+	mergePositiveModelHeader(header, upstream, grokMaxCompletionTokensHeader, 32)
+}
+
+func mergePositiveModelHeader(header, upstream http.Header, name string, bitSize int) {
+	if positiveModelHeader(header.Get(name), bitSize) {
+		return
+	}
+	value := strings.TrimSpace(upstream.Get(name))
+	if positiveModelHeader(value, bitSize) {
+		header.Set(name, value)
+	}
+}
+
+func positiveModelHeader(value string, bitSize int) bool {
+	parsed, err := strconv.ParseUint(strings.TrimSpace(value), 10, bitSize)
+	return err == nil && parsed > 0
+}
+
 func normalizeDeepSeekRequest(root map[string]any, route config.Route, protocol wireProtocol) {
 	if root == nil || !isOfficialDeepSeekRoute(route) {
 		return

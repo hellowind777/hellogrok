@@ -6,7 +6,7 @@
 
 跨平台 Grok Build 本地代理，让自定义模型渠道兼容常见 API 格式、Build 原生 Web 工具、独立鉴权和自动配置恢复。
 
-[![Version](https://img.shields.io/badge/version-0.1.9-2f6feb.svg)](./internal/appinfo/appinfo.go)
+[![Version](https://img.shields.io/badge/version-0.1.10-2f6feb.svg)](./internal/appinfo/appinfo.go)
 [![Go](https://img.shields.io/badge/Go-1.26.6-00ADD8.svg)](./go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#平台支持)
@@ -61,11 +61,12 @@ hellogrok 为这些自定义渠道提供统一的本地兼容层。运行时准�
 - 保留每个渠道配置的上游 URL 路径和模型标识。
 - 使用前准备所有显式自定义渠道，避免通过 `/model` 切换后首次请求失败。
 - 热切换模型时保留可移植的会话历史，只排除已知属于不同渠道、协议、线上模型或上游端点的加密推理。
+- 在 Responses、Messages 与 Chat Completions 桥接中保留 Grok Build 的任意本地函数工具，包括 Shell、文件、补丁、Task 和 MCP 函数。第三方渠道不会收到 xAI 专属的 `x_search`；供应商 hosted 工具仍须由上游真实支持。
 
 ### 原生 Web 工具
 
 - 支持 hosted 和客户端搜索两种 Grok Build 原生 `web_search` 工作流。
-- 当 `supports_backend_search = true` 时，三种格式都使用当前渠道自身的 hosted 搜索：Responses 直接转发，Messages 使用 `web_search_20250305`，Chat 使用配置的搜索方言或协议桥接。DeepSeek 官方渠道是保留来源的例外：当前请求允许执行 hosted 搜索时，默认走官方 Messages API，以保留结构化结果 URL；`tool_choice` 禁用或排除搜索时仍保持配置协议。只有显式设置 `chat_search_dialect = "responses"` 才会让可搜索请求退回来源受限的 Responses 接口。
+- 当 `supports_backend_search = true` 时，三种格式都使用当前渠道自身的 hosted 搜索：Responses 保持 Responses，Messages 保持 Messages 并使用 `web_search_20250305`，Chat 使用配置的搜索方言或协议桥接。DeepSeek Responses 正式发布后，官方渠道遵循已配置的原生协议；由于 DeepSeek Chat 目前只记录 function 工具，其 hosted 搜索默认桥接到 Responses。确实需要 Messages 桥接时仍可显式设置 `chat_search_dialect = "messages"`。
 - 对设置了 `supports_backend_search = true` 的渠道，只要上游真实执行了搜索，Grok Build 就会收到规范的 Responses 搜索事件，包括已完成的 `web_search_call`，以及供应商实际返回的已验证来源、引用和用量。该字段是路由声明，不是能力探测结果。每个 Responses 搜索都会请求完整的 `web_search_call.action.sources` 元数据，同时保留调用方已有项目。DeepSeek 当前会接受但静默忽略这个标准 `include` 提示，因此 hellogrok 只能消费原生搜索 action 已带的 URL，无法恢复上游省略的结果；未来 DeepSeek 实现该字段后，同一请求会自动取得来源，无需更新 hellogrok。Messages 搜索结果/引用块、供应商顶层引用及 Chat 的注解/搜索结果容器会归一化到同一套规范来源字段。
 - 通过 `[models].web_search` 或 `GROK_WEB_SEARCH_MODEL` 选中的自定义代理渠道，会在整个代理运行期投影为 `supports_backend_search = true`，即使原值是 false。Grok Build 因而能在普通会话和固定的非流式 WebSearchClient 请求中发现 hosted `web_search`；hellogrok 将两者转换为供应商协议，并在停止时恢复原始设置。
 - 将适配后搜索结果中的真实 URL 同时写入 `web_search_call.action.sources` 与 `output_text.annotations`；只有响应能独立证明已执行搜索时，才会使用最终回答中的有效链接。Grok Build 因此可显示原生去重站点数。
@@ -110,7 +111,7 @@ hellogrok 是 Grok Build 渠道代理，不是系统代理、PAC 服务、VPN �
 
 后端搜索不是 Grok Build 发起的第二个请求。它的声明就在当前模型请求中，因此 hellogrok 必须在模型决定是否搜索之前选定供应商协议。客户端 `web_search` 不同：当前模型先调用本地函数，随后 Grok Build 的 `WebSearchClient` 才向所选搜索模型单独发送非流式 `/responses` 请求，再由 hellogrok 映射到该渠道的搜索协议。
 
-hellogrok 不会创建、选择或替换 `[models].web_search`，启动时也不会发送搜索能力探测。标记为启用的 Messages 渠道必须真正支持 `web_search_20250305`。Chat 默认使用 `web_search_options`；xAI 官方 Chat 自动桥接到 Responses，而 `api.deepseek.com` 官方 hosted 搜索对所有已配置后端默认使用 Messages，因为其 Responses API 没有可请求的完整来源信息。中转需要指定策略或 DeepSeek 需要退出该默认值时，可把 `chat_search_dialect` 设置为 `web_search_options`、`search_parameters`、`messages` 或 `responses`。临时能力标记只是路由声明，不证明供应商真实支持：上游 HTTP 拒绝会原样保留；固定 WebSearchClient 请求若被静默回答但没有完成搜索，hellogrok 会返回不可重试的 `502`，明确指出所选搜索模型未完成 backend `web_search`。
+hellogrok 不会创建、选择或替换 `[models].web_search`，启动时也不会发送搜索能力探测。标记为启用的 Messages 渠道必须真正支持 `web_search_20250305`。Chat 默认使用 `web_search_options`；xAI 官方和 DeepSeek 官方 Chat 自动桥接到 Responses。渠道需要指定策略时，可把 `chat_search_dialect` 设置为 `web_search_options`、`search_parameters`、`messages` 或 `responses`。临时能力标记只是路由声明，不证明供应商真实支持：上游 HTTP 拒绝会原样保留；固定 WebSearchClient 请求若被静默回答但没有完成搜索，hellogrok 会返回不可重试的 `502`，明确指出所选搜索模型未完成 backend `web_search`。
 
 对于客户端搜索，hellogrok 会明确工具用途，但不会根据提示词推断或强制调用工具。强制选择只来自结构化 `tool_choice`。内部传输别名只修改协议定义的工具声明、选择和调用名称字段；响应正文、URL、工具参数、工具结果及其他业务 JSON 均保持不变。
 
@@ -131,7 +132,7 @@ chat_search_dialect = "web_search_options"
 supports_backend_search = false
 ```
 
-示例中的原始 false 仍由用户所有，但 hellogrok 运行期间会因默认搜索模型选择临时覆盖为 true，停止时恢复；供应商仍必须真实支持指定搜索方言。没有被选为默认搜索模型的渠道，只有在确认供应商 API 支持 hosted 搜索后才应设置 `supports_backend_search = true`。Messages 使用 `web_search_20250305`；DeepSeek 官方 hosted 搜索对所有已配置后端默认调用 `/anthropic/v1/messages`，其他 Chat 中转可显式选择 `chat_search_dialect`。
+示例中的原始 false 仍由用户所有，但 hellogrok 运行期间会因默认搜索模型选择临时覆盖为 true，停止时恢复；供应商仍必须真实支持指定搜索方言。没有被选为默认搜索模型的渠道，只有在确认供应商 API 支持 hosted 搜索后才应设置 `supports_backend_search = true`。Messages 使用 `web_search_20250305`；Chat 中转可显式选择 `chat_search_dialect`。
 
 ### 支持的渠道设置
 
@@ -139,8 +140,8 @@ supports_backend_search = false
 |------|----------|--------|------|
 | `model` | 否 | 模型表 ID | 发送给上游渠道的模型标识。 |
 | `base_url` 或 `api_base_url` | 是 | 无 | 自定义上游端点；没有自定义 URL 的模型不会进入代理。 |
-| `api_backend` | 否 | 模型目录，其次 `chat_completions` | 上游真实 API 格式：`responses`、`messages` 或 `chat_completions`。启用搜索能力的非 Responses 渠道只会在 Grok Build 侧临时投影为 Responses。DeepSeek 官方请求在本轮可执行 hosted 搜索时默认改用 Messages 以保留来源 URL；`tool_choice` 排除搜索的请求、其他流量和恢复后的配置保持选定格式。 |
-| `chat_search_dialect` | 否 | 按主机判断 | hosted 搜索策略覆盖：`web_search_options`、`search_parameters`、`messages` 或 `responses`。DeepSeek 官方主机默认 `messages`，xAI 官方 Chat 默认 `responses`，其他 Chat 主机默认 `web_search_options`。 |
+| `api_backend` | 否 | 模型目录，其次 `chat_completions` | 上游真实 API 格式：`responses`、`messages` 或 `chat_completions`。启用搜索能力的非 Responses 渠道只会在 Grok Build 侧临时投影为 Responses；hellogrok 在供应商边界转换，并保持选定的原生协议，除非显式搜索桥接生效。 |
+| `chat_search_dialect` | 否 | 按主机判断 | hosted 搜索策略覆盖：`web_search_options`、`search_parameters`、`messages` 或 `responses`。DeepSeek 与 xAI 官方 Chat 默认 `responses`，其他 Chat 主机默认 `web_search_options`；Responses 与 Messages 只有在该字段显式要求时才桥接。 |
 | `api_key` | 三选一 | 无 | 静态渠道凭据；共享配置建议优先使用 `env_key`。 |
 | `env_key` | 三选一 | 无 | 保存渠道凭据的环境变量名或按顺序尝试的名称列表。 |
 | `auth_provider` | 三选一 | 无 | Grok 命令式鉴权提供器。 |
@@ -157,7 +158,7 @@ supports_backend_search = false
 
 ## DeepSeek
 
-DeepSeek 兼容行为只根据精确的官方主机 `api.deepseek.com` 启用，不绑定模型 ID。滚动别名和未来模型因此无需发布新版 hellogrok 就能获得鉴权、端点、hosted 搜索、协议级请求规范化、排队保活、用量与 SSE 分帧处理。同协议原生请求会保留未知字段；跨协议桥接只映射 Grok Build 当前实际发送且目标协议能够表达的字段。未来未知推理档位值仍会原样保留。截至 2026-08-15，当前正式模型 ID 为 `deepseek-v4-pro` 和 `deepseek-v4-flash`；它们只是配置示例，不是 hellogrok 的白名单。仅复用 DeepSeek 模型名的中转不会获得官方端点假设。
+DeepSeek 兼容行为只根据精确的官方主机 `api.deepseek.com` 启用，不绑定模型 ID。滚动别名和未来模型因此无需发布新版 hellogrok 就能获得鉴权、端点、hosted 搜索、协议级请求规范化、排队保活、用量与 SSE 分帧处理。同协议原生请求会保留未知字段；跨协议桥接只映射 Grok Build 当前实际发送且目标协议能够表达的字段。未来未知推理档位值仍会原样保留。截至 2026-08-16，当前正式模型 ID 为正式版 `deepseek-v4-pro` 和 `deepseek-v4-flash`；它们只是配置示例，不是 hellogrok 的白名单。仅复用 DeepSeek 模型名的中转不会获得官方端点假设。
 
 ### 推荐配置
 
@@ -169,7 +170,7 @@ model = "deepseek-v4-pro"
 base_url = "https://api.deepseek.com"
 env_key = ["DEEPSEEK_API_KEY"]
 api_backend = "responses"
-context_window = 1000000
+context_window = 1048576
 max_completion_tokens = 384000
 inference_idle_timeout_secs = 660
 
@@ -178,16 +179,16 @@ model = "deepseek-v4-flash"
 base_url = "https://api.deepseek.com"
 env_key = ["DEEPSEEK_API_KEY"]
 api_backend = "responses"
-context_window = 1000000
+context_window = 1048576
 max_completion_tokens = 384000
 inference_idle_timeout_secs = 660
 ```
 
-缺省 `supports_backend_search` 即使用 DeepSeek 原生 hosted Web Search；显式设为 `false` 则改用 Grok Build 客户端搜索。本轮允许执行 hosted 搜索时，DeepSeek 官方的 Responses、Messages、Chat 和未配置后端路由都默认使用官方 Messages API，因为该接口会返回结构化 `web_search_tool_result` URL；`tool_choice` 禁用搜索或指定其他函数时，请求仍走配置的 API。这个仅限搜索的协议选择按官方主机判断，不绑定模型 ID。只有 Responses 专属搜索/工具行为比 Grok Build 来源展示更重要时，才设置 `chat_search_dialect = "responses"`：OpenAI 通过 `include = ["web_search_call.action.sources"]` 选择返回完整 Web Search 来源，而 DeepSeek 当前会接受该提示却不返回请求的来源，所以其当前 Responses API 可以完成搜索却不返回来源 URL。hellogrok 仍会发送这个标准提示，使供应商未来实现后自动生效。原生 Responses 与 Chat 使用 Bearer 鉴权；Messages 使用官方文档中的 SDK base URL `https://api.deepseek.com/anthropic`（实际端点为 `/anthropic/v1/messages`）和 `X-Api-Key`。`[1m]` 后缀只是 DeepSeek 文档中的 Anthropic 集成别名，不能用于 Responses。
+缺省 `supports_backend_search` 即使用 DeepSeek 原生 hosted Web Search；显式设为 `false` 则改用 Grok Build 客户端搜索。Responses 与 Messages 搜索请求保持各自配置的原生 API。由于 DeepSeek Chat 目前只记录 function 工具，Chat 默认桥接到 Responses；只有明确需要 Messages 桥接时才设置 `chat_search_dialect = "messages"`。hellogrok 会向 Responses 请求 `web_search_call.action.sources`，保留 DeepSeek 实际返回的 URL，但不会虚构被省略的来源。原生 Responses 与 Chat 使用 Bearer 鉴权；Messages 使用官方文档中的 SDK base URL `https://api.deepseek.com/anthropic`（实际端点为 `/anthropic/v1/messages`）和 `X-Api-Key`。`[1m]` 后缀只是 DeepSeek 文档中的 Anthropic 集成别名，不能用于 Responses。
 
-上面两个容量上限是当前 V4 文档值，不是 hellogrok 的运行时常量；660 秒是为了覆盖 DeepSeek 官方最长十分钟排队的空闲策略。直接写在 `[model.*]` 下的值优先于从 `[model_providers.*]` 继承的值。Grok Build 已能继承 provider 的 `context_window`；当前 Grok Build 不继承 provider 的 `max_completion_tokens`，因此 hellogrok 只在代理运行期间把该有效值临时物化到模型表，停止时恢复原文件。字段缺失时，hellogrok 不会写入猜测值：以 Grok Build 已解析的模型目录或上游 `X-Grok-*` 响应元数据为准。DeepSeek 公开文档没有定义这两个 Grok 私有响应头，因此当 Grok Build 没有对应目录项时，应显式配置所需限额。未来模型或滚动别名改变容量时无需发布新版 hellogrok。
+上面两个容量上限对应 DeepSeek 文档中的 1M 总上下文和 384K 最大输出；`1,048,576` 来自其结构化上下文错误中实际报告的服务边界，不是 hellogrok 按模型 ID 写死的常量。660 秒是覆盖 DeepSeek 官方最长十分钟排队的空闲策略。模型级配置优先于继承的 provider 配置；未显式配置时，hellogrok 接受有效的上游 `X-Grok-Context-Window`、`X-Grok-Max-Completion-Tokens`，或错误中无歧义的结构化上下文上限字段，不根据模型名称猜测。最后才使用 Grok Build 自己的模型目录；未知自定义模型缺少 `context_window` 时默认只有 200,000 token。DeepSeek 没有公开这两个 Grok 私有响应头，因此建议显式填写两项上限，确保首轮行为可预测。未来模型或滚动别名改变容量时无需发布新版 hellogrok。
 
-当前 DeepSeek 推理菜单默认选择 `High`。Grok Build 在三种协议下都显示 `None`、`Low`、`High`、`Max`，协议由模型目录解析时也相同。三个协议统一采用官方映射：`minimal`/`low` 映射为 `low`，`medium`/`high`/`xhigh` 映射为 `high`，`max` 保持不变，`none` 关闭思考（`minimal` 仅是 Responses 的输入值）。这些按官方主机启用的端点规则同样适用于未来模型 ID，未知的未来档位值则原样透传。用户显式设置的 `supports_reasoning_effort` 或 `reasoning_efforts` 始终优先。
+当前 DeepSeek 推理菜单默认选择 `High`。Grok Build 原生接受紧凑的 `reasoning_efforts = ["none", "low", "high", "max"]` 写法，并会从非空菜单推导推理支持，因此 hellogrok 不再添加冗余的 `supports_reasoning_effort`，也不再写四段对象表。hellogrok 把所有用户显式赋值视为用户所有，包括不含 `none` 的列表、空列表以及自定义标签、顺序或默认值的对象菜单，既不替换也不追加。当前 Grok Build 在合并模型目录默认值时会忽略空集合覆盖，因此 `reasoning_efforts = []` 能保证 hellogrok 不注入菜单，但不一定能清除 Grok Build 自己继承的菜单。旧版 hellogrok 精确生成的冗长菜单只会迁移一次；已有模型级或全局推理选择时保持原值，否则写入 `reasoning_effort = "high"` 维持原默认值。三种协议仍统一采用官方映射：`minimal`/`low` 映射为 `low`，`medium`/`high`/`xhigh` 映射为 `high`，`max` 保持不变，`none` 关闭思考（`minimal` 仅是 Responses 的输入值）。
 
 ### 原生能力映射
 
@@ -421,7 +422,7 @@ Responses 供应商继续使用 Responses。Messages 供应商接收 Messages �
 
 对于流式请求，hellogrok 会向选定的供应商 API 发送 `stream=true`。未启用能力的渠道保持原生 SSE；启用能力的 Messages 和 Chat 渠道会被增量转换成 Responses 事件，使 Grok Build 能消费推理、文本、函数调用、`web_search_call`、来源和终止状态。日志若提示缓冲回退，说明上游只返回了一次性完整 JSON，本次请求无法实现真正流式。
 
-当前 Grok Build 有两条 Responses 来源展示路径：hosted 搜索读取 `web_search_call.action.sources`，客户端 `web_search` 工具读取 `output_text.annotations` 中的 URL 引用。对 hosted 搜索而言，非空来源 URL 会生成折叠标题后的 `(N sites)` 和可展开的编号 URL 正文；没有 URL 就没有站点数和可展开内容。转发 Responses hosted 搜索前，hellogrok 会加入 `web_search_call.action.sources` 到 `include`，且不会覆盖调用方已有项目。DeepSeek 当前会接受但静默忽略该提示，因此代理会直接规范化其原生搜索 action，而 DeepSeek 官方 hosted 搜索默认改用 Messages，以保留 `web_search_tool_result` URL；保留该提示可让 DeepSeek 未来支持后自动生效。Responses 顶层 `citations`、Messages 搜索结果/引用块，以及 Chat 的 `annotations`、`citations`、`search_results` 或 `web_search_results` 都会归一化到 Grok Build 的两条展示路径。WebSearchClient 适配器复用相同逻辑；只有响应能独立证明已执行搜索时，才从最终回答恢复有效 HTTP(S) 链接。普通回答链接不会凭空创建搜索调用。如果供应商没有返回真实 URL，仍可显示搜索活动，但不能伪造可信站点数。
+当前 Grok Build 有两条 Responses 来源展示路径：hosted 搜索读取 `web_search_call.action.sources`，客户端 `web_search` 工具读取 `output_text.annotations` 中的 URL 引用。对 hosted 搜索而言，非空来源 URL 会生成折叠标题后的 `(N sites)` 和可展开的编号 URL 正文；没有 URL 就没有站点数和可展开内容。转发 Responses hosted 搜索前，hellogrok 会加入 `web_search_call.action.sources` 到 `include`，且不会覆盖调用方已有项目。DeepSeek 当前会接受但静默忽略该提示，因此代理直接规范化其原生 Responses 搜索 action，来源展示仅限它实际返回的 URL；保留该提示可让 DeepSeek 未来支持后自动生效。Responses 顶层 `citations`、Messages 搜索结果/引用块，以及 Chat 的 `annotations`、`citations`、`search_results` 或 `web_search_results` 都会归一化到 Grok Build 的两条展示路径。WebSearchClient 适配器复用相同逻辑；只有响应能独立证明已执行搜索时，才从最终回答恢复有效 HTTP(S) 链接。普通回答链接不会凭空创建搜索调用。如果供应商没有返回真实 URL，仍可显示搜索活动，但不能伪造可信站点数。
 
 ### 出现 `unknown variant keepalive` 或持续 `Waiting for response...`
 
@@ -435,11 +436,23 @@ Responses 供应商继续使用 Responses。Messages 供应商接收 Messages �
 
 Grok Build 不会把每次响应的 `usage.total_tokens` 累加到一个总和。当前公开源码会在 Responses 终止事件的 `usage.context_details.input_tokens` 与 `usage.context_details.output_tokens` 都有效时，用两者之和覆盖类型化的 `total_tokens`；没有该扩展时才沿用供应商的 `total_tokens`。随后 Chat State 把这个结果视为“当前完整上下文”的测量值，用它覆盖 token 基线，再加上该响应之后由本地估算的新增项，并在下一次请求模型前检查配置的自动压缩阈值。
 
+hellogrok 按这套合同统一处理所有渠道，而不是按供应商名称分支。完整有效的 Responses 用量可以采用 `input_tokens` / `output_tokens`，也可以采用常见的 `prompt_tokens` / `completion_tokens` 别名；详情容器会按相同方式规范化。Messages 与 Chat 转为 Responses 后也遵循同一规则。只有完整可信的一对计数才会得到 `context_details`；缺失、冲突、负数、小数、溢出或占位测量统一保持 `usage: null`，让 Grok Build 保留原基线。
+
+DeepSeek 的 1M 上下文是输入与生成输出共享的总预算，Responses 的 `max_output_tokens` 同时包含隐藏推理和可见输出。用尽单次输出上限时，Responses 返回 `status = "incomplete"` 且原因为 `max_output_tokens`；Chat 返回 `finish_reason = "length"`，hellogrok 会映射为同一种不完整结果。已生成的部分仍可使用，但若推理消耗了额度，可见正文可能很少。此时可以在下一轮继续、降低推理档位，或仅在总上下文剩余空间足够时提高输出额度。只达到输出上限本身不应触发自动压缩。
+
+在 `664K / 1.0M` 附近出现上下文过长，不代表存在隐藏的 `500K` 上限，也不能据此认定统计错误。当窗口为 `1,048,576` 且 `max_completion_tokens = 384000` 时，供应商会同时预留完整输出额度，所以消息一旦超过 `664,576` 就可能拒绝。例如 `664,712 + 384,000 = 1,048,712`，虽然消息占用约 63%，总请求仍比窗口多 136 token。hellogrok 现在只在识别到这个精确、结构化且数字自洽的供应商错误时，把本次输出额度改为“最大窗口 - 消息 token”，透明重试一次；不会伪造界面统计、缩小配置窗口或改变自动压缩阈值。
+
+活动工具循环中显示超过 100% 是另一条路径。Grok Build 的常规阈值检查发生在采样前，而工具结果后的独立预检只有在估算值已经大于上下文窗口时才触发。一次较大的工具输出因此可能让活动上下文从阈值以下直接增长到明显超过 100%，随后才压缩。这是当前活动上下文的估算值，不是累计计费用量。
+
 旧版 hellogrok 会把供应商缺失的用量补成全零字段。这样语法有效的响应就会报告 `total_tokens: 0`，导致 Grok Build 每轮都把基线重置为零，始终无法达到配置阈值。当前版本会保留可信的供应商总量；只有输入和输出测量都完整时才推导总量；缺失、不完整、负数、小数、全零占位或其他不可信用量统一输出 `usage: null`。原生 Responses 若带有完整且为正数的 `context_details`，即使独立的计费计数为零，仍可作为实时上下文计量使用。
 
-对于 DeepSeek 官方端点，hellogrok 还会请求流式终止用量，保留 DeepSeek 的计费 `total_tokens`，并只根据完整真实的输入/输出计数生成 Grok Build 私有的 `context_details`。上下文窗口元数据对 DeepSeek、GPT、Claude、Grok、Gemini 及其他渠道统一遵循一个规则：显式的 `[model.*].context_window`（或从 `[model_providers.*]` 继承的值）会通过 `X-Grok-Context-Window` 返回，且不能被不同的上游响应头覆盖；没有配置时才原样透传供应商元数据。`max_completion_tokens` 使用相同优先级；由于当前 Grok Build 不继承 provider 的该字段，hellogrok 会把 provider 的显式值临时物化到 `[model.*]`。终止用量块负责更新分子，用户选择的本地档位或未配置时的供应商/Grok Build 模型元数据负责提供分母。hellogrok 不会改写 `auto_compact_threshold_percent`；Grok Build 按 `context_window * auto_compact_threshold_percent` 检查阈值。
+对于 DeepSeek 官方端点，hellogrok 还会请求流式终止用量并保留供应商计费 `total_tokens`。容量元数据对 DeepSeek、GPT、Claude、Grok、Gemini 及其他渠道统一遵循一个规则：显式 `[model.*]` 或继承的 `[model_providers.*]` 值优先；没有配置时才透传有效的上游 `X-Grok-*` 响应头。上下文拒绝还可能通过 `context_window`、`max_context_tokens`、`maximum_context_length`、`maximum_context_tokens`、`model_context_window` 或 `max_model_len` 暴露窗口；hellogrok 只接受唯一、正数、无歧义且不溢出的值。`max_completion_tokens` 使用同样的配置优先级；由于当前 Grok Build 不继承 provider 的该字段，hellogrok 会临时物化到 `[model.*]`。终止用量更新分子，配置、远端元数据或 Grok Build 模型目录提供分母。hellogrok 不改写 `auto_compact_threshold_percent`。
 
 当前 Grok Build 会有意忽略响应头对上下文窗口的降级。因此，若模型不在其目录中且供应商真实上限低于 Grok Build 回退值，仅靠代理转发首次响应头无法在事后纠正分母，必须显式设置 `context_window`。若某个中转完全不返回用量，代理在没有供应商 tokenizer 和隐藏提示开销的情况下也无法制造精确结果；`usage: null` 的目的就是保留 Grok Build 既有基线，而不是再次破坏它。升级后先发起一次新的 DeepSeek 请求，让真实终止用量覆盖已打开会话中可能保存的零基线。
+
+这也是内置 `grok-4.5` 通常显示正确的原因：Grok Build 模型目录提供 500,000 token 窗口和该模型专用的 80% 阈值，xAI 原生 Responses 流又提供采样器所需的实时上下文 `context_details`。未知自定义模型若未配置或发现容量，只会回退到 200,000 token；旧版 hellogrok 还可能把它的实时基线重置为零。系统不存在通用的隐藏 500K 截止点。
+
+如果一个已经结束或恢复的会话在有效阈值之上，下一次用户输入会先触发 Grok Build 的采样前自动压缩，然后才向供应商发请求。hellogrok 的进程级测试已覆盖 Responses、Messages 与 Chat Completions 的恢复会话路径。活动轮次中的大工具结果仍可能在两次检查之间越过阈值；随后同一工具循环的下一道保护会压缩当前活动上下文。
 
 常规 DeepSeek 请求的完整输入/输出用量可以精确更新上述基线。服务端 Web Search 是唯一需要保留的语义边界：DeepSeek 官方 Responses 文档没有公开 `context_details`，也没有说明一次服务端多步搜索的输入/输出用量代表最终活动上下文还是累计计费量；hellogrok 只能把完整返回值投影到 Grok Build 的该扩展中。因此自动压缩不会再因零基线失效，但 hosted search 的精确触发时点仍取决于 DeepSeek 返回值的实际语义，需要用真实 API 响应继续校验。非 DeepSeek 渠道同理：有可信终止用量且配置了正确 `context_window` 时可精确触发；完全不返回用量时只能保留基线并近似增长。
 

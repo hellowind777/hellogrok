@@ -122,6 +122,9 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 	}
 
 	var response *http.Response
+	var contextOutputLimit uint64
+	var discoveredContextWindow uint64
+	contextBudgetRetried := false
 	for {
 		response, err = doRequest(request.Body)
 		if err != nil {
@@ -163,10 +166,37 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 			return
 		}
 
+		observation, observedContextBudget := inspectContextBudgetError(response.StatusCode, data)
+		if observedContextBudget && discoveredContextWindow == 0 {
+			discoveredContextWindow = observation.MaximumTokens
+		}
+		if !contextBudgetRetried && observedContextBudget {
+			if retry, ok := clampCompletionForContextError(observation, request.Body, request.Protocol); ok {
+				contextBudgetRetried = true
+				contextOutputLimit = retry.AvailableOutput
+				request.Body = retry.Body
+				s.log.Printf("UP channel=%s context budget retry once maximum=%d messages=%d completion_before=%d completion_after=%d",
+					route.ChannelID, retry.MaximumTokens, retry.MessageTokens,
+					retry.OriginalOutput, retry.AvailableOutput)
+				saveLastRequestMeta(logTarget, route.WireModel, len(request.Body), tools, webSearch, hostedSearch, functionSearch, xSearch, request)
+				continue
+			}
+		}
+
 		reasoningRejected := isOpaqueReasoningRejection(response.StatusCode, data)
 		keptOpaqueReasoning := request.Reasoning.Opaque - request.Reasoning.Dropped
 		if reasoningRejected && keptOpaqueReasoning > 0 && !request.ReasoningRecovery {
 			retryRequest, retryErr := adaptFacadeRequestWithReasoning(body, route, incomingProtocol, s.reasoning, dropAllOpaqueReasoning)
+			if retryErr == nil && retryRequest.Reasoning.Dropped > request.Reasoning.Dropped {
+				if contextOutputLimit > 0 {
+					adjusted, ok := setCompletionLimit(retryRequest.Body, retryRequest.Protocol, contextOutputLimit)
+					if !ok {
+						retryErr = fmt.Errorf("preserve context output limit")
+					} else {
+						retryRequest.Body = adjusted
+					}
+				}
+			}
 			if retryErr == nil && retryRequest.Reasoning.Dropped > request.Reasoning.Dropped {
 				s.log.Printf("UP channel=%s reasoning recovery retry once removed=%d after status=%d",
 					route.ChannelID, retryRequest.Reasoning.Dropped, response.StatusCode)
@@ -179,6 +209,10 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 			}
 		}
 
+		mergeGrokModelHeaders(w.Header(), response.Header)
+		if !positiveModelHeader(w.Header().Get(grokContextWindowHeader), 64) && discoveredContextWindow > 0 {
+			w.Header().Set(grokContextWindowHeader, fmt.Sprintf("%d", discoveredContextWindow))
+		}
 		copySafeResponseHeaders(w.Header(), response.Header)
 		setRetryDisposition(w.Header(), response.StatusCode)
 		if reasoningRejected {
@@ -189,6 +223,10 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 		return
 	}
 	defer response.Body.Close()
+	mergeGrokModelHeaders(w.Header(), response.Header)
+	if !positiveModelHeader(w.Header().Get(grokContextWindowHeader), 64) && discoveredContextWindow > 0 {
+		w.Header().Set(grokContextWindowHeader, fmt.Sprintf("%d", discoveredContextWindow))
+	}
 
 	upstreamSSE := strings.Contains(strings.ToLower(response.Header.Get("Content-Type")), "text/event-stream")
 	if upstreamSSE && !request.Stream {
@@ -210,7 +248,7 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 				GPTResponses:            true,
 				WebSearch:               true,
 				RequestModel:            responseModelForRoute(route),
-				ContextDetailsFromUsage: isOfficialDeepSeekRoute(route),
+				ContextDetailsFromUsage: true,
 			}
 			s.streamResponsesSSE(w, response, route, request, options, started)
 		case wireMessages:
@@ -397,7 +435,7 @@ func (s *Server) normalizeResponsesJSON(data []byte, route config.Route, request
 		GPTResponses:            true,
 		WebSearch:               true,
 		RequestModel:            responseModelForRoute(route),
-		ContextDetailsFromUsage: isOfficialDeepSeekRoute(route),
+		ContextDetailsFromUsage: true,
 	}
 	data, err = patch.PatchJSONBytesStrict(data, options)
 	if err != nil {

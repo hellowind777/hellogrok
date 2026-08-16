@@ -478,8 +478,8 @@ func contextDetailsFromUsage(usage map[string]any, enabled bool) (int64, int64, 
 	if _, exists := usage["context_details"]; exists {
 		return 0, 0, false
 	}
-	input, hasInput, validInput := optionalTokenCount(usage, "input_tokens")
-	output, hasOutput, validOutput := optionalTokenCount(usage, "output_tokens")
+	input, hasInput, validInput := canonicalUsageTokenCount(usage, "input_tokens", "prompt_tokens")
+	output, hasOutput, validOutput := canonicalUsageTokenCount(usage, "output_tokens", "completion_tokens")
 	if !hasInput || !hasOutput || !validInput || !validOutput || input > maxWireTokenCount-output {
 		return 0, 0, false
 	}
@@ -495,8 +495,8 @@ func contextDetailsFromUsage(usage map[string]any, enabled bool) (int64, int64, 
 // values. A provider total is preserved when the complete pair is present;
 // otherwise the total is derived from that pair.
 func normalizeUsageTokenFields(usage map[string]any) bool {
-	input, hasInput, validInput := optionalTokenCount(usage, "input_tokens")
-	output, hasOutput, validOutput := optionalTokenCount(usage, "output_tokens")
+	input, hasInput, validInput := canonicalUsageTokenCount(usage, "input_tokens", "prompt_tokens")
+	output, hasOutput, validOutput := canonicalUsageTokenCount(usage, "output_tokens", "completion_tokens")
 	total, hasTotal, validTotal := optionalTokenCount(usage, "total_tokens")
 	if !validInput || !validOutput || !validTotal || !hasInput || !hasOutput {
 		return false
@@ -511,11 +511,39 @@ func normalizeUsageTokenFields(usage map[string]any) bool {
 	if input == 0 && output == 0 && total == 0 && !positiveContextDetails(usage) {
 		return false
 	}
+	copyUsageDetailAlias(usage, "input_tokens_details", "prompt_tokens_details")
+	copyUsageDetailAlias(usage, "output_tokens_details", "completion_tokens_details")
 	if !normalizeUsageDetail(usage, "output_tokens_details", "reasoning_tokens") ||
 		!normalizeUsageDetail(usage, "input_tokens_details", "cached_tokens") {
 		return false
 	}
 	return total >= 0
+}
+
+func canonicalUsageTokenCount(usage map[string]any, canonical string, aliases ...string) (int64, bool, bool) {
+	value, present, valid := optionalTokenCount(usage, canonical)
+	if present || !valid {
+		return value, present, valid
+	}
+	for _, alias := range aliases {
+		value, present, valid = optionalTokenCount(usage, alias)
+		if !valid || present {
+			if present && valid {
+				usage[canonical] = value
+			}
+			return value, present, valid
+		}
+	}
+	return 0, false, true
+}
+
+func copyUsageDetailAlias(usage map[string]any, canonical, alias string) {
+	if value, exists := usage[canonical]; exists && value != nil {
+		return
+	}
+	if value, exists := usage[alias]; exists && value != nil {
+		usage[canonical] = value
+	}
 }
 
 func positiveContextDetails(usage map[string]any) bool {

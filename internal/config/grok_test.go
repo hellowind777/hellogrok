@@ -682,6 +682,66 @@ supports_reasoning_effort = false
 	}
 }
 
+func TestLoadModelsRecognizesOnlyExactLegacyGeneratedReasoningMenu(t *testing.T) {
+	legacy := `reasoning_efforts = [{ value = "none", label = "None" }, { value = "low", label = "Low" }, { value = "high", label = "High", default = true }, { value = "max", label = "Max" }]`
+	tests := []struct {
+		name       string
+		menu       string
+		wantLegacy bool
+	}{
+		{"legacy inline objects", legacy, true},
+		{"compact full list", `reasoning_efforts = ["none", "low", "high", "max"]`, false},
+		{"compact list without none", `reasoning_efforts = ["low", "high", "max"]`, false},
+		{"explicit empty list", `reasoning_efforts = []`, false},
+		{"custom labels", `reasoning_efforts = [{ value = "none", label = "Off" }, { value = "low", label = "Low" }, { value = "high", label = "High", default = true }, { value = "max", label = "Max" }]`, false},
+		{"custom order", `reasoning_efforts = [{ value = "low", label = "Low" }, { value = "none", label = "None" }, { value = "high", label = "High", default = true }, { value = "max", label = "Max" }]`, false},
+		{"custom default", `reasoning_efforts = [{ value = "none", label = "None", default = true }, { value = "low", label = "Low" }, { value = "high", label = "High" }, { value = "max", label = "Max" }]`, false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.toml")
+			raw := "[model.deepseek]\nmodel = \"deepseek-v4-pro\"\nbase_url = \"https://api.deepseek.com\"\n" + test.menu + "\n"
+			if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			models, err := LoadModels(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(models) != 1 || !models[0].ReasoningEffortConfigured ||
+				models[0].LegacyGeneratedReasoningMenu != test.wantLegacy {
+				t.Fatalf("models = %+v", models)
+			}
+		})
+	}
+}
+
+func TestLoadModelsTracksReasoningSelectionAtModelOrGlobalScope(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	raw := `[models]
+default_reasoning_effort = "low"
+
+[model.global]
+base_url = "https://api.deepseek.com"
+
+[model.local]
+base_url = "https://api.deepseek.com"
+reasoning_effort = "max"
+`
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	models, err := LoadModels(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, model := range models {
+		if !model.ReasoningEffortSelectionConfigured {
+			t.Fatalf("model %q lost explicit reasoning selection: %+v", model.ID, model)
+		}
+	}
+}
+
 func TestLoadModelsRejectsMalformedReasoningCapabilityFields(t *testing.T) {
 	for _, body := range []string{
 		"supports_reasoning_effort = \"yes\"\n",

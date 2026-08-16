@@ -332,6 +332,58 @@ func TestRemoteCatalogHostedSearchIsDetectedWithoutLocalModelKnowledge(t *testin
 	}
 }
 
+func TestThirdPartyRoutesNeverReceiveXSearch(t *testing.T) {
+	body := []byte(`{
+		"model":"catalog-alias",
+		"input":[{"role":"user","content":"find current docs"}],
+		"max_output_tokens":4096,
+		"tools":[
+			{"type":"web_search","filters":{"allowed_domains":["example.test"]}},
+			{"type":"x_search","from_date":"2026-01-01"},
+			{"type":"function","name":"read_file","description":"read a file","parameters":{"type":"object"}}
+		],
+		"tool_choice":{"type":"allowed_tools","tools":[{"type":"web_search"},{"type":"x_search"},{"type":"function","name":"read_file"}]},
+		"stream":false
+	}`)
+	for _, test := range []struct {
+		name     string
+		backend  string
+		protocol wireProtocol
+	}{
+		{name: "Responses", backend: "responses", protocol: wireResponses},
+		{name: "Messages", backend: "messages", protocol: wireMessages},
+		{name: "Chat Completions", backend: "chat_completions", protocol: wireChatCompletions},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request, err := adaptFacadeRequest(body, config.Route{
+				ChannelID: "third-party", Host: "relay.example", WireModel: "provider-model",
+				APIBackend: test.backend, APIBackendConfigured: true,
+			}, wireResponses)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if request.Protocol != test.protocol || bytes.Contains(request.Body, []byte(`"x_search"`)) {
+				t.Fatalf("third-party wire retained x_search: protocol=%s body=%s", request.Protocol, request.Body)
+			}
+			root, err := decodeRequestObject(request.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !nativeRequestHasSearchForTest(root, test.protocol) {
+				t.Fatalf("web_search was lost while removing x_search: %s", request.Body)
+			}
+			foundReadFile := false
+			for _, raw := range anySlice(root["tools"]) {
+				tool, _ := raw.(map[string]any)
+				foundReadFile = foundReadFile || functionToolName(tool) == "read_file"
+			}
+			if !foundReadFile {
+				t.Fatalf("local function tool was lost: %s", request.Body)
+			}
+		})
+	}
+}
+
 func TestCrossProtocolResponsesEndpointAcceptsOnlyBuildClientSearch(t *testing.T) {
 	for _, backend := range []string{"messages", "chat_completions"} {
 		t.Run(backend, func(t *testing.T) {
@@ -497,10 +549,10 @@ func TestChatSearchDialectUsesExplicitOrOfficialHostCapabilities(t *testing.T) {
 	if got := chatSearchDialect(config.Route{Host: "api.x.ai"}); got != config.ChatSearchDialectResponses {
 		t.Fatalf("official xAI host default=%q", got)
 	}
-	if got := chatSearchDialect(config.Route{Host: "api.deepseek.com", WireModel: "deepseek-v4-pro"}); got != config.ChatSearchDialectMessages {
+	if got := chatSearchDialect(config.Route{Host: "api.deepseek.com", WireModel: "deepseek-v4-pro"}); got != config.ChatSearchDialectResponses {
 		t.Fatalf("official DeepSeek V4 host default=%q", got)
 	}
-	if got := chatSearchDialect(config.Route{Host: "api.deepseek.com", WireModel: "deepseek-future-model"}); got != config.ChatSearchDialectMessages {
+	if got := chatSearchDialect(config.Route{Host: "api.deepseek.com", WireModel: "deepseek-future-model"}); got != config.ChatSearchDialectResponses {
 		t.Fatalf("future official DeepSeek model default=%q", got)
 	}
 	explicit := config.Route{Host: "api.deepseek.com", ChatSearchDialect: config.ChatSearchDialectWebSearchOptions}
@@ -529,9 +581,9 @@ func TestProviderSearchProtocolHonorsConfiguredNativeAPIAndExplicitChatDialect(t
 			want:  wireMessages,
 		},
 		{
-			name:  "official Chat uses source-preserving Messages default",
+			name:  "official Chat uses documented Responses default",
 			route: config.Route{Host: "api.deepseek.com", APIBackend: "chat_completions", WireModel: "deepseek-future-model"},
-			want:  wireMessages,
+			want:  wireResponses,
 		},
 		{
 			name: "explicit Chat dialect overrides host default",
