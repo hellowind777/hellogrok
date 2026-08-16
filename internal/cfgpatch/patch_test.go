@@ -2,6 +2,7 @@ package cfgpatch
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1446,6 +1447,395 @@ func TestApplyTargetsPreservesExistingOrderAndAppendsMissingFields(t *testing.T)
 	}
 	if string(restored) != original {
 		t.Fatalf("restore was not byte-exact\nwant: %q\ngot:  %q", original, restored)
+	}
+}
+
+func TestApplyTargetsPreservesConfiguredReasoningAndSearchOrder(t *testing.T) {
+	efforts := []ReasoningEffortOption{
+		{Value: "none", Label: "None"},
+		{Value: "high", Label: "High", Default: true},
+		{Value: "max", Label: "Max"},
+	}
+	tests := []struct {
+		name        string
+		modelFields []string
+		wantOrder   []string
+	}{
+		{
+			name: "reasoning menu before backend search",
+			modelFields: []string{
+				`reasoning_effort = "high" # keep selection position`,
+				"reasoning_efforts = [",
+				`  { value = "low", label = "Low" },`,
+				`  { value = "high", label = "High", default = true },`,
+				"] # keep menu position",
+				`api_key = "test-key"`,
+				"supports_backend_search = false # keep search position",
+			},
+			wantOrder: []string{
+				`reasoning_effort = "high" # keep selection position`,
+				`reasoning_efforts = ["none", "high", "max"]`,
+				`api_key = "test-key"`,
+				"supports_backend_search = true # keep search position",
+			},
+		},
+		{
+			name: "backend search before multiline reasoning menu",
+			modelFields: []string{
+				`reasoning_effort = "high" # keep selection position`,
+				"supports_backend_search = false # keep search position",
+				`api_key = "test-key"`,
+				"reasoning_efforts = [",
+				`  { value = "low", label = "Low" },`,
+				`  { value = "high", label = "High", default = true },`,
+				"] # keep menu position",
+			},
+			wantOrder: []string{
+				`reasoning_effort = "high" # keep selection position`,
+				"supports_backend_search = true # keep search position",
+				`api_key = "test-key"`,
+				`reasoning_efforts = ["none", "high", "max"]`,
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			configPath := filepath.Join(dir, "config.toml")
+			statePath := filepath.Join(dir, "state.json")
+			original := strings.Join(append([]string{
+				"[model.one]",
+				`base_url = "https://one.example/v1"`,
+			}, test.modelFields...), "\r\n") + "\r\n"
+			if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			target := Target{
+				ID: "one", SupportsBackendSearch: true, ProjectBackendSearch: true,
+				ReasoningEfforts: efforts,
+			}
+			if _, err := ApplyTargets(configPath, statePath, []Target{target}); err != nil {
+				t.Fatal(err)
+			}
+			first, err := os.ReadFile(configPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertOrdered(t, sectionText(t, string(first), "model.one"), test.wantOrder...)
+
+			if _, err := ApplyTargets(configPath, statePath, []Target{target}); err != nil {
+				t.Fatal(err)
+			}
+			second, err := os.ReadFile(configPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(second, first) {
+				t.Fatalf("reapply changed configured field order\nfirst:  %q\nsecond: %q", first, second)
+			}
+
+			if _, err := Restore(configPath, statePath); err != nil {
+				t.Fatal(err)
+			}
+			restored, err := os.ReadFile(configPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(restored) != original {
+				t.Fatalf("restore changed configured field order\nwant: %q\ngot:  %q", original, restored)
+			}
+		})
+	}
+}
+
+func TestApplyTargetsOrdersMissingReasoningAndSearchFields(t *testing.T) {
+	efforts := []ReasoningEffortOption{
+		{Value: "none", Label: "None"},
+		{Value: "high", Label: "High", Default: true},
+		{Value: "max", Label: "Max"},
+	}
+	tests := []struct {
+		name         string
+		modelFields  []string
+		migrateModes []bool
+	}{
+		{name: "all fields missing", modelFields: []string{`api_key = "test-key"`}, migrateModes: []bool{false}},
+		{
+			name: "only backend search configured",
+			modelFields: []string{
+				"supports_backend_search = false # keep position and comment",
+				`api_key = "test-key"`,
+			},
+			migrateModes: []bool{false},
+		},
+		{
+			name: "only single-line reasoning menu configured",
+			modelFields: []string{
+				`reasoning_efforts = ["low", "high"] # keep position and comment`,
+				`api_key = "test-key"`,
+			},
+			migrateModes: []bool{false, true},
+		},
+		{
+			name: "only multiline reasoning menu configured",
+			modelFields: []string{
+				"reasoning_efforts = [",
+				`  { value = "low", label = "Low" },`,
+				`  { value = "high", label = "High", default = true },`,
+				"] # keep position and comment",
+				`api_key = "test-key"`,
+			},
+			migrateModes: []bool{false, true},
+		},
+	}
+
+	for _, test := range tests {
+		for _, migrateLegacy := range test.migrateModes {
+			name := fmt.Sprintf("%s/migrate_legacy_%t", test.name, migrateLegacy)
+			t.Run(name, func(t *testing.T) {
+				dir := t.TempDir()
+				configPath := filepath.Join(dir, "config.toml")
+				statePath := filepath.Join(dir, "state.json")
+				original := strings.Join(append([]string{
+					"[model.one]",
+					`base_url = "https://one.example/v1"`,
+				}, test.modelFields...), "\n") + "\n"
+				if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
+					t.Fatal(err)
+				}
+
+				target := Target{
+					ID: "one", SupportsBackendSearch: true, ProjectBackendSearch: true,
+					ReasoningEfforts: efforts, ReasoningEffortDefault: "high",
+					MigrateLegacyReasoningMenu: migrateLegacy,
+				}
+				if _, err := ApplyTargets(configPath, statePath, []Target{target}); err != nil {
+					t.Fatal(err)
+				}
+				first, err := os.ReadFile(configPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				model := sectionText(t, string(first), "model.one")
+				assertOrdered(t, model,
+					`reasoning_effort = "high"`,
+					`reasoning_efforts = ["none", "high", "max"]`,
+					"supports_backend_search = true",
+				)
+
+				if _, err := ApplyTargets(configPath, statePath, []Target{target}); err != nil {
+					t.Fatal(err)
+				}
+				second, err := os.ReadFile(configPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !bytes.Equal(second, first) {
+					t.Fatalf("reapply changed inserted field order\nfirst:  %q\nsecond: %q", first, second)
+				}
+
+				if _, err := Restore(configPath, statePath); err != nil {
+					t.Fatal(err)
+				}
+				restored, err := os.ReadFile(configPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if migrateLegacy && strings.Contains(original, "reasoning_efforts") {
+					assertOrdered(t, sectionText(t, string(restored), "model.one"),
+						`reasoning_effort = "high"`,
+						`reasoning_efforts = ["none", "high", "max"]`,
+					)
+					return
+				}
+				if string(restored) != original {
+					t.Fatalf("restore changed original field order\nwant: %q\ngot:  %q", original, restored)
+				}
+			})
+		}
+	}
+}
+
+func TestApplyTargetsUsesUserOwnedCapabilityFieldsAsOrderingAnchors(t *testing.T) {
+	efforts := []ReasoningEffortOption{
+		{Value: "none", Label: "None"},
+		{Value: "high", Label: "High", Default: true},
+		{Value: "max", Label: "Max"},
+	}
+	tests := []struct {
+		name          string
+		modelFields   []string
+		targetEfforts []ReasoningEffortOption
+		wantOrder     []string
+	}{
+		{
+			name: "user-owned reasoning menu anchors projected search field",
+			modelFields: []string{
+				`reasoning_efforts = [{ value = "future", label = "Future", default = true }] # user menu`,
+				`api_key = "test-key"`,
+			},
+			wantOrder: []string{
+				`reasoning_efforts = [{ value = "future", label = "Future", default = true }] # user menu`,
+				"supports_backend_search = true",
+				`api_key = "test-key"`,
+			},
+		},
+		{
+			name: "user-owned reasoning selection anchors projected menu and search field",
+			modelFields: []string{
+				`reasoning_effort = "high" # user selection`,
+				`api_key = "test-key"`,
+			},
+			targetEfforts: efforts,
+			wantOrder: []string{
+				`reasoning_effort = "high" # user selection`,
+				`reasoning_efforts = ["none", "high", "max"]`,
+				"supports_backend_search = true",
+				`api_key = "test-key"`,
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			configPath := filepath.Join(dir, "config.toml")
+			statePath := filepath.Join(dir, "state.json")
+			original := strings.Join(append([]string{
+				"[model.one]",
+				`base_url = "https://one.example/v1"`,
+			}, test.modelFields...), "\n") + "\n"
+			if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			target := Target{
+				ID: "one", SupportsBackendSearch: true, ProjectBackendSearch: true,
+				ReasoningEfforts: test.targetEfforts,
+			}
+			if _, err := ApplyTargets(configPath, statePath, []Target{target}); err != nil {
+				t.Fatal(err)
+			}
+			first, err := os.ReadFile(configPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertOrdered(t, sectionText(t, string(first), "model.one"), test.wantOrder...)
+
+			if _, err := ApplyTargets(configPath, statePath, []Target{target}); err != nil {
+				t.Fatal(err)
+			}
+			second, err := os.ReadFile(configPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(second, first) {
+				t.Fatalf("reapply changed anchored field order\nfirst:  %q\nsecond: %q", first, second)
+			}
+
+			if _, err := Restore(configPath, statePath); err != nil {
+				t.Fatal(err)
+			}
+			restored, err := os.ReadFile(configPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(restored) != original {
+				t.Fatalf("restore changed user-owned ordering anchor\nwant: %q\ngot:  %q", original, restored)
+			}
+		})
+	}
+}
+
+func TestApplyTargetsPreservesLegacyReasoningMenuAndSearchOrderDuringMigration(t *testing.T) {
+	efforts := []ReasoningEffortOption{
+		{Value: "none", Label: "None"},
+		{Value: "high", Label: "High", Default: true},
+		{Value: "max", Label: "Max"},
+	}
+	legacyMenu := []string{
+		"[[model.one.reasoning_efforts]]",
+		`value = "none"`,
+		`label = "None"`,
+		"[[model.one.reasoning_efforts]]",
+		`value = "high"`,
+		`label = "High"`,
+		"default = true",
+		"[[model.one.reasoning_efforts]]",
+		`value = "max"`,
+		`label = "Max"`,
+	}
+	tests := []struct {
+		name        string
+		modelFields []string
+		wantOrder   []string
+	}{
+		{
+			name: "legacy menu before backend search",
+			modelFields: append(append([]string(nil), legacyMenu...),
+				"supports_backend_search = false # keep search position"),
+			wantOrder: []string{
+				`reasoning_efforts = ["none", "high", "max"]`,
+				"supports_backend_search = false # keep search position",
+			},
+		},
+		{
+			name: "backend search before legacy menu",
+			modelFields: append([]string{
+				"supports_backend_search = false # keep search position",
+			}, legacyMenu...),
+			wantOrder: []string{
+				"supports_backend_search = false # keep search position",
+				`reasoning_efforts = ["none", "high", "max"]`,
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			configPath := filepath.Join(dir, "config.toml")
+			statePath := filepath.Join(dir, "state.json")
+			original := strings.Join(append([]string{
+				"[model.one]",
+				`base_url = "https://one.example/v1"`,
+			}, test.modelFields...), "\n") + "\n"
+			if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			target := Target{
+				ID: "one", SupportsBackendSearch: true, ProjectBackendSearch: true,
+				ReasoningEfforts: efforts, ReasoningEffortDefault: "high",
+				MigrateLegacyReasoningMenu: true,
+			}
+			if _, err := ApplyTargets(configPath, statePath, []Target{target}); err != nil {
+				t.Fatal(err)
+			}
+			patched, err := os.ReadFile(configPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(string(patched), "[[model.one.reasoning_efforts]]") {
+				t.Fatalf("legacy reasoning menu was not compacted:\n%s", patched)
+			}
+
+			if _, err := Restore(configPath, statePath); err != nil {
+				t.Fatal(err)
+			}
+			restored, err := os.ReadFile(configPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			model := sectionText(t, string(restored), "model.one")
+			assertOrdered(t, model, test.wantOrder...)
+			if strings.Contains(model, "[[model.one.reasoning_efforts]]") ||
+				!strings.Contains(model, `reasoning_effort = "high"`) {
+				t.Fatalf("legacy migration was not durable after restore:\n%s", model)
+			}
+		})
 	}
 }
 

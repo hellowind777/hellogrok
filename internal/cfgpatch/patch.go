@@ -1216,11 +1216,7 @@ func rewriteModelBlock(block []string, id string, target Target, state *State, e
 			state: &modelState.AutoCompactThreshold, changed: &result.AutoCompactThresholds,
 		})
 	}
-	if target.ProjectBackendSearch || modelState.BackendSearch.Managed {
-		fields = append(fields,
-			managedField{name: "supports_backend_search", pattern: backendSearchLine, anyPattern: backendSearchAnyLine, value: fmt.Sprintf("%t", target.SupportsBackendSearch), state: &modelState.BackendSearch, changed: &result.BackendSearch},
-		)
-	}
+	orderedFields := make([]managedField, 0, 3)
 	if target.ReasoningEffortDefault != "" &&
 		(modelState.ReasoningEffort.Managed || !modelBlockHasField(block, reasoningEffortAnyLine)) {
 		if target.MigrateLegacyReasoningMenu && !modelState.ReasoningEffort.Managed &&
@@ -1233,7 +1229,7 @@ func rewriteModelBlock(block []string, id string, target Target, state *State, e
 				PreApplyPresent:  false,
 			}
 		}
-		fields = append(fields, managedField{
+		orderedFields = append(orderedFields, managedField{
 			name: "reasoning_effort", pattern: reasoningEffortLine,
 			anyPattern: reasoningEffortAnyLine, value: quoteTOML(target.ReasoningEffortDefault),
 			state: &modelState.ReasoningEffort, changed: &result.ReasoningEffort,
@@ -1246,15 +1242,27 @@ func rewriteModelBlock(block []string, id string, target Target, state *State, e
 			anyPattern: reasoningEffortsAnyLine, value: reasoningEffortsTOML(target.ReasoningEfforts),
 			state: &modelState.ReasoningEfforts, changed: &result.ReasoningEfforts,
 		}
-		block, err = rewriteManagedCompositeField(block, 1, field, ending, id, target.MigrateLegacyReasoningMenu)
+		orderedFields = append(orderedFields, field)
+		block, err = rewriteExistingManagedCompositeField(block, 1, field, ending, id, target.MigrateLegacyReasoningMenu)
 		if err != nil {
 			return nil, fmt.Errorf("[model.%s].reasoning_efforts: %w", id, err)
 		}
+	}
+	if target.ProjectBackendSearch || modelState.BackendSearch.Managed {
+		orderedFields = append(orderedFields, managedField{
+			name: "supports_backend_search", pattern: backendSearchLine, anyPattern: backendSearchAnyLine,
+			value: fmt.Sprintf("%t", target.SupportsBackendSearch), state: &modelState.BackendSearch, changed: &result.BackendSearch,
+		})
 	}
 	// Compact legacy child array tables before appending model-level scalar
 	// fields. While [[model.<id>.reasoning_efforts]] is the active TOML table,
 	// an appended scalar would otherwise become part of the final menu item.
 	block = rewriteManagedFields(block, 1, fields, ending)
+	foundOrdered := rewriteExistingManagedFields(block, 1, orderedFields)
+	block, err = insertMissingModelCapabilityFields(block, 1, orderedFields, foundOrdered, ending)
+	if err != nil {
+		return nil, fmt.Errorf("[model.%s] capability field order: %w", id, err)
+	}
 	state.Models[id] = modelState
 	return block, nil
 }
@@ -1273,6 +1281,32 @@ func modelBlockHasField(block []string, pattern *regexp.Regexp) bool {
 // missing values after the table's last field, before trailing comments and
 // blank lines. firstContent is 1 for a named table and 0 for the root table.
 func rewriteManagedFields(block []string, firstContent int, fields []managedField, ending string) []string {
+	found := rewriteExistingManagedFields(block, firstContent, fields)
+
+	insertAt := managedFieldFooterInsertAt(block, firstContent)
+	for index := range fields {
+		field := &fields[index]
+		if found[field.name] {
+			continue
+		}
+		if !field.state.Managed {
+			*field.state = ManagedLineState{Managed: true, Present: false}
+		}
+		field.state.AppliedValue = managedSemanticValue(field.value)
+		if insertAt > 0 && lineEnding(block[insertAt-1]) == "" {
+			if field.state.PreviousLineHash == "" {
+				field.state.PreviousLineHash = lineFingerprint(block[insertAt-1])
+			}
+			block[insertAt-1] += ending
+		}
+		block = insertBlockLine(block, insertAt, field.name+" = "+field.value+ending)
+		insertAt++
+		*field.changed++
+	}
+	return block
+}
+
+func rewriteExistingManagedFields(block []string, firstContent int, fields []managedField) map[string]bool {
 	found := make(map[string]bool, len(fields))
 	structural := tomlStructuralLines(block)
 	for index := firstContent; index < len(block); index++ {
@@ -1300,34 +1334,14 @@ func rewriteManagedFields(block []string, firstContent int, fields []managedFiel
 			break
 		}
 	}
-
-	insertAt := managedFieldFooterInsertAt(block, firstContent)
-	for index := range fields {
-		field := &fields[index]
-		if found[field.name] {
-			continue
-		}
-		if !field.state.Managed {
-			*field.state = ManagedLineState{Managed: true, Present: false}
-		}
-		field.state.AppliedValue = managedSemanticValue(field.value)
-		if insertAt > 0 && lineEnding(block[insertAt-1]) == "" {
-			if field.state.PreviousLineHash == "" {
-				field.state.PreviousLineHash = lineFingerprint(block[insertAt-1])
-			}
-			block[insertAt-1] += ending
-		}
-		block = insertBlockLine(block, insertAt, field.name+" = "+field.value+ending)
-		insertAt++
-		*field.changed++
-	}
-	return block
+	return found
 }
 
-// rewriteManagedCompositeField handles TOML values that may span multiple
-// lines. The complete original assignment is kept in OriginalLine so shutdown
-// can restore comments, formatting, and line endings byte-for-byte.
-func rewriteManagedCompositeField(
+// rewriteExistingManagedCompositeField handles existing TOML values that may
+// span multiple lines. The complete original assignment is kept in
+// OriginalLine so shutdown can restore comments, formatting, and line endings
+// byte-for-byte. Missing capability fields are inserted together later.
+func rewriteExistingManagedCompositeField(
 	block []string,
 	firstContent int,
 	field managedField,
@@ -1406,20 +1420,95 @@ func rewriteManagedCompositeField(
 		return next, nil
 	}
 
-	if !field.state.Managed {
-		*field.state = ManagedLineState{Managed: true, Present: false}
-	}
-	field.state.AppliedValue = managedSemanticValue(field.value)
-	insertAt := managedFieldFooterInsertAt(block, firstContent)
-	if insertAt > 0 && lineEnding(block[insertAt-1]) == "" {
-		if field.state.PreviousLineHash == "" {
-			field.state.PreviousLineHash = lineFingerprint(block[insertAt-1])
-		}
-		block[insertAt-1] += ending
-	}
-	block = insertBlockLine(block, insertAt, field.name+" = "+field.value+ending)
-	*field.changed++
 	return block, nil
+}
+
+var orderedModelCapabilityFields = []struct {
+	name       string
+	anyPattern *regexp.Regexp
+}{
+	{name: "reasoning_effort", anyPattern: reasoningEffortAnyLine},
+	{name: "reasoning_efforts", anyPattern: reasoningEffortsAnyLine},
+	{name: "supports_backend_search", anyPattern: backendSearchAnyLine},
+}
+
+func insertMissingModelCapabilityFields(
+	block []string,
+	firstContent int,
+	fields []managedField,
+	found map[string]bool,
+	ending string,
+) ([]string, error) {
+	active := make(map[string]managedField, len(fields))
+	for _, field := range fields {
+		active[field.name] = field
+	}
+	for orderIndex, ordered := range orderedModelCapabilityFields {
+		field, enabled := active[ordered.name]
+		if !enabled || found[field.name] {
+			continue
+		}
+		insertAt, err := orderedModelCapabilityInsertAt(block, firstContent, orderIndex)
+		if err != nil {
+			return nil, err
+		}
+		if !field.state.Managed {
+			*field.state = ManagedLineState{Managed: true, Present: false}
+		}
+		field.state.AppliedValue = managedSemanticValue(field.value)
+		if insertAt > 0 && lineEnding(block[insertAt-1]) == "" {
+			if field.state.PreviousLineHash == "" {
+				field.state.PreviousLineHash = lineFingerprint(block[insertAt-1])
+			}
+			block[insertAt-1] += ending
+		}
+		block = insertBlockLine(block, insertAt, field.name+" = "+field.value+ending)
+		*field.changed++
+	}
+	return block, nil
+}
+
+func orderedModelCapabilityInsertAt(block []string, firstContent, targetOrder int) (int, error) {
+	previousEnd := -1
+	nextStart := -1
+	structural := tomlStructuralLines(block)
+	for index := firstContent; index < len(block); index++ {
+		if !structural[index] {
+			continue
+		}
+		bare := strings.TrimRight(block[index], "\r\n")
+		for orderIndex, ordered := range orderedModelCapabilityFields {
+			if !ordered.anyPattern.MatchString(bare) {
+				continue
+			}
+			if orderIndex < targetOrder {
+				end := index + 1
+				if ordered.name == "reasoning_efforts" {
+					var err error
+					end, err = tomlAssignmentEnd(block, index, ordered.name)
+					if err != nil {
+						return 0, err
+					}
+				}
+				if end > previousEnd {
+					previousEnd = end
+				}
+			} else if orderIndex > targetOrder && (nextStart < 0 || index < nextStart) {
+				nextStart = index
+			}
+			break
+		}
+	}
+	if previousEnd >= 0 && (nextStart < 0 || previousEnd <= nextStart) {
+		return previousEnd, nil
+	}
+	if nextStart >= 0 {
+		return nextStart, nil
+	}
+	if previousEnd >= 0 {
+		return previousEnd, nil
+	}
+	return managedFieldFooterInsertAt(block, firstContent), nil
 }
 
 func recordPreApplyModelField(block []string, modelID, key string, state *ManagedLineState) error {

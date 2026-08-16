@@ -6,7 +6,7 @@
 
 A cross-platform local proxy that makes Grok Build custom model channels work with common API formats, native Web tools, isolated authentication, and automatic configuration recovery.
 
-[![Version](https://img.shields.io/badge/version-0.1.14-2f6feb.svg)](./internal/appinfo/appinfo.go)
+[![Version](https://img.shields.io/badge/version-0.1.15-2f6feb.svg)](./internal/appinfo/appinfo.go)
 [![Go](https://img.shields.io/badge/Go-1.26.6-00ADD8.svg)](./go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#platform-support)
@@ -81,6 +81,7 @@ It is intended for users who maintain multiple third-party model channels and wa
 - Prevents an official Grok login token from being sent to an unrelated custom channel.
 - Validates channel-owned header names and values while loading configuration. Request framing, content, and connection headers remain controlled by the proxy.
 - Checks and temporarily completes required Grok settings when the proxy starts.
+- Updates existing reasoning and search assignments in place without changing their relative positions. Missing proxy-owned fields are inserted as `reasoning_effort`, `reasoning_efforts`, then `supports_backend_search`; repeated applies are byte-stable, and stop restores only managed values.
 - Accepts `config.toml` as UTF-8 with or without a BOM. Read-only checks never rewrite the file; every successful proxy apply, restore, or rollback write saves it atomically as UTF-8 without BOM. Invalid TOML reports the file path, line, and column instead of an undecorated parser error.
 - Computes an independent auto-compaction budget for each custom model from its effective context window and maximum output. It temporarily lowers only unsafe thresholds, never raises a lower user value, and restores every managed value when the proxy stops.
 - On normal stop, tray exit, Ctrl+C, SIGTERM, or failed startup, restores untouched temporary values while preserving concurrent user edits through a field-level three-way merge. If unrelated edits make the full TOML document invalid but it remains valid UTF-8, line-scoped recovery still restores independently valid managed assignments while preserving the malformed user text.

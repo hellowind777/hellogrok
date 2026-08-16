@@ -6,6 +6,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.1.15] — 2026-08-16
+
+### Fixed
+
+- Proxy configuration updates now preserve the relative positions of existing `reasoning_effort`, single-line or multiline `reasoning_efforts`, and `supports_backend_search` assignments across every channel. Missing proxy-owned fields use existing assignments as anchors and are inserted in that order; repeated applies remain byte-stable, normal restore remains byte-exact, and legacy reasoning-menu migration preserves existing reasoning/search placement.
+
 ## [0.1.14] — 2026-08-16
 
 ### Changed
@@ -249,7 +255,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - CC Switch compatibility detection and conflict warnings.
 - Builds for Windows, Linux, and macOS on amd64 and arm64.
 
-[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.14...HEAD
+[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.15...HEAD
+[0.1.15]: https://github.com/hellowind777/hellogrok/compare/v0.1.14...v0.1.15
 [0.1.14]: https://github.com/hellowind777/hellogrok/compare/v0.1.13...v0.1.14
 [0.1.13]: https://github.com/hellowind777/hellogrok/compare/v0.1.12...v0.1.13
 [0.1.12]: https://github.com/hellowind777/hellogrok/compare/v0.1.11...v0.1.12

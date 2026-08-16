@@ -1,11 +1,13 @@
-# Release Notes — v0.1.14
+# Release Notes — v0.1.15
 
-## Managed configuration writes now use UTF-8 without BOM
+## Existing reasoning and search fields keep their positions
 
-hellogrok continues to read UTF-8 `config.toml` files with or without a byte-order mark, and read-only inspection never rewrites the file. Whenever the proxy successfully applies, restores, or rolls back managed settings, the atomic write now saves the configuration as UTF-8 without BOM.
+Enabling the proxy no longer changes the relative placement of existing `reasoning_effort`, `reasoning_efforts`, or `supports_backend_search` assignments. Single-line and multiline reasoning menus are updated in place, while comments, unrelated model settings, and user-defined field order remain intact.
 
-If a user adds a BOM while the proxy is active, a later successful restore removes it while preserving concurrent field edits. Valid UTF-8 text remains eligible for line-scoped recovery when unrelated edits temporarily make the TOML document invalid; a successful recovery also writes the result without BOM.
+This behavior is shared by every proxied channel. Reapplying the active projection produces identical configuration bytes, and a normal stop restores the original assignments and formatting exactly.
 
-## Invalid encodings fail closed during recovery
+## Missing capability fields use a stable order
 
-Line-scoped recovery now runs only after the configuration has passed UTF-8 validation. Invalid UTF-8 reports the configuration path and first invalid line, column, and byte offset without exposing configuration values. The configuration bytes and recovery state remain unchanged so restoration can be retried after the encoding is corrected. hellogrok does not guess or transcode GBK, UTF-16, or another encoding.
+When one or more of these fields must be projected but are absent, hellogrok now uses existing user assignments as anchors and inserts only the missing values in this order: `reasoning_effort`, `reasoning_efforts`, `supports_backend_search`.
+
+The same ordering applies when all three fields are absent. One-time migration of an exact legacy hellogrok reasoning menu still compacts that menu, but it preserves the relative placement of existing search and reasoning settings.
