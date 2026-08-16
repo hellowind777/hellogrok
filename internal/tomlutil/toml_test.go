@@ -1,7 +1,6 @@
 package tomlutil
 
 import (
-	"bytes"
 	"strings"
 	"testing"
 )
@@ -16,9 +15,6 @@ func TestUnmarshalAcceptsUTF8BOM(t *testing.T) {
 	one, _ := model["one"].(map[string]any)
 	if got := one["value"]; got != int64(1) {
 		t.Fatalf("value = %#v, want 1", got)
-	}
-	if !bytes.HasPrefix(PreserveUTF8BOM(raw, []byte("value = 2\n")), []byte{0xEF, 0xBB, 0xBF}) {
-		t.Fatal("UTF-8 BOM was not preserved")
 	}
 }
 

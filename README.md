@@ -6,7 +6,7 @@
 
 A cross-platform local proxy that makes Grok Build custom model channels work with common API formats, native Web tools, isolated authentication, and automatic configuration recovery.
 
-[![Version](https://img.shields.io/badge/version-0.1.13-2f6feb.svg)](./internal/appinfo/appinfo.go)
+[![Version](https://img.shields.io/badge/version-0.1.14-2f6feb.svg)](./internal/appinfo/appinfo.go)
 [![Go](https://img.shields.io/badge/Go-1.26.6-00ADD8.svg)](./go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#platform-support)
@@ -81,9 +81,9 @@ It is intended for users who maintain multiple third-party model channels and wa
 - Prevents an official Grok login token from being sent to an unrelated custom channel.
 - Validates channel-owned header names and values while loading configuration. Request framing, content, and connection headers remain controlled by the proxy.
 - Checks and temporarily completes required Grok settings when the proxy starts.
-- Accepts `config.toml` as UTF-8 with or without a BOM. Normal proxy transactions preserve the file's current BOM choice, including a choice changed by the user while the proxy is active; invalid TOML reports the file path, line, and column instead of an undecorated parser error.
+- Accepts `config.toml` as UTF-8 with or without a BOM. Read-only checks never rewrite the file; every successful proxy apply, restore, or rollback write saves it atomically as UTF-8 without BOM. Invalid TOML reports the file path, line, and column instead of an undecorated parser error.
 - Computes an independent auto-compaction budget for each custom model from its effective context window and maximum output. It temporarily lowers only unsafe thresholds, never raises a lower user value, and restores every managed value when the proxy stops.
-- On normal stop, tray exit, Ctrl+C, SIGTERM, or failed startup, restores untouched temporary values while preserving concurrent user edits through a field-level three-way merge. If unrelated edits make the full TOML document invalid, line-scoped recovery still restores independently valid managed assignments without rewriting the invalid user bytes.
+- On normal stop, tray exit, Ctrl+C, SIGTERM, or failed startup, restores untouched temporary values while preserving concurrent user edits through a field-level three-way merge. If unrelated edits make the full TOML document invalid but it remains valid UTF-8, line-scoped recovery still restores independently valid managed assignments while preserving the malformed user text.
 - Always honors the tray **Exit** command after attempting cleanup. If safe restoration is impossible because the file cannot be accessed or an unowned local route remains, the recovery transaction stays on disk for the next launch instead of trapping the user in the tray process.
 - Recovers proxy-managed settings after an unclean exit with `hellogrok restore`.
 
@@ -333,7 +333,7 @@ On Windows, the divider in **Status and logs** contains a retention selector and
 
 **Stop protection**: The **Start proxy** toggle and foreground signal handler remain fail-closed when another provider manager owns Grok Build or a temporary hellogrok route cannot be restored safely. The tray **Exit** command is different: it always terminates after the cleanup attempt, so an external ownership conflict can never trap the user in the application.
 
-Configuration edits made while the proxy is active are merged field by field during shutdown. Values still matching hellogrok's temporary projection are restored to their startup values, while user-edited values and deleted model channels are preserved. When unrelated edits leave TOML temporarily invalid, hellogrok compares each managed assignment independently, restores only values it still owns, preserves the malformed user text byte for byte, and checks textually for remaining local routes. A cleanup that still cannot prove the route safe leaves the recovery state intact; tray exit nevertheless completes.
+Configuration edits made while the proxy is active are merged field by field during shutdown. Values still matching hellogrok's temporary projection are restored to their startup values, while user-edited values and deleted model channels are preserved. When unrelated edits leave TOML temporarily invalid but still valid UTF-8, hellogrok compares each managed assignment independently, restores only values it still owns, preserves the malformed user text, writes the successful result as UTF-8 without BOM, and checks textually for remaining local routes. Invalid UTF-8 is never guessed or rewritten: cleanup leaves both the configuration and recovery state unchanged, while tray exit nevertheless completes.
 
 ### Compatibility with CC Switch
 
@@ -424,7 +424,7 @@ Native `web_search`, `web_fetch`, official Grok login behavior, and supported su
 
 The error identifies the `config.toml` path and, when available, the exact line and column. Standard UTF-8 with or without a BOM is accepted. Other encodings are not guessed or silently transcoded; save the file as UTF-8 in an editor, then retry.
 
-To remove a valid UTF-8 BOM deliberately, first stop hellogrok and any provider manager that owns Grok Build, then run `hellogrok normalize-config`. The command validates the complete TOML document before an atomic write and leaves invalid input unchanged. Ordinary startup never removes the BOM silently.
+Read-only startup checks do not rewrite the file. Whenever the proxy commits an apply, restore, or rollback write, it validates the applicable input and saves `config.toml` atomically as UTF-8 without BOM, including when a user adds a BOM while the proxy is active. To normalize immediately while the proxy is stopped, run `hellogrok normalize-config`; it validates the complete TOML document and leaves invalid input unchanged.
 
 ### No custom routes are found
 

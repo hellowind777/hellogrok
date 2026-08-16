@@ -16,24 +16,30 @@ func StripUTF8BOM(raw []byte) []byte {
 	return bytes.TrimPrefix(raw, utf8BOM)
 }
 
-// PreserveUTF8BOM restores the source file's optional UTF-8 byte-order mark.
-func PreserveUTF8BOM(source, content []byte) []byte {
-	if !bytes.HasPrefix(source, utf8BOM) {
-		return content
-	}
-	withBOM := make([]byte, 0, len(utf8BOM)+len(content))
-	withBOM = append(withBOM, utf8BOM...)
-	return append(withBOM, content...)
-}
-
-// Unmarshal accepts both ordinary UTF-8 and UTF-8 with a byte-order mark.
-func Unmarshal(raw []byte, target any) error {
+// ValidateUTF8 accepts UTF-8 content with or without a byte-order mark.
+func ValidateUTF8(raw []byte) error {
 	raw = StripUTF8BOM(raw)
 	if offset := firstInvalidUTF8(raw); offset >= 0 {
 		line, column := bytePosition(raw, offset)
 		return fmt.Errorf("内容不是有效的 UTF-8（第 %d 行，第 %d 列，字节偏移 %d）", line, column, offset)
 	}
-	return toml.Unmarshal(raw, target)
+	return nil
+}
+
+// ValidateUTF8File includes the file path in user-facing encoding errors.
+func ValidateUTF8File(path string, raw []byte) error {
+	if err := ValidateUTF8(raw); err != nil {
+		return fmt.Errorf("配置文件 %s 编码校验失败：%w", path, err)
+	}
+	return nil
+}
+
+// Unmarshal accepts both ordinary UTF-8 and UTF-8 with a byte-order mark.
+func Unmarshal(raw []byte, target any) error {
+	if err := ValidateUTF8(raw); err != nil {
+		return err
+	}
+	return toml.Unmarshal(StripUTF8BOM(raw), target)
 }
 
 // UnmarshalFile includes the file and parser position in user-facing errors.

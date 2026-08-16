@@ -527,7 +527,7 @@ func ApplyTargets(configPath, statePath string, targets []Target) (ApplyResult, 
 		}
 	}
 	sort.Strings(result.Targets)
-	prepared := tomlutil.PreserveUTF8BOM(raw, []byte(text))
+	prepared := []byte(text)
 	if err := validateManagedConfig(prepared, targetMap, state); err != nil {
 		return ApplyResult{}, fmt.Errorf("validate prepared config: %w", err)
 	}
@@ -549,7 +549,7 @@ func ApplyTargets(configPath, statePath string, targets []Target) (ApplyResult, 
 	if !bytes.Equal(persistedState, encoded) {
 		return ApplyResult{}, restorePreviousRewriteState(statePath, previousState, hadPreviousState, fmt.Errorf("rewrite state read-back mismatch"))
 	}
-	if err := writeFileAtomic(configPath, prepared, existingFileMode(configPath, 0o600)); err != nil {
+	if err := writeConfigAtomic(configPath, prepared); err != nil {
 		return ApplyResult{}, restorePreviousRewriteState(statePath, previousState, hadPreviousState, fmt.Errorf("write config: %w", err))
 	}
 	written, err := os.ReadFile(configPath)
@@ -582,7 +582,7 @@ func NormalizeUTF8(configPath string) (bool, error) {
 	if len(withoutBOM) == len(raw) {
 		return false, nil
 	}
-	if err := writeFileAtomic(configPath, withoutBOM, existingFileMode(configPath, 0o600)); err != nil {
+	if err := writeConfigAtomic(configPath, withoutBOM); err != nil {
 		return false, fmt.Errorf("将配置文件转换为 UTF-8 无 BOM 失败：%w", err)
 	}
 	written, err := os.ReadFile(configPath)
@@ -906,7 +906,7 @@ func validateSubagentEnabledValue(root map[string]any) error {
 }
 
 func rollbackApplyAttempt(configPath, statePath string, previousConfig, previousState []byte, hadPreviousState bool, cause error) error {
-	if err := writeFileAtomic(configPath, previousConfig, existingFileMode(configPath, 0o600)); err != nil {
+	if err := writeConfigAtomic(configPath, previousConfig); err != nil {
 		return fmt.Errorf("%w; restore previous active config: %v", cause, err)
 	}
 	return restorePreviousRewriteState(statePath, previousState, hadPreviousState, cause)
@@ -1540,6 +1540,9 @@ func Restore(configPath, statePath string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	if err := tomlutil.ValidateUTF8File(configPath, raw); err != nil {
+		return 0, err
+	}
 	var parsed map[string]any
 	parseErr := tomlutil.Unmarshal(raw, &parsed)
 	original := false
@@ -1610,8 +1613,8 @@ func Restore(configPath, statePath string) (int, error) {
 	if len(remaining) != 0 {
 		return 0, fmt.Errorf("config still contains temporary hellogrok routes after preserving concurrent edits: %s", strings.Join(remaining, ", "))
 	}
-	restoredBytes := tomlutil.PreserveUTF8BOM(raw, []byte(text))
-	if err := writeFileAtomic(configPath, restoredBytes, existingFileMode(configPath, 0o600)); err != nil {
+	restoredBytes := []byte(text)
+	if err := writeConfigAtomic(configPath, restoredBytes); err != nil {
 		return 0, err
 	}
 	if err := os.Remove(statePath); err != nil && !os.IsNotExist(err) {
@@ -2691,6 +2694,13 @@ func existingFileMode(path string, fallback os.FileMode) os.FileMode {
 		return info.Mode().Perm()
 	}
 	return fallback
+}
+
+func writeConfigAtomic(path string, data []byte) error {
+	if err := tomlutil.ValidateUTF8File(path, data); err != nil {
+		return err
+	}
+	return writeFileAtomic(path, tomlutil.StripUTF8BOM(data), existingFileMode(path, 0o600))
 }
 
 func writeFileAtomic(path string, data []byte, mode os.FileMode) error {

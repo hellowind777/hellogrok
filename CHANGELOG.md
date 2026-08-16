@@ -6,6 +6,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.1.14] — 2026-08-16
+
+### Changed
+
+- Every successful proxy apply, restore, or rollback write now saves valid UTF-8 `config.toml` content atomically without a byte-order mark. Read-only inspection still accepts either UTF-8 form without rewriting the file.
+
+### Fixed
+
+- Restore now rejects invalid UTF-8 before line-scoped TOML recovery, reports the configuration path and invalid byte location, and leaves both the configuration and recovery state unchanged for a later retry.
+
 ## [0.1.13] — 2026-08-16
 
 ### Changed
@@ -239,7 +249,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - CC Switch compatibility detection and conflict warnings.
 - Builds for Windows, Linux, and macOS on amd64 and arm64.
 
-[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.13...HEAD
+[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.14...HEAD
+[0.1.14]: https://github.com/hellowind777/hellogrok/compare/v0.1.13...v0.1.14
 [0.1.13]: https://github.com/hellowind777/hellogrok/compare/v0.1.12...v0.1.13
 [0.1.12]: https://github.com/hellowind777/hellogrok/compare/v0.1.11...v0.1.12
 [0.1.11]: https://github.com/hellowind777/hellogrok/compare/v0.1.10...v0.1.11

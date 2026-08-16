@@ -9,11 +9,12 @@ import (
 	"unicode/utf8"
 )
 
-func TestApplyAndRestorePreserveUTF8BOMExactly(t *testing.T) {
+func TestApplyAndRestoreWriteUTF8WithoutBOM(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.toml")
 	statePath := filepath.Join(dir, "state.json")
-	original := append([]byte{0xEF, 0xBB, 0xBF}, []byte("[model.one]\nbase_url = \"https://one.example/v1\"\n")...)
+	content := []byte("[model.one]\nbase_url = \"https://one.example/v1\"\n")
+	original := append([]byte{0xEF, 0xBB, 0xBF}, content...)
 	if err := os.WriteFile(configPath, original, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -25,8 +26,8 @@ func TestApplyAndRestorePreserveUTF8BOMExactly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.HasPrefix(patched, []byte{0xEF, 0xBB, 0xBF}) {
-		t.Fatal("apply removed the UTF-8 BOM")
+	if !utf8.Valid(patched) || bytes.HasPrefix(patched, []byte{0xEF, 0xBB, 0xBF}) {
+		t.Fatal("applied configuration is not UTF-8 without BOM")
 	}
 	state, err := os.ReadFile(statePath)
 	if err != nil {
@@ -42,12 +43,12 @@ func TestApplyAndRestorePreserveUTF8BOMExactly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(restored, original) {
-		t.Fatalf("restore was not byte-exact\nwant: %x\ngot:  %x", original, restored)
+	if !bytes.Equal(restored, content) {
+		t.Fatalf("restore did not return BOM-free original content\nwant: %x\ngot:  %x", content, restored)
 	}
 }
 
-func TestRestorePreservesConcurrentUTF8BOMChoice(t *testing.T) {
+func TestRestoreWritesUTF8WithoutBOMAfterConcurrentBOMChange(t *testing.T) {
 	for _, test := range []struct {
 		name          string
 		originalBOM   bool
@@ -89,13 +90,107 @@ func TestRestorePreservesConcurrentUTF8BOMChoice(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if got := bytes.HasPrefix(restored, []byte{0xEF, 0xBB, 0xBF}); got != test.userEditedBOM {
-				t.Fatalf("restored BOM = %t, want user choice %t", got, test.userEditedBOM)
+			if !utf8.Valid(restored) || bytes.HasPrefix(restored, []byte{0xEF, 0xBB, 0xBF}) {
+				t.Fatal("restored configuration is not UTF-8 without BOM")
 			}
-			if !bytes.Equal(bytes.TrimPrefix(restored, []byte{0xEF, 0xBB, 0xBF}), content) {
+			if !bytes.Equal(restored, content) {
 				t.Fatal("restore changed configuration content")
 			}
 		})
+	}
+}
+
+func TestRestoreRejectsInvalidUTF8WithoutChangingConfigOrState(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	statePath := filepath.Join(dir, "state.json")
+	original := []byte("[model.one]\nbase_url = \"https://one.example/v1\"\n")
+	if err := os.WriteFile(configPath, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ApplyTargets(configPath, statePath, []Target{{ID: "one"}}); err != nil {
+		t.Fatal(err)
+	}
+	patched, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalid := append(append([]byte(nil), patched...), []byte("name = \"")...)
+	invalid = append(invalid, 0xFF, '"', '\n')
+	if err := os.WriteFile(configPath, invalid, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stateBefore, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonicalPath, err := canonicalConfigPath(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, restoreErr := Restore(configPath, statePath)
+	if restoreErr == nil || !strings.Contains(restoreErr.Error(), canonicalPath) || !strings.Contains(restoreErr.Error(), "不是有效的 UTF-8") || !strings.Contains(restoreErr.Error(), "第 6 行") {
+		t.Fatalf("Restore() error = %v", restoreErr)
+	}
+	for _, value := range []string{"one.example", "127.0.0.1"} {
+		if strings.Contains(restoreErr.Error(), value) {
+			t.Fatalf("Restore() error exposed configuration value %q: %v", value, restoreErr)
+		}
+	}
+	configAfter, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(configAfter, invalid) {
+		t.Fatal("invalid UTF-8 configuration changed during restore")
+	}
+	stateAfter, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(stateAfter, stateBefore) {
+		t.Fatal("recovery state changed after rejected invalid UTF-8 restore")
+	}
+}
+
+func TestRollbackApplyAttemptWritesUTF8WithoutBOM(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	statePath := filepath.Join(dir, "state.json")
+	content := []byte("[model.one]\nbase_url = \"https://one.example/v1\"\n")
+	previous := append([]byte{0xEF, 0xBB, 0xBF}, content...)
+	if err := os.WriteFile(configPath, []byte("temporary = true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cause := &os.PathError{Op: "validate", Path: configPath, Err: os.ErrInvalid}
+	if err := rollbackApplyAttempt(configPath, statePath, previous, nil, false, cause); err != cause {
+		t.Fatalf("rollbackApplyAttempt() error = %v, want original cause", err)
+	}
+	written, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(written, content) {
+		t.Fatalf("rollback did not write BOM-free content\nwant: %x\ngot:  %x", content, written)
+	}
+}
+
+func TestDetectCCSwitchTakeoverDoesNotRewriteUTF8BOM(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	original := append([]byte{0xEF, 0xBB, 0xBF}, []byte("[model.one]\nbase_url = \"https://one.example/v1\"\n")...)
+	if err := os.WriteFile(path, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DetectCCSwitchTakeover(path); err != nil {
+		t.Fatal(err)
+	}
+	current, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(current, original) {
+		t.Fatal("read-only ownership detection rewrote the configuration")
 	}
 }
 
@@ -2004,6 +2099,13 @@ func TestRestoreRemovesProxyRoutesWhenUnrelatedTOMLIsInvalid(t *testing.T) {
 			name: "unfinished user setting",
 			corrupt: func(patched string) string {
 				return patched + "\n[user]\nunfinished = \"\n"
+			},
+			wantSuffix: "\n[user]\nunfinished = \"\n",
+		},
+		{
+			name: "UTF-8 BOM with unfinished user setting",
+			corrupt: func(patched string) string {
+				return "\ufeff" + patched + "\n[user]\nunfinished = \"\n"
 			},
 			wantSuffix: "\n[user]\nunfinished = \"\n",
 		},
