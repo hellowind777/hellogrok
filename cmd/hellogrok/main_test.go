@@ -28,7 +28,8 @@ func TestUsageIncludesApplicationVersion(t *testing.T) {
 	var output bytes.Buffer
 	printUsage(&output)
 	if !strings.Contains(output.String(), "hellogrok "+appinfo.Version) ||
-		!strings.Contains(output.String(), "version               print the application version") {
+		!strings.Contains(output.String(), "version               print the application version") ||
+		!strings.Contains(output.String(), "normalize-config      validate config.toml and explicitly remove its UTF-8 BOM") {
 		t.Fatalf("usage does not expose the application version:\n%s", output.String())
 	}
 }
@@ -180,7 +181,11 @@ func TestAppLearnsRuntimeCapacityAndUpdatesThreshold(t *testing.T) {
 	for {
 		patched, err := os.ReadFile(configPath)
 		if err != nil {
-			t.Fatal(err)
+			if time.Now().After(deadline) {
+				t.Fatal(err)
+			}
+			time.Sleep(10 * time.Millisecond)
+			continue
 		}
 		if strings.Contains(string(patched), "auto_compact_threshold_percent = 58") &&
 			strings.Contains(string(patched), "context_window = 1048576") {
@@ -405,7 +410,11 @@ func TestAppUsesRequestOutputForBudgetWithoutCreatingOutputCap(t *testing.T) {
 	for {
 		patched, err := os.ReadFile(configPath)
 		if err != nil {
-			t.Fatal(err)
+			if time.Now().After(deadline) {
+				t.Fatal(err)
+			}
+			time.Sleep(10 * time.Millisecond)
+			continue
 		}
 		text := string(patched)
 		if strings.Contains(text, "auto_compact_threshold_percent = 58") {
@@ -1457,6 +1466,9 @@ func TestEnsureFacadeIdleRejectsOccupiedAddress(t *testing.T) {
 	if err := ensureFacadeIdle(address); err == nil {
 		_ = listener.Close()
 		t.Fatal("occupied facade address was treated as idle")
+	} else if !strings.Contains(err.Error(), address) || !strings.Contains(err.Error(), "请先停止代理") {
+		_ = listener.Close()
+		t.Fatalf("occupied facade error is not actionable: %v", err)
 	}
 	if err := listener.Close(); err != nil {
 		t.Fatal(err)

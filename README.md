@@ -6,7 +6,7 @@
 
 A cross-platform local proxy that makes Grok Build custom model channels work with common API formats, native Web tools, isolated authentication, and automatic configuration recovery.
 
-[![Version](https://img.shields.io/badge/version-0.1.12-2f6feb.svg)](./internal/appinfo/appinfo.go)
+[![Version](https://img.shields.io/badge/version-0.1.13-2f6feb.svg)](./internal/appinfo/appinfo.go)
 [![Go](https://img.shields.io/badge/Go-1.26.6-00ADD8.svg)](./go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#platform-support)
@@ -81,6 +81,7 @@ It is intended for users who maintain multiple third-party model channels and wa
 - Prevents an official Grok login token from being sent to an unrelated custom channel.
 - Validates channel-owned header names and values while loading configuration. Request framing, content, and connection headers remain controlled by the proxy.
 - Checks and temporarily completes required Grok settings when the proxy starts.
+- Accepts `config.toml` as UTF-8 with or without a BOM. Normal proxy transactions preserve the file's current BOM choice, including a choice changed by the user while the proxy is active; invalid TOML reports the file path, line, and column instead of an undecorated parser error.
 - Computes an independent auto-compaction budget for each custom model from its effective context window and maximum output. It temporarily lowers only unsafe thresholds, never raises a lower user value, and restores every managed value when the proxy stops.
 - On normal stop, tray exit, Ctrl+C, SIGTERM, or failed startup, restores untouched temporary values while preserving concurrent user edits through a field-level three-way merge. If unrelated edits make the full TOML document invalid, line-scoped recovery still restores independently valid managed assignments without rewriting the invalid user bytes.
 - Always honors the tray **Exit** command after attempting cleanup. If safe restoration is impossible because the file cannot be accessed or an unowned local route remains, the recovery transaction stays on disk for the next launch instead of trapping the user in the tray process.
@@ -353,6 +354,7 @@ If both Grok proxies were enabled accidentally, disable CC Switch's Grok Build t
 | `hellogrok version` | Print the installed version. |
 | `hellogrok routes` | List custom routes without printing credentials. |
 | `hellogrok restore` | Restore proxy-managed settings after an unclean exit. |
+| `hellogrok normalize-config` | Validate `config.toml`, then explicitly remove its UTF-8 BOM without transcoding another encoding. |
 | `hellogrok autostart enable` | Enable login autostart for the current executable. |
 | `hellogrok autostart disable` | Disable login autostart. |
 | `hellogrok autostart status` | Show the current autostart state. |
@@ -367,7 +369,7 @@ If both Grok proxies were enabled accidentally, disable CC Switch's Grok Build t
 | Windows | `%LOCALAPPDATA%\hellogrok` |
 | Linux and macOS | `~/.hellogrok` |
 
-Runtime data contains application preferences, logs, the recovery state used to restore managed configuration, and `reasoning_provenance.json`. The provenance index stores only SHA-256 digests of opaque reasoning values and route signature domains; it never stores raw reasoning, channel IDs, model names, upstream URLs, or credentials.
+Runtime data contains application preferences, logs, the recovery state used to restore managed configuration, and `reasoning_provenance.json`. Files owned by hellogrok are written as UTF-8 without BOM. The provenance index stores only SHA-256 digests of opaque reasoning values and route signature domains; it never stores raw reasoning, channel IDs, model names, upstream URLs, or credentials.
 
 Log retention is applied on every platform. The native retention selector and in-window search are currently Windows-only because the standard Linux and macOS builds use terminal log viewing instead of the Win32 status window.
 
@@ -417,6 +419,12 @@ Responses providers remain Responses. Messages providers receive Messages reques
 Native `web_search`, `web_fetch`, official Grok login behavior, and supported subagent workflows remain controlled through Grok Build rather than being replaced by a separate search service.
 
 ## Troubleshooting
+
+### Startup reports a TOML or UTF-8 error
+
+The error identifies the `config.toml` path and, when available, the exact line and column. Standard UTF-8 with or without a BOM is accepted. Other encodings are not guessed or silently transcoded; save the file as UTF-8 in an editor, then retry.
+
+To remove a valid UTF-8 BOM deliberately, first stop hellogrok and any provider manager that owns Grok Build, then run `hellogrok normalize-config`. The command validates the complete TOML document before an atomic write and leaves invalid input unchanged. Ordinary startup never removes the BOM silently.
 
 ### No custom routes are found
 

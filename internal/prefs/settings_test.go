@@ -1,9 +1,11 @@
 package prefs
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestProxyEnabledDefaultsTrueAndPersistsExplicitChoice(t *testing.T) {
@@ -34,6 +36,13 @@ func TestProxyEnabledDefaultsTrueAndPersistsExplicitChoice(t *testing.T) {
 	}
 	if days, err := LogRetentionUsageDays(path); err != nil || days != 14 {
 		t.Fatalf("saved retention=%v err=%v", days, err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !utf8.Valid(raw) || bytes.HasPrefix(raw, []byte{0xEF, 0xBB, 0xBF}) {
+		t.Fatal("settings file is not UTF-8 without BOM")
 	}
 }
 

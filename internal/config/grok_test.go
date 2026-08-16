@@ -1,11 +1,44 @@
 package config
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestLoadModelsAcceptsUTF8BOMAndReportsInvalidFileLocation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	valid := append([]byte{0xEF, 0xBB, 0xBF}, []byte("[model.one]\nbase_url = \"https://example.test/v1\"\n")...)
+	if err := os.WriteFile(path, valid, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	models, err := LoadModels(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(models) != 1 || models[0].ID != "one" {
+		t.Fatalf("models = %+v", models)
+	}
+
+	invalid := append([]byte{0xEF, 0xBB, 0xBF}, []byte("[model.one]\nbase_url =\n")...)
+	if err := os.WriteFile(path, invalid, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err = LoadModels(path)
+	if err == nil {
+		t.Fatal("invalid TOML was accepted")
+	}
+	for _, want := range []string{path, "第 2 行", "第 11 列"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q does not contain %q", err, want)
+		}
+	}
+	if !bytes.HasPrefix(invalid, []byte{0xEF, 0xBB, 0xBF}) {
+		t.Fatal("test input lost its UTF-8 BOM")
+	}
+}
 
 func TestLoadModelsSupportsQuotedAndLegacyDottedChannelIDs(t *testing.T) {
 	dir := t.TempDir()

@@ -1,10 +1,12 @@
 package capacity
 
 import (
+	"bytes"
 	"os"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func TestCachePersistsOnlyHashedRouteIdentity(t *testing.T) {
@@ -26,6 +28,9 @@ func TestCachePersistsOnlyHashedRouteIdentity(t *testing.T) {
 	raw, err := os.ReadFile(Path(dir))
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !utf8.Valid(raw) || bytes.HasPrefix(raw, []byte{0xEF, 0xBB, 0xBF}) {
+		t.Fatal("capacity cache is not UTF-8 without BOM")
 	}
 	for _, sensitive := range []string{"secret", "example.invalid", "private-model", "token=private"} {
 		if strings.Contains(string(raw), sensitive) {

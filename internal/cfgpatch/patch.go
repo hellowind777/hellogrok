@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/hellowind777/hellogrok/internal/tomlutil"
 	"github.com/pelletier/go-toml/v2"
 )
 
@@ -277,8 +278,8 @@ func DetectCCSwitchTakeover(configPath string) (CCSwitchTakeover, error) {
 		return CCSwitchTakeover{}, err
 	}
 	var root map[string]any
-	if err := toml.Unmarshal(raw, &root); err != nil {
-		return CCSwitchTakeover{}, fmt.Errorf("parse TOML: %w", err)
+	if err := tomlutil.UnmarshalFile(configPath, raw, &root); err != nil {
+		return CCSwitchTakeover{}, err
 	}
 	models := ModelTables(root)
 	if len(models) == 0 {
@@ -333,7 +334,7 @@ func ActiveProxyReferences(configPath string) ([]string, error) {
 
 func activeProxyReferences(raw []byte) ([]string, error) {
 	var root map[string]any
-	if err := toml.Unmarshal(raw, &root); err != nil {
+	if err := tomlutil.Unmarshal(raw, &root); err != nil {
 		return activeProxyReferencesText(raw), nil
 	}
 	models := ModelTables(root)
@@ -447,8 +448,8 @@ func ApplyTargets(configPath, statePath string, targets []Target) (ApplyResult, 
 		return ApplyResult{}, nil
 	}
 	var initialRoot map[string]any
-	if err := toml.Unmarshal(raw, &initialRoot); err != nil {
-		return ApplyResult{}, fmt.Errorf("parse TOML: %w", err)
+	if err := tomlutil.UnmarshalFile(configPath, raw, &initialRoot); err != nil {
+		return ApplyResult{}, err
 	}
 	if err := validateTargetBackendSearchValues(initialRoot, targetMap); err != nil {
 		return ApplyResult{}, err
@@ -498,7 +499,7 @@ func ApplyTargets(configPath, statePath string, targets []Target) (ApplyResult, 
 	state.Format = stateFormat
 	state.ConfigPath = configPath
 
-	text, subagentEnabled, err := rewriteSubagentEnabled(string(raw), initialRoot, &state)
+	text, subagentEnabled, err := rewriteSubagentEnabled(string(tomlutil.StripUTF8BOM(raw)), initialRoot, &state)
 	if err != nil {
 		return ApplyResult{}, err
 	}
@@ -526,7 +527,8 @@ func ApplyTargets(configPath, statePath string, targets []Target) (ApplyResult, 
 		}
 	}
 	sort.Strings(result.Targets)
-	if err := validateManagedConfig([]byte(text), targetMap, state); err != nil {
+	prepared := tomlutil.PreserveUTF8BOM(raw, []byte(text))
+	if err := validateManagedConfig(prepared, targetMap, state); err != nil {
 		return ApplyResult{}, fmt.Errorf("validate prepared config: %w", err)
 	}
 
@@ -547,7 +549,7 @@ func ApplyTargets(configPath, statePath string, targets []Target) (ApplyResult, 
 	if !bytes.Equal(persistedState, encoded) {
 		return ApplyResult{}, restorePreviousRewriteState(statePath, previousState, hadPreviousState, fmt.Errorf("rewrite state read-back mismatch"))
 	}
-	if err := writeFileAtomic(configPath, []byte(text), existingFileMode(configPath, 0o600)); err != nil {
+	if err := writeFileAtomic(configPath, prepared, existingFileMode(configPath, 0o600)); err != nil {
 		return ApplyResult{}, restorePreviousRewriteState(statePath, previousState, hadPreviousState, fmt.Errorf("write config: %w", err))
 	}
 	written, err := os.ReadFile(configPath)
@@ -561,9 +563,41 @@ func ApplyTargets(configPath, statePath string, targets []Target) (ApplyResult, 
 	return result, nil
 }
 
+// NormalizeUTF8 removes an optional UTF-8 BOM after validating the full TOML
+// document. The explicit operation never attempts to transcode another encoding.
+func NormalizeUTF8(configPath string) (bool, error) {
+	configPath, err := canonicalConfigPath(configPath)
+	if err != nil {
+		return false, fmt.Errorf("解析配置路径失败：%w", err)
+	}
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		return false, fmt.Errorf("读取配置文件 %s 失败：%w", configPath, err)
+	}
+	var root map[string]any
+	if err := tomlutil.UnmarshalFile(configPath, raw, &root); err != nil {
+		return false, err
+	}
+	withoutBOM := tomlutil.StripUTF8BOM(raw)
+	if len(withoutBOM) == len(raw) {
+		return false, nil
+	}
+	if err := writeFileAtomic(configPath, withoutBOM, existingFileMode(configPath, 0o600)); err != nil {
+		return false, fmt.Errorf("将配置文件转换为 UTF-8 无 BOM 失败：%w", err)
+	}
+	written, err := os.ReadFile(configPath)
+	if err != nil {
+		return false, fmt.Errorf("转换后读取配置文件失败：%w", err)
+	}
+	if !bytes.Equal(written, withoutBOM) {
+		return false, fmt.Errorf("转换后配置文件校验失败")
+	}
+	return true, nil
+}
+
 func validateManagedConfig(raw []byte, targets map[string]Target, state State) error {
 	var root map[string]any
-	if err := toml.Unmarshal(raw, &root); err != nil {
+	if err := tomlutil.Unmarshal(raw, &root); err != nil {
 		return fmt.Errorf("parse TOML: %w", err)
 	}
 	features, ok := root["features"].(map[string]any)
@@ -1507,7 +1541,7 @@ func Restore(configPath, statePath string) (int, error) {
 		return 0, err
 	}
 	var parsed map[string]any
-	parseErr := toml.Unmarshal(raw, &parsed)
+	parseErr := tomlutil.Unmarshal(raw, &parsed)
 	original := false
 	if parseErr == nil {
 		original, err = matchesOriginalManagedState(raw, state)
@@ -1524,12 +1558,12 @@ func Restore(configPath, statePath string) (int, error) {
 	if parseErr == nil {
 		state, err = prepareRestoreState(raw, state)
 	} else {
-		state, err = prepareRestoreStateText(raw, state)
+		state, err = prepareRestoreStateText(tomlutil.StripUTF8BOM(raw), state)
 	}
 	if err != nil {
 		return 0, fmt.Errorf("prepare config restore: %w", err)
 	}
-	lines := splitKeepNL(string(raw))
+	lines := splitKeepNL(string(tomlutil.StripUTF8BOM(raw)))
 	structural := tomlStructuralLines(lines)
 	out := make([]string, 0, len(lines))
 	restored := 0
@@ -1576,7 +1610,8 @@ func Restore(configPath, statePath string) (int, error) {
 	if len(remaining) != 0 {
 		return 0, fmt.Errorf("config still contains temporary hellogrok routes after preserving concurrent edits: %s", strings.Join(remaining, ", "))
 	}
-	if err := writeFileAtomic(configPath, []byte(text), existingFileMode(configPath, 0o600)); err != nil {
+	restoredBytes := tomlutil.PreserveUTF8BOM(raw, []byte(text))
+	if err := writeFileAtomic(configPath, restoredBytes, existingFileMode(configPath, 0o600)); err != nil {
 		return 0, err
 	}
 	if err := os.Remove(statePath); err != nil && !os.IsNotExist(err) {
@@ -1591,7 +1626,7 @@ func Restore(configPath, statePath string) (int, error) {
 // still treated as a user conflict.
 func matchesOriginalManagedState(raw []byte, state State) (bool, error) {
 	var root map[string]any
-	if err := toml.Unmarshal(raw, &root); err != nil {
+	if err := tomlutil.Unmarshal(raw, &root); err != nil {
 		return false, fmt.Errorf("parse TOML: %w", err)
 	}
 	features, _ := root["features"].(map[string]any)
@@ -1719,7 +1754,7 @@ func managedSemanticValue(rendered string) string {
 // while the proxy was active become user-owned and are preserved as written.
 func prepareRestoreState(raw []byte, state State) (State, error) {
 	var root map[string]any
-	if err := toml.Unmarshal(raw, &root); err != nil {
+	if err := tomlutil.Unmarshal(raw, &root); err != nil {
 		return State{}, fmt.Errorf("parse TOML: %w", err)
 	}
 
@@ -1810,7 +1845,7 @@ func prepareRestoreState(raw []byte, state State) (State, error) {
 // independently parseable managed assignment with the value hellogrok applied,
 // so unrelated half-written settings do not block shutdown or get discarded.
 func prepareRestoreStateText(raw []byte, state State) (State, error) {
-	lines := splitKeepNL(string(raw))
+	lines := splitKeepNL(string(tomlutil.StripUTF8BOM(raw)))
 	structural := tomlStructuralLines(lines)
 
 	if block := namedSectionBlock(lines, structural, "features"); block != nil {
@@ -2013,7 +2048,7 @@ func activeProxyReferencesText(raw []byte) []string {
 
 func unexpectedProxyReferences(raw []byte, state State) ([]string, error) {
 	var root map[string]any
-	if err := toml.Unmarshal(raw, &root); err != nil {
+	if err := tomlutil.Unmarshal(raw, &root); err != nil {
 		return nil, fmt.Errorf("parse TOML: %w", err)
 	}
 	models := ModelTables(root)
@@ -2072,7 +2107,7 @@ func managedStateForRestore(section string, table map[string]any, key string, st
 
 func validateRestorableConfig(raw []byte, state State) error {
 	var root map[string]any
-	if err := toml.Unmarshal(raw, &root); err != nil {
+	if err := tomlutil.Unmarshal(raw, &root); err != nil {
 		return fmt.Errorf("parse TOML: %w", err)
 	}
 	features, _ := root["features"].(map[string]any)

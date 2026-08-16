@@ -1,11 +1,174 @@
 package cfgpatch
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
+
+func TestApplyAndRestorePreserveUTF8BOMExactly(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	statePath := filepath.Join(dir, "state.json")
+	original := append([]byte{0xEF, 0xBB, 0xBF}, []byte("[model.one]\nbase_url = \"https://one.example/v1\"\n")...)
+	if err := os.WriteFile(configPath, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	threshold := uint8(58)
+	if _, err := ApplyTargets(configPath, statePath, []Target{{ID: "one", AutoCompactThresholdPercent: &threshold}}); err != nil {
+		t.Fatal(err)
+	}
+	patched, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.HasPrefix(patched, []byte{0xEF, 0xBB, 0xBF}) {
+		t.Fatal("apply removed the UTF-8 BOM")
+	}
+	state, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !utf8.Valid(state) || bytes.HasPrefix(state, []byte{0xEF, 0xBB, 0xBF}) {
+		t.Fatal("rewrite state is not UTF-8 without BOM")
+	}
+	if _, err := Restore(configPath, statePath); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(restored, original) {
+		t.Fatalf("restore was not byte-exact\nwant: %x\ngot:  %x", original, restored)
+	}
+}
+
+func TestRestorePreservesConcurrentUTF8BOMChoice(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		originalBOM   bool
+		userEditedBOM bool
+	}{
+		{name: "user removes BOM", originalBOM: true, userEditedBOM: false},
+		{name: "user adds BOM", originalBOM: false, userEditedBOM: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			configPath := filepath.Join(dir, "config.toml")
+			statePath := filepath.Join(dir, "state.json")
+			content := []byte("[model.one]\nbase_url = \"https://one.example/v1\"\n")
+			original := content
+			if test.originalBOM {
+				original = append([]byte{0xEF, 0xBB, 0xBF}, content...)
+			}
+			if err := os.WriteFile(configPath, original, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := ApplyTargets(configPath, statePath, []Target{{ID: "one"}}); err != nil {
+				t.Fatal(err)
+			}
+			patched, err := os.ReadFile(configPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			patched = bytes.TrimPrefix(patched, []byte{0xEF, 0xBB, 0xBF})
+			if test.userEditedBOM {
+				patched = append([]byte{0xEF, 0xBB, 0xBF}, patched...)
+			}
+			if err := os.WriteFile(configPath, patched, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Restore(configPath, statePath); err != nil {
+				t.Fatal(err)
+			}
+			restored, err := os.ReadFile(configPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := bytes.HasPrefix(restored, []byte{0xEF, 0xBB, 0xBF}); got != test.userEditedBOM {
+				t.Fatalf("restored BOM = %t, want user choice %t", got, test.userEditedBOM)
+			}
+			if !bytes.Equal(bytes.TrimPrefix(restored, []byte{0xEF, 0xBB, 0xBF}), content) {
+				t.Fatal("restore changed configuration content")
+			}
+		})
+	}
+}
+
+func TestDetectCCSwitchTakeoverReportsConfigLocation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte("[model.one]\nbase_url =\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := DetectCCSwitchTakeover(path)
+	if err == nil {
+		t.Fatal("invalid TOML was accepted")
+	}
+	for _, want := range []string{path, "第 2 行", "第 11 列"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q does not contain %q", err, want)
+		}
+	}
+}
+
+func TestNormalizeUTF8IsExplicitValidatedAndIdempotent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	content := []byte("[model.one]\nbase_url = \"https://one.example/v1\"\n")
+	withBOM := append([]byte{0xEF, 0xBB, 0xBF}, content...)
+	if err := os.WriteFile(path, withBOM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := NormalizeUTF8(path)
+	if err != nil || !changed {
+		t.Fatalf("NormalizeUTF8() = %t, %v", changed, err)
+	}
+	written, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(written, content) {
+		t.Fatalf("normalized bytes = %x, want %x", written, content)
+	}
+	changed, err = NormalizeUTF8(path)
+	if err != nil || changed {
+		t.Fatalf("second NormalizeUTF8() = %t, %v", changed, err)
+	}
+
+	invalid := append([]byte{0xEF, 0xBB, 0xBF}, []byte("[model.one]\nbase_url =\n")...)
+	if err := os.WriteFile(path, invalid, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := NormalizeUTF8(path); err == nil || changed {
+		t.Fatalf("invalid NormalizeUTF8() = %t, %v", changed, err)
+	}
+	unchanged, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(unchanged, invalid) {
+		t.Fatal("invalid config changed during normalization")
+	}
+
+	invalidUTF8 := append([]byte{0xEF, 0xBB, 0xBF}, []byte("[model.one]\nname = \"")...)
+	invalidUTF8 = append(invalidUTF8, 0xFF, '"', '\n')
+	if err := os.WriteFile(path, invalidUTF8, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := NormalizeUTF8(path); err == nil || changed || !strings.Contains(err.Error(), "不是有效的 UTF-8") {
+		t.Fatalf("invalid UTF-8 NormalizeUTF8() = %t, %v", changed, err)
+	}
+	unchanged, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(unchanged, invalidUTF8) {
+		t.Fatal("invalid UTF-8 config changed during normalization")
+	}
+}
 
 func TestChannelProxyURLRoundTrip(t *testing.T) {
 	got, err := ToChannelProxyURL("provider/model one")
@@ -1623,7 +1786,8 @@ func TestApplyTargetsRejectsInvalidPreparedTOMLWithoutWriting(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := ApplyTargets(configPath, statePath, []Target{{ID: "one"}}); err == nil || !strings.Contains(err.Error(), "parse TOML") {
+	if _, err := ApplyTargets(configPath, statePath, []Target{{ID: "one"}}); err == nil ||
+		!strings.Contains(err.Error(), "config.toml") || !strings.Contains(err.Error(), "第 3 行") {
 		t.Fatalf("invalid prepared TOML error = %v", err)
 	}
 	current, _ := os.ReadFile(configPath)

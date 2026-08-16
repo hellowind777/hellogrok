@@ -196,6 +196,33 @@ func runUtilityCommand(args []string, dataDir, logPath string) {
 			fmt.Printf("channel=%s host=%s backend=%s model=%s backend_search=%t auth=%s\n",
 				route.ChannelID, route.Host, route.APIBackend, route.WireModel, route.SupportsBackendSearch, routeAuthStatus(route))
 		}
+	case "normalize-config":
+		configPath := config.ConfigPath()
+		if err := ensureFacadeIdle(net.JoinHostPort(cfgpatch.ProxyHost, cfgpatch.ProxyPort)); err != nil {
+			fmt.Fprintf(os.Stderr, "无法规范化配置编码：%v\n", err)
+			os.Exit(1)
+		}
+		if takeover, err := cfgpatch.DetectCCSwitchTakeover(configPath); err != nil {
+			fmt.Fprintf(os.Stderr, "无法规范化配置编码：%v\n", err)
+			os.Exit(1)
+		} else if takeover.Active() {
+			fmt.Fprintln(os.Stderr, ccSwitchConflictError(takeover, "规范化配置编码"))
+			os.Exit(1)
+		}
+		if _, err := cfgpatch.Restore(configPath, cfgpatch.StatePath(dataDir)); err != nil {
+			fmt.Fprintf(os.Stderr, "无法规范化配置编码：启动前恢复记录处理失败：%v\n", err)
+			os.Exit(1)
+		}
+		changed, err := cfgpatch.NormalizeUTF8(configPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "无法规范化配置编码：%v\n", err)
+			os.Exit(1)
+		}
+		if changed {
+			fmt.Printf("已将 %s 转换为 UTF-8 无 BOM。\n", configPath)
+		} else {
+			fmt.Printf("%s 已经是 UTF-8 无 BOM，无需修改。\n", configPath)
+		}
 	case "log":
 		if err := os.MkdirAll(dataDir, 0o700); err != nil {
 			fmt.Fprintln(os.Stderr, "create data directory:", err)
@@ -225,7 +252,7 @@ func runUtilityCommand(args []string, dataDir, logPath string) {
 func ensureFacadeIdle(address string) error {
 	listener, err := net.Listen("tcp", address)
 	if err != nil {
-		return fmt.Errorf("local facade %s is active; stop it before restoring", address)
+		return fmt.Errorf("本地代理 %s 正在运行，请先停止代理后再执行此操作", address)
 	}
 	return listener.Close()
 }
@@ -311,6 +338,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  start                 run proxy in foreground; Ctrl+C/SIGTERM restores config")
 	fmt.Fprintln(w, "  restore               recover proxy-managed config after an unclean exit")
 	fmt.Fprintln(w, "  routes                list configured upstream routes without credentials")
+	fmt.Fprintln(w, "  normalize-config      validate config.toml and explicitly remove its UTF-8 BOM")
 	fmt.Fprintln(w, "  autostart <action>    enable, disable, or inspect login autostart")
 	fmt.Fprintln(w, "  log                   print and open the log file")
 	fmt.Fprintln(w, "  logview               follow the log in the current terminal")
@@ -441,7 +469,7 @@ func (a *App) Start() error {
 	a.beginSessionLog()
 
 	if takeover, err := cfgpatch.DetectCCSwitchTakeover(cfgPath); err != nil {
-		return a.abortStart(fmt.Errorf("inspect config ownership before start: %w", err))
+		return a.abortStart(fmt.Errorf("启动前检查配置归属失败：%w", err))
 	} else if takeover.Active() {
 		return a.abortStart(ccSwitchConflictError(takeover, "启动 hellogrok"))
 	}
@@ -452,7 +480,7 @@ func (a *App) Start() error {
 	n, err := cfgpatch.Restore(cfgPath, stPath)
 	a.cfgMu.Unlock()
 	if err != nil {
-		return a.abortStart(fmt.Errorf("restore config before start: %w", err))
+		return a.abortStart(fmt.Errorf("启动前恢复配置失败：%w", err))
 	}
 	if n > 0 {
 		a.logger.Printf("orphan restore: %d proxy-managed setting(s) recovered before start", n)
@@ -461,7 +489,7 @@ func (a *App) Start() error {
 	// Load models AFTER orphan restore for auth/routes.
 	models, err := config.LoadModels(cfgPath)
 	if err != nil {
-		return a.abortStart(fmt.Errorf("load models: %w", err))
+		return a.abortStart(fmt.Errorf("读取模型配置失败：%w", err))
 	}
 	for _, model := range models {
 		if cfgpatch.IsProxyURL(model.BaseURL) || cfgpatch.IsProxyURL(model.APIBaseURL) {
@@ -524,7 +552,7 @@ func (a *App) Start() error {
 		}
 	}
 	if takeover, err := cfgpatch.DetectCCSwitchTakeover(cfgPath); err != nil {
-		return a.abortStart(fmt.Errorf("recheck config ownership before rewrite: %w", err))
+		return a.abortStart(fmt.Errorf("写入前再次检查配置归属失败：%w", err))
 	} else if takeover.Active() {
 		return a.abortStart(ccSwitchConflictError(takeover, "启动 hellogrok"))
 	}

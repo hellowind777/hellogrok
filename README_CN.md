@@ -6,7 +6,7 @@
 
 跨平台 Grok Build 本地代理，让自定义模型渠道兼容常见 API 格式、Build 原生 Web 工具、独立鉴权和自动配置恢复。
 
-[![Version](https://img.shields.io/badge/version-0.1.12-2f6feb.svg)](./internal/appinfo/appinfo.go)
+[![Version](https://img.shields.io/badge/version-0.1.13-2f6feb.svg)](./internal/appinfo/appinfo.go)
 [![Go](https://img.shields.io/badge/Go-1.26.6-00ADD8.svg)](./go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#平台支持)
@@ -81,6 +81,7 @@ hellogrok 为这些自定义渠道提供统一的本地兼容层。运行时准�
 - 避免把 Grok 官方登录令牌发送给无关的自定义渠道。
 - 加载配置时校验渠道请求头名称和值；请求分帧、内容和连接请求头仍由代理控制。
 - 代理启动时检查并临时补全 Grok 必需设置。
+- 接受带或不带 BOM 的 UTF-8 `config.toml`。普通代理事务会保留文件当前的 BOM 选择，包括用户在代理运行期间主动改变的选择；TOML 无效时会显示文件路径、行号和列号，不再只输出缺少上下文的解析器错误。
 - 根据每个自定义模型的有效上下文窗口和最大输出分别计算自动压缩预算；只临时降低不安全的阈值，不会提高用户设置的较低值，停止代理时恢复全部受管值。
 - 正常停止、退出托盘、Ctrl+C、SIGTERM 或启动失败时恢复未被用户改动的临时值，并通过字段级三方合并保留代理运行期间的用户修改。无关修改使整份 TOML 无效时，逐行恢复仍会撤销可独立解析的受管字段，不改写用户的无效字节。
 - 托盘“退出”始终会在尝试清理后结束进程。若文件无法访问或仍有不属于原事务结构的本地路由，恢复事务会留在磁盘供下次启动处理，不会把用户困在托盘程序中。
@@ -353,6 +354,7 @@ Windows 的“状态与日志”分割工具条提供自动清理天数选择和
 | `hellogrok version` | 输出当前安装版本。 |
 | `hellogrok routes` | 列出自定义渠道路由，不输出凭据。 |
 | `hellogrok restore` | 异常退出后恢复代理管理的设置。 |
+| `hellogrok normalize-config` | 校验 `config.toml` 后显式删除 UTF-8 BOM，不猜测或转码其他编码。 |
 | `hellogrok autostart enable` | 为当前可执行文件启用登录自启动。 |
 | `hellogrok autostart disable` | 禁用登录自启动。 |
 | `hellogrok autostart status` | 查看当前自启动状态。 |
@@ -367,7 +369,7 @@ Windows 的“状态与日志”分割工具条提供自动清理天数选择和
 | Windows | `%LOCALAPPDATA%\hellogrok` |
 | Linux 和 macOS | `~/.hellogrok` |
 
-运行数据包括应用偏好、日志、用于恢复代理管理配置的恢复状态，以及 `reasoning_provenance.json`。推理来源索引只保存不透明推理值和路由签名域的 SHA-256 摘要，不保存原始推理、渠道 ID、模型名、上游 URL 或凭据。
+运行数据包括应用偏好、日志、用于恢复代理管理配置的恢复状态，以及 `reasoning_provenance.json`。hellogrok 自己拥有的文件统一写成 UTF-8 无 BOM。推理来源索引只保存不透明推理值和路由签名域的 SHA-256 摘要，不保存原始推理、渠道 ID、模型名、上游 URL 或凭据。
 
 日志保留规则在所有平台生效。原生下拉框和窗口内搜索目前仅适用于 Windows，因为标准 Linux 与 macOS 构建使用终端日志视图，没有对应的 Win32 状态窗口。
 
@@ -417,6 +419,12 @@ Responses 供应商继续使用 Responses。Messages 供应商接收 Messages �
 原生 `web_search`、`web_fetch`、Grok 官方登录行为和受支持的子代理工作流仍由 Grok Build 管理，不会被替换成独立搜索服务。
 
 ## 故障排查
+
+### 启动时报告 TOML 或 UTF-8 错误
+
+错误会显示 `config.toml` 路径，并在可以定位时给出准确行号和列号。标准 UTF-8 无论是否带 BOM 都可以直接读取。程序不会猜测或静默转码其他编码；请先用编辑器把文件另存为 UTF-8，再重新启动。
+
+如果希望主动删除有效的 UTF-8 BOM，应先停止 hellogrok 和正在接管 Grok Build 的供应商管理工具，再执行 `hellogrok normalize-config`。该命令会先校验整份 TOML，再原子写入；输入无效时保持文件不变。普通启动不会静默删除 BOM。
 
 ### 没有发现自定义路由
 

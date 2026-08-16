@@ -6,6 +6,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.1.13] — 2026-08-16
+
+### Changed
+
+- `config.toml` may use UTF-8 with or without a byte-order mark. Proxy apply and restore transactions preserve the file's current BOM choice, including a concurrent user encoding edit, while hellogrok-owned state, preference, and cache files remain UTF-8 without BOM.
+- Added `hellogrok normalize-config` as an explicit, atomic UTF-8 BOM removal operation. It validates the complete TOML document, refuses invalid UTF-8 or syntax, and does not guess or transcode another encoding.
+
+### Fixed
+
+- A standard UTF-8 BOM no longer prevents proxy startup during configuration-ownership inspection. Genuine TOML failures now include the configuration path and parser line and column; invalid UTF-8 reports its first invalid location without exposing configuration content.
+
 ## [0.1.12] — 2026-08-16
 
 ### Changed
@@ -228,7 +239,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - CC Switch compatibility detection and conflict warnings.
 - Builds for Windows, Linux, and macOS on amd64 and arm64.
 
-[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.12...HEAD
+[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.13...HEAD
+[0.1.13]: https://github.com/hellowind777/hellogrok/compare/v0.1.12...v0.1.13
 [0.1.12]: https://github.com/hellowind777/hellogrok/compare/v0.1.11...v0.1.12
 [0.1.11]: https://github.com/hellowind777/hellogrok/compare/v0.1.10...v0.1.11
 [0.1.10]: https://github.com/hellowind777/hellogrok/compare/v0.1.9...v0.1.10

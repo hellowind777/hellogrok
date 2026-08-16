@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/hellowind777/hellogrok/internal/cfgpatch"
+	"github.com/hellowind777/hellogrok/internal/tomlutil"
 	"github.com/pelletier/go-toml/v2"
 )
 
@@ -192,8 +193,8 @@ func LoadModels(path string) ([]Model, error) {
 		return nil, err
 	}
 	var root map[string]any
-	if err := toml.Unmarshal(raw, &root); err != nil {
-		return nil, fmt.Errorf("parse toml: %w", err)
+	if err := tomlutil.UnmarshalFile(path, raw, &root); err != nil {
+		return nil, err
 	}
 	modelTable := cfgpatch.ModelTables(root)
 	if len(modelTable) == 0 {
@@ -578,8 +579,8 @@ func LoadWebSearchSelection(path string) (WebSearchSelection, error) {
 		return WebSearchSelection{}, err
 	}
 	var root map[string]any
-	if err := toml.Unmarshal(raw, &root); err != nil {
-		return WebSearchSelection{}, fmt.Errorf("parse toml: %w", err)
+	if err := tomlutil.UnmarshalFile(path, raw, &root); err != nil {
+		return WebSearchSelection{}, err
 	}
 	models, _ := root["models"].(map[string]any)
 	if models == nil {
