@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"io"
 	"log"
 	"net"
@@ -884,7 +883,7 @@ func TestAppStartStopLifecycleRestoresConfigExactly(t *testing.T) {
 	}
 }
 
-func TestAppDoesNotInventDeepSeekLimits(t *testing.T) {
+func TestAppDoesNotInventDeepSeekCapacityOrReasoningConfig(t *testing.T) {
 	dir := t.TempDir()
 	grokHome := filepath.Join(dir, "grok")
 	dataDir := filepath.Join(dir, "data")
@@ -911,17 +910,16 @@ func TestAppDoesNotInventDeepSeekLimits(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, expected := range []string{
-		`reasoning_efforts = ["none", "low", "high", "max"]`,
-		`reasoning_effort = "high"`,
+	for _, unexpected := range []string{
+		"context_window",
+		"max_completion_tokens",
+		"inference_idle_timeout_secs",
+		"reasoning_effort =",
+		"reasoning_efforts =",
+		"supports_reasoning_effort =",
 	} {
-		if !strings.Contains(string(patched), expected) {
-			t.Fatalf("pre-response DeepSeek config missing %q:\n%s", expected, patched)
-		}
-	}
-	for _, unexpected := range []string{"context_window", "max_completion_tokens", "inference_idle_timeout_secs"} {
 		if strings.Contains(string(patched), unexpected) {
-			t.Fatalf("DeepSeek capacity was invented for %q:\n%s", unexpected, patched)
+			t.Fatalf("DeepSeek configuration was invented for %q:\n%s", unexpected, patched)
 		}
 	}
 	if err := app.Stop(); err != nil {
@@ -986,60 +984,6 @@ func TestAppPreservesExplicitReasoningMenusWithoutAddingDefaults(t *testing.T) {
 				t.Fatalf("explicit menu lifecycle was not byte-exact\nwant: %q\ngot:  %q", original, restored)
 			}
 		})
-	}
-}
-
-func TestAppMigratesLegacyReasoningArrayTablesOnce(t *testing.T) {
-	dir := t.TempDir()
-	grokHome := filepath.Join(dir, "grok")
-	dataDir := filepath.Join(dir, "data")
-	if err := os.MkdirAll(grokHome, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("GROK_HOME", grokHome)
-	configPath := filepath.Join(grokHome, "config.toml")
-	var original strings.Builder
-	for _, id := range []string{"deepseek-v4-pro", "deepseek-v4-flash", "deepseek-v4-chat"} {
-		fmt.Fprintf(&original, "[model.%s]\nmodel = %q\nbase_url = \"https://api.deepseek.com\"\napi_key = \"test-key\"\nreasoning_effort = \"max\"\n", id, id)
-		for index, value := range []string{"none", "low", "high", "max"} {
-			fmt.Fprintf(&original, "[[model.%s.reasoning_efforts]]\nvalue = %q\nlabel = %q\n", id, value, strings.ToUpper(value[:1])+value[1:])
-			if index == 2 {
-				original.WriteString("default = true\n")
-			}
-		}
-		original.WriteString("\n")
-	}
-	if err := os.WriteFile(configPath, []byte(original.String()), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	runLifecycle := func() string {
-		t.Helper()
-		server := proxy.New(log.New(io.Discard, "", 0))
-		server.PathAddr = "127.0.0.1:0"
-		app := &App{logger: log.New(io.Discard, "", 0), dataDir: dataDir, server: server}
-		if err := app.Start(); err != nil {
-			t.Fatal(err)
-		}
-		if err := app.Stop(); err != nil {
-			t.Fatal(err)
-		}
-		current, err := os.ReadFile(configPath)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return string(current)
-	}
-
-	first := runLifecycle()
-	if strings.Contains(first, "[[model.") || strings.Contains(first, "label =") ||
-		strings.Count(first, `reasoning_efforts = ["none", "low", "high", "max"]`) != 3 ||
-		strings.Count(first, `reasoning_effort = "max"`) != 3 {
-		t.Fatalf("legacy menus were not compacted exactly once:\n%s", first)
-	}
-	second := runLifecycle()
-	if second != first {
-		t.Fatalf("second lifecycle changed migrated config\nfirst:  %q\nsecond: %q", first, second)
 	}
 }
 
@@ -1625,48 +1569,6 @@ func TestProjectBackendSearchOnlyForExplicitOrDocumentedDefaults(t *testing.T) {
 				t.Fatalf("project backend search = %t, want %t", got, test.want)
 			}
 		})
-	}
-}
-
-func TestBuildDeepSeekReasoningEffortsFollowOfficialEndpointProtocol(t *testing.T) {
-	tests := []struct {
-		name  string
-		route config.Route
-		want  []string
-	}{
-		{name: "Responses", route: config.Route{APIBackend: "responses"}, want: []string{"none", "low", "high", "max"}},
-		{name: "Chat", route: config.Route{APIBackend: "chat_completions"}, want: []string{"none", "low", "high", "max"}},
-		{name: "Messages", route: config.Route{APIBackend: "messages"}, want: []string{"none", "low", "high", "max"}},
-		{name: "DeepSeek default Chat search bridge", route: config.Route{APIBackend: "chat_completions", SupportsBackendSearch: true}, want: []string{"none", "low", "high", "max"}},
-		{name: "explicit native Chat search", route: config.Route{APIBackend: "chat_completions", SupportsBackendSearch: true, ChatSearchDialect: config.ChatSearchDialectWebSearchOptions}, want: []string{"none", "low", "high", "max"}},
-		{name: "explicit Messages search bridge", route: config.Route{APIBackend: "chat_completions", SupportsBackendSearch: true, ChatSearchDialect: config.ChatSearchDialectMessages}, want: []string{"none", "low", "high", "max"}},
-		{name: "catalog resolved protocol", route: config.Route{}, want: []string{"none", "low", "high", "max"}},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			test.route.Host = "api.deepseek.com"
-			test.route.WireModel = "deepseek-future-model"
-			efforts := buildDeepSeekReasoningEfforts(test.route)
-			if len(efforts) != len(test.want) {
-				t.Fatalf("DeepSeek effort menu = %+v", efforts)
-			}
-			for index, want := range test.want {
-				if efforts[index].Value != want || efforts[index].Label != strings.ToUpper(want[:1])+want[1:] {
-					t.Fatalf("DeepSeek effort menu = %+v", efforts)
-				}
-			}
-			if !efforts[len(efforts)-2].Default || efforts[len(efforts)-1].Default {
-				t.Fatalf("DeepSeek effort default = %+v", efforts)
-			}
-		})
-	}
-	for _, route := range []config.Route{
-		{Host: "relay.example", WireModel: "deepseek-v4-pro"},
-		{Host: "api.deepseek.com", WireModel: "deepseek-v4-pro", ReasoningEffortConfigured: true},
-	} {
-		if efforts := buildDeepSeekReasoningEfforts(route); efforts != nil {
-			t.Fatalf("non-first-party or explicitly configured route received an inferred effort menu: route=%+v efforts=%+v", route, efforts)
-		}
 	}
 }
 

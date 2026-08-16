@@ -725,7 +725,7 @@ func TestLoadModelsAcceptsZeroInferenceIdleTimeoutLikeGrokBuild(t *testing.T) {
 	}
 }
 
-func TestReasoningCapabilityDefaultsAreConfiguredFirstAndHostScoped(t *testing.T) {
+func TestReasoningCapabilityIsEnabledOnlyByUserConfiguration(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.toml")
 	raw := `[model.v4-default]
 model = "deepseek-v4-pro"
@@ -740,6 +740,11 @@ model = "deepseek-future-model"
 base_url = "https://api.deepseek.com"
 supports_reasoning_effort = true
 reasoning_efforts = [{ value = "max", label = "Future Max", default = true }]
+
+[model.selection-only]
+model = "deepseek-v4-pro"
+base_url = "https://api.deepseek.com"
+reasoning_effort = "none"
 
 [model.v4-disabled]
 model = "deepseek-v4-flash"
@@ -761,77 +766,20 @@ supports_reasoning_effort = false
 	for _, route := range routes {
 		byID[route.ChannelID] = route
 	}
-	if got := byID["v4-default"]; got.ReasoningEffortConfigured || !got.ReasoningEffortEnabled {
-		t.Fatalf("official DeepSeek default capability = %+v", got)
+	if got := byID["v4-default"]; got.ReasoningSelectionConfigured {
+		t.Fatalf("official DeepSeek received an inferred reasoning capability = %+v", got)
 	}
-	if got := byID["future-default"]; got.ReasoningEffortConfigured || !got.ReasoningEffortEnabled {
-		t.Fatalf("future official model missed endpoint capability = %+v", got)
+	if got := byID["future-default"]; got.ReasoningSelectionConfigured {
+		t.Fatalf("future official model received an inferred reasoning capability = %+v", got)
 	}
-	if got := byID["future-configured"]; !got.ReasoningEffortConfigured || !got.ReasoningEffortEnabled {
+	if got := byID["future-configured"]; !got.ReasoningSelectionConfigured {
 		t.Fatalf("future explicit capability was lost = %+v", got)
 	}
-	if got := byID["v4-disabled"]; !got.ReasoningEffortConfigured || got.ReasoningEffortEnabled {
+	if got := byID["selection-only"]; !got.ReasoningSelectionConfigured {
+		t.Fatalf("explicit reasoning selection was not detected = %+v", got)
+	}
+	if got := byID["v4-disabled"]; got.ReasoningSelectionConfigured {
 		t.Fatalf("explicit V4 opt-out was overridden = %+v", got)
-	}
-}
-
-func TestLoadModelsRecognizesOnlyExactLegacyGeneratedReasoningMenu(t *testing.T) {
-	legacy := `reasoning_efforts = [{ value = "none", label = "None" }, { value = "low", label = "Low" }, { value = "high", label = "High", default = true }, { value = "max", label = "Max" }]`
-	tests := []struct {
-		name       string
-		menu       string
-		wantLegacy bool
-	}{
-		{"legacy inline objects", legacy, true},
-		{"compact full list", `reasoning_efforts = ["none", "low", "high", "max"]`, false},
-		{"compact list without none", `reasoning_efforts = ["low", "high", "max"]`, false},
-		{"explicit empty list", `reasoning_efforts = []`, false},
-		{"custom labels", `reasoning_efforts = [{ value = "none", label = "Off" }, { value = "low", label = "Low" }, { value = "high", label = "High", default = true }, { value = "max", label = "Max" }]`, false},
-		{"custom order", `reasoning_efforts = [{ value = "low", label = "Low" }, { value = "none", label = "None" }, { value = "high", label = "High", default = true }, { value = "max", label = "Max" }]`, false},
-		{"custom default", `reasoning_efforts = [{ value = "none", label = "None", default = true }, { value = "low", label = "Low" }, { value = "high", label = "High" }, { value = "max", label = "Max" }]`, false},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			path := filepath.Join(t.TempDir(), "config.toml")
-			raw := "[model.deepseek]\nmodel = \"deepseek-v4-pro\"\nbase_url = \"https://api.deepseek.com\"\n" + test.menu + "\n"
-			if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			models, err := LoadModels(path)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if len(models) != 1 || !models[0].ReasoningEffortConfigured ||
-				models[0].LegacyGeneratedReasoningMenu != test.wantLegacy {
-				t.Fatalf("models = %+v", models)
-			}
-		})
-	}
-}
-
-func TestLoadModelsTracksReasoningSelectionAtModelOrGlobalScope(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "config.toml")
-	raw := `[models]
-default_reasoning_effort = "low"
-
-[model.global]
-base_url = "https://api.deepseek.com"
-
-[model.local]
-base_url = "https://api.deepseek.com"
-reasoning_effort = "max"
-`
-	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	models, err := LoadModels(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, model := range models {
-		if !model.ReasoningEffortSelectionConfigured {
-			t.Fatalf("model %q lost explicit reasoning selection: %+v", model.ID, model)
-		}
 	}
 }
 

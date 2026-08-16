@@ -6,7 +6,7 @@
 
 跨平台 Grok Build 本地代理，让自定义模型渠道兼容常见 API 格式、Build 原生 Web 工具、独立鉴权和自动配置恢复。
 
-[![Version](https://img.shields.io/badge/version-0.1.15-2f6feb.svg)](./internal/appinfo/appinfo.go)
+[![Version](https://img.shields.io/badge/version-0.1.16-2f6feb.svg)](./internal/appinfo/appinfo.go)
 [![Go](https://img.shields.io/badge/Go-1.26.6-00ADD8.svg)](./go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#平台支持)
@@ -81,7 +81,7 @@ hellogrok 为这些自定义渠道提供统一的本地兼容层。运行时准�
 - 避免把 Grok 官方登录令牌发送给无关的自定义渠道。
 - 加载配置时校验渠道请求头名称和值；请求分帧、内容和连接请求头仍由代理控制。
 - 代理启动时检查并临时补全 Grok 必需设置。
-- 原位更新已有推理和搜索赋值，不改变它们的相对位置。代理需要补写字段时，统一按 `reasoning_effort`、`reasoning_efforts`、`supports_backend_search` 的顺序插入；重复应用不会继续改变文件，停止时只恢复受管值。
+- `reasoning_effort`、`reasoning_efforts` 和 `supports_reasoning_effort` 完全归用户或 Grok Build 管理，hellogrok 不会创建、迁移、重排或替换这些字段。`supports_backend_search` 等代理临时管理的设置在重复应用时保持稳定，停止时只恢复当前事务管理的值。
 - 接受带或不带 BOM 的 UTF-8 `config.toml`。只读检查不会改写文件；代理每次成功应用、恢复或回滚配置时，都会以 UTF-8 无 BOM 原子写入。TOML 无效时会显示文件路径、行号和列号，不再只输出缺少上下文的解析器错误。
 - 根据每个自定义模型的有效上下文窗口和最大输出分别计算自动压缩预算；只临时降低不安全的阈值，不会提高用户设置的较低值，停止代理时恢复全部受管值。
 - 正常停止、退出托盘、Ctrl+C、SIGTERM 或启动失败时恢复未被用户改动的临时值，并通过字段级三方合并保留代理运行期间的用户修改。无关修改使整份 TOML 无效但文件仍是有效 UTF-8 时，逐行恢复仍会撤销可独立解析的受管字段，并保留用户写入的无效 TOML 文本。
@@ -152,6 +152,9 @@ supports_backend_search = false
 | `auth_scheme` | 否 | `bearer` | 上游鉴权方式；只有服务商明确要求 `X-Api-Key` 时才设置为 `x_api_key`。 |
 | `extra_headers` | 否 | 空 | 额外的渠道自有 HTTP 请求头，包括供应商专用鉴权字段。拒绝由代理控制的分帧、内容和连接请求头；名称按大小写不敏感处理。 |
 | `env_http_headers` | 否 | 空 | 从环境变量读取的 HTTP 请求头；解析后的值使用与 `extra_headers` 相同的请求头规则。 |
+| `reasoning_effort` | 否 | Grok Build 选择 | 当前选择或默认的 Grok Build 推理档位。该值归用户或模型目录管理，hellogrok 不会写入或重排；无需同时定义推理菜单即可单独配置。 |
+| `reasoning_efforts` | 否 | 模型目录 | Grok Build 为模型显示的推理档位。字符串数组和自定义对象菜单保持不变；hellogrok 仅在必要时转换协议字段结构，不重新解释已选择的档位。 |
+| `supports_reasoning_effort` | 否 | 模型目录/菜单 | 显式声明推理选择器能力。hellogrok 只读取它以保持协议语义，不会插入或修改。 |
 | `supports_backend_search` | 否 | 模型目录/供应商默认 | 为 true 时，三种上游格式都使用当前渠道自身的 hosted 搜索，并向 Grok Build 输出规范 Responses 搜索事件；为 false 时，Grok Build 使用配置或登录回退的客户端搜索路径，但被 `[models].web_search` 或 `GROK_WEB_SEARCH_MODEL` 选中的自定义模型会临时覆盖为 true。精确的 DeepSeek 官方端点不依赖模型 ID 而默认为 true；其他未知模型继续由显式配置或 Grok Build 模型目录决定。 |
 | `context_window` | 否 | 供应商/模型目录 | 输入与输出共享的总上下文容量。显式模型/provider 值优先；缺失时，hellogrok 可以学习可信上游值并临时物化到模型级，使 Grok Build 使用相同的自动压缩分母。 |
 | `max_completion_tokens` | 否 | 模型元数据 | 最大生成 token 额度。显式配置优先；缺失时，hellogrok 根据实际发出的请求和可信上游元数据计算预算，但不会把请求中观察到的值写回为模型输出上限。 |
@@ -184,7 +187,7 @@ effective = min(user_or_default_threshold, safe)
 
 ## DeepSeek
 
-DeepSeek 兼容行为只根据精确的官方主机 `api.deepseek.com` 启用，不绑定模型 ID。滚动别名和未来模型因此无需发布新版 hellogrok 就能获得鉴权、端点、hosted 搜索、协议级请求规范化、排队保活、用量与 SSE 分帧处理。同协议原生请求会保留未知字段；跨协议桥接只映射 Grok Build 当前实际发送且目标协议能够表达的字段。未来未知推理档位值仍会原样保留。截至 2026-08-16，当前正式模型 ID 为正式版 `deepseek-v4-pro` 和 `deepseek-v4-flash`；它们只是配置示例，不是 hellogrok 的白名单。仅复用 DeepSeek 模型名的中转不会获得官方端点假设。
+DeepSeek 兼容行为只根据精确的官方主机 `api.deepseek.com` 启用，不绑定模型 ID。滚动别名和未来模型因此无需发布新版 hellogrok 就能获得鉴权、端点、hosted 搜索、协议级请求规范化、排队保活、用量与 SSE 分帧处理。同协议原生请求会保留未知字段；跨协议桥接只映射 Grok Build 当前实际发送且目标协议能够表达的字段。推理档位字符串归供应商管理，hellogrok 不维护模型级映射表，直接将其传给上游。截至 2026-08-16，当前正式模型 ID 为正式版 `deepseek-v4-pro` 和 `deepseek-v4-flash`；它们只是配置示例，不是 hellogrok 的白名单。仅复用 DeepSeek 模型名的中转不会获得官方端点假设。
 
 ### 推荐配置
 
@@ -214,7 +217,19 @@ inference_idle_timeout_secs = 660
 
 上面两个容量上限对应 DeepSeek 文档中的 1M 总上下文和 384K 最大输出；`1,048,576` 来自其结构化上下文错误中实际报告的服务边界，不是 hellogrok 按模型 ID 写死的常量。使用这两个值时，85% 首选阈值会被自动预算临时限制为 58%。660 秒是覆盖 DeepSeek 官方最长十分钟排队的空闲策略。模型级配置优先于继承的 provider 配置；未显式配置时，hellogrok 接受有效的上游 `X-Grok-Context-Window`、`X-Grok-Max-Completion-Tokens`，或错误中无歧义的结构化上下文上限字段，不根据模型名称猜测。最后才使用 Grok Build 自己的模型目录；未知自定义模型缺少 `context_window` 时先使用 200,000 token 回退，直到 hellogrok 学到可信窗口。DeepSeek 没有公开这两个 Grok 私有响应头，因此建议显式填写两项上限，确保首轮行为可预测。未来模型或滚动别名改变容量时无需发布新版 hellogrok。
 
-当前 DeepSeek 推理菜单默认选择 `High`。Grok Build 原生接受紧凑的 `reasoning_efforts = ["none", "low", "high", "max"]` 写法，并会从非空菜单推导推理支持，因此 hellogrok 不再添加冗余的 `supports_reasoning_effort`，也不再写四段对象表。hellogrok 把所有用户显式赋值视为用户所有，包括不含 `none` 的列表、空列表以及自定义标签、顺序或默认值的对象菜单，既不替换也不追加。当前 Grok Build 在合并模型目录默认值时会忽略空集合覆盖，因此 `reasoning_efforts = []` 能保证 hellogrok 不注入菜单，但不一定能清除 Grok Build 自己继承的菜单。旧版 hellogrok 精确生成的冗长菜单只会迁移一次；已有模型级或全局推理选择时保持原值，否则写入 `reasoning_effort = "high"` 维持原默认值。三种协议仍统一采用官方映射：`minimal`/`low` 映射为 `low`，`medium`/`high`/`xhigh` 映射为 `high`，`max` 保持不变，`none` 关闭思考（`minimal` 仅是 Responses 的输入值）。
+模型推理菜单和当前选择或默认档位归 Grok Build 管理。hellogrok 不会添加、迁移、重排或替换 `reasoning_effort`、`reasoning_efforts` 或 `supports_reasoning_effort`；用户自定义的字符串数组、对象标签、顺序和默认值都保持原位且字节不变。用户可以只配置 `reasoning_effort`、只配置菜单、同时配置两者或全部不配置。若只想显示 DeepSeek 原生有区别的档位，可配置 `reasoning_efforts = ["none", "low", "high", "max"]`；若只需要固定选择，可单独设置 `reasoning_effort`。三个字段全部缺省时，继续使用 Grok Build 模型目录和供应商默认行为。
+
+hellogrok 不会重新解释供应商的推理档位。Responses 转 Messages 时会复现 Grok Build 的原生 Messages 序列化行为，省略 `none` 和 `minimal`；其他非空值原样复制。对于 DeepSeek 官方端点，显式 `none`（包括只配置 `reasoning_effort = "none"`）会转换为相应协议的原生关闭开关，避免请求因字段缺省而落入 DeepSeek 默认开启思考的模式。未配置任何推理字段时，hellogrok 不添加思考开关，保持该默认行为。DeepSeek 当前文档说明了以下服务端行为：
+
+| 请求档位 | DeepSeek 实际档位 |
+|----------|-------------------|
+| `low` | `low` |
+| `medium` | `high` |
+| `high` | `high` |
+| `xhigh` | `high` |
+| `max` | `max` |
+
+这张表描述的是 DeepSeek 服务端行为，不是 hellogrok 的转换规则。将菜单限制为 `none`、`low`、`high`、`max`，可以避免多个选项最终落到同一实际档位。其他非空档位也会原样进入供应商请求，由 DeepSeek 当前或未来的校验结果决定是否接受。第三方中转不应用 DeepSeek 专用推理逻辑，只进行普通的跨协议字段转换。
 
 ### 原生能力映射
 
@@ -222,7 +237,7 @@ inference_idle_timeout_secs = 660
 |---------------|----------------------------|
 | Responses | 保留 `instructions`、developer 消息、推理、原生 `text.format` JSON Schema、函数工具和原生 Web Search；发送标准来源 `include` 提示但不虚构缺失结果，来源展示仅限 DeepSeek 实际返回的 URL。供应商 `action.queries` 数组保持原样，同时为每次调用补充 Grok Build 用于显示的单值 `action.query`；`response.completed`、`response.incomplete`、`response.failed` 都作为终止事件。 |
 | Chat Completions | 保留工具调用历史中的 `reasoning_content`，请求流式终止用量块，在未显式设置 `max_tokens` 时把 `max_completion_tokens` 映射为 `max_tokens`，把 developer 消息转换为 system，为 assistant 工具消息补非 null 内容，并把显式 Responses `user` 映射为 DeepSeek `user_id`。DeepSeek 在该接口只记录了 function 工具，因此 hosted Web Search 必须桥接到 Messages 或 Responses。DeepSeek 在开启思考时不接受 `tool_choice`，因此会移除该选择器但保留函数声明供模型自动使用；显式关闭思考时仍保留官方支持的选择器形式。Grok Build 的 `json_schema` 会转换为官方支持的 `json_object` 加 schema 指令，返回 JSON 仍由 Grok Build 本地校验。 |
-| Anthropic Messages | 使用 `X-Api-Key`，保留思考/工具历史、推理强度、函数工具及原生服务端 Web Search 块。Grok Build 省略字段表示的 `None` 会转换为 `thinking.type=disabled`，不会误落到 DeepSeek 默认的 `high`；只发送受支持的 `output_config.effort`，显式 Responses `user` 映射为 `metadata.user_id`，官方 `deepseek-v4-pro[1m]` 别名会继续保留在 Messages 请求中。 |
+| Anthropic Messages | 使用 `X-Api-Key`，保留思考/工具历史、推理强度、函数工具及原生服务端 Web Search 块。显式配置推理选择器时，Grok Build 省略字段表示的 `None` 会转换为 `thinking.type=disabled`，不会误落到 DeepSeek 默认的 `high`；只发送受支持的 `output_config.effort`，显式 Responses `user` 映射为 `metadata.user_id`，官方 `deepseek-v4-pro[1m]` 别名会继续保留在 Messages 请求中。 |
 | 排队与用量 | 接受非流式空行保活和流式 `: keep-alive` 注释；保留真实终止用量，让 Grok Build 正确统计上下文并触发自动压缩。 |
 
 在这三套接口中，只有 Responses 原生支持 JSON Schema 输出。Chat 只支持 `json_object`，且官方说明它偶尔可能返回空 content，因此适配依赖注入的 schema 指令和 Grok Build 本地校验。Chat 函数的 `strict: true` 是另一项 Beta 能力：确实需要该行为时，应配置 `base_url = "https://api.deepseek.com/beta"`。Messages 的结构化输出继续使用 Grok Build 自带且会校验的 `StructuredOutput` 函数，因为 DeepSeek Anthropic 兼容接口的 `output_config` 只支持 effort。调用方显式提供的用户隔离 ID 会在协议桥接时保留，但 hellogrok 不会凭空生成，也不会从无关身份请求头推导。Chat 返回 `insufficient_system_resource` 时，hellogrok 会输出结构化失败；若原生非流式协议仍能改写 HTTP 响应，则返回可重试的 `503`。

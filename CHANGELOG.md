@@ -6,6 +6,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.1.16] — 2026-08-16
+
+### Changed
+
+- Reasoning configuration is now fully user- or Grok Build-owned. hellogrok no longer creates, migrates, reorders, or replaces `reasoning_effort`, `reasoning_efforts`, or `supports_reasoning_effort` for any channel; recovery still removes temporary reasoning projections recorded by earlier releases.
+- Provider effort values are no longer normalized through a DeepSeek-specific level table. Responses, Chat Completions, and Messages preserve provider-owned values, while Responses-to-Messages bridges omit `none` and `minimal` exactly as Grok Build's native Messages serializer does.
+
+### Fixed
+
+- First-party DeepSeek Messages now converts an explicit off selection to its native thinking switch even when only `reasoning_effort = "none"` is configured. Missing reasoning fields remain untouched and continue to use Grok Build and provider defaults.
+
 ## [0.1.15] — 2026-08-16
 
 ### Fixed
@@ -255,7 +266,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - CC Switch compatibility detection and conflict warnings.
 - Builds for Windows, Linux, and macOS on amd64 and arm64.
 
-[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.15...HEAD
+[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.16...HEAD
+[0.1.16]: https://github.com/hellowind777/hellogrok/compare/v0.1.15...v0.1.16
 [0.1.15]: https://github.com/hellowind777/hellogrok/compare/v0.1.14...v0.1.15
 [0.1.14]: https://github.com/hellowind777/hellogrok/compare/v0.1.13...v0.1.14
 [0.1.13]: https://github.com/hellowind777/hellogrok/compare/v0.1.12...v0.1.13

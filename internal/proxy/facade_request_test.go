@@ -537,6 +537,100 @@ func TestResponsesToMessagesDoesNotInventMaxOutputTokens(t *testing.T) {
 	}
 }
 
+func TestResponsesToMessagesMatchesGrokBuildReasoningWireSemantics(t *testing.T) {
+	tests := []struct {
+		name         string
+		effort       string
+		wantThinking bool
+		wantEffort   string
+	}{
+		{name: "none is omitted", effort: "none"},
+		{name: "minimal is omitted", effort: "minimal"},
+		{name: "low is preserved", effort: "low", wantThinking: true, wantEffort: "low"},
+		{name: "unknown is provider owned", effort: "ultra", wantThinking: true, wantEffort: "ultra"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			converted, err := responsesToMessagesRequest(map[string]any{
+				"model":             "wire",
+				"input":             "hello",
+				"max_output_tokens": 128,
+				"reasoning":         map[string]any{"effort": test.effort},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, hasThinking := converted["thinking"]
+			output, hasOutput := converted["output_config"].(map[string]any)
+			if hasThinking != test.wantThinking {
+				t.Fatalf("thinking presence=%v, want %v: %#v", hasThinking, test.wantThinking, converted)
+			}
+			if test.wantEffort == "" {
+				if hasOutput {
+					t.Fatalf("omitted effort produced output_config: %#v", converted)
+				}
+				return
+			}
+			if !hasOutput || output["effort"] != test.wantEffort {
+				t.Fatalf("effort=%#v, want %q: %#v", output["effort"], test.wantEffort, converted)
+			}
+		})
+	}
+}
+
+func TestResponsesToMessagesOmittedReasoningKeepsStructuredOutput(t *testing.T) {
+	converted, err := responsesToMessagesRequest(map[string]any{
+		"model":             "wire",
+		"input":             "hello",
+		"max_output_tokens": 128,
+		"reasoning":         map[string]any{"effort": "none"},
+		"text": map[string]any{"format": map[string]any{
+			"type": "json_schema", "schema": map[string]any{"type": "object"},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, hasThinking := converted["thinking"]; hasThinking {
+		t.Fatalf("none unexpectedly enabled thinking: %#v", converted)
+	}
+	output, _ := converted["output_config"].(map[string]any)
+	if output == nil || output["effort"] != nil || output["format"] == nil {
+		t.Fatalf("structured output was not preserved independently of reasoning: %#v", converted)
+	}
+}
+
+func TestResponsesToDeepSeekMessagesNoneUsesNativeDisabledSwitch(t *testing.T) {
+	request, err := adaptFacadeRequest([]byte(`{
+		"model":"display",
+		"input":"hello",
+		"max_output_tokens":128,
+		"reasoning":{"effort":"none"},
+		"stream":false
+	}`), config.Route{
+		ChannelID:                    "deepseek",
+		Host:                         "api.deepseek.com",
+		APIBackend:                   "messages",
+		WireModel:                    "deepseek-v4-pro",
+		SupportsBackendSearch:        true,
+		ReasoningSelectionConfigured: true,
+	}, wireResponses)
+	if err != nil {
+		t.Fatal(err)
+	}
+	converted, err := decodeRequestObject(request.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	thinking, _ := converted["thinking"].(map[string]any)
+	if thinking["type"] != "disabled" {
+		t.Fatalf("DeepSeek none did not become its native disabled switch: %#v", converted)
+	}
+	if _, hasOutput := converted["output_config"]; hasOutput {
+		t.Fatalf("DeepSeek disabled request retained output_config: %#v", converted)
+	}
+}
+
 func TestChatSearchDialectUsesExplicitOrOfficialHostCapabilities(t *testing.T) {
 	for _, route := range []config.Route{
 		{ChannelID: "grok-channel", WireModel: "ordinary", Host: "relay.example"},

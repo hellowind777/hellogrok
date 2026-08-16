@@ -6,6 +6,8 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -128,40 +130,6 @@ func TestDeepSeekDynamicAuthenticationConvertsAcrossProtocolBridges(t *testing.T
 	}
 }
 
-func TestDeepSeekEffortMappingMatchesCurrentAPI(t *testing.T) {
-	responses := map[string]string{
-		"none":    "none",
-		"minimal": "low",
-		"low":     "low",
-		"medium":  "high",
-		"high":    "high",
-		"xhigh":   "high",
-		"max":     "max",
-	}
-	for input, want := range responses {
-		if got := normalizedDeepSeekResponsesEffort(input); got != want {
-			t.Fatalf("Responses effort %q normalized to %q want %q", input, got, want)
-		}
-	}
-	chatMessages := map[string]string{
-		"low":    "low",
-		"medium": "high",
-		"high":   "high",
-		"xhigh":  "high",
-		"max":    "max",
-	}
-	for input, want := range chatMessages {
-		if got := normalizedDeepSeekChatMessagesEffort(input); got != want {
-			t.Fatalf("Chat/Messages effort %q normalized to %q want %q", input, got, want)
-		}
-	}
-	for _, unsupported := range []string{"none", "minimal", "future-tier"} {
-		if got := normalizedDeepSeekChatMessagesEffort(unsupported); got != "" {
-			t.Fatalf("unsupported Chat/Messages effort %q normalized to %q", unsupported, got)
-		}
-	}
-}
-
 func TestNormalizeDeepSeekRequestKeepsModelIDsDataDrivenAndHandlesMessagesAlias(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -238,7 +206,7 @@ func TestCanonicalDeepSeekResponseUsesProviderModelID(t *testing.T) {
 func TestNormalizeDeepSeekResponsesPreservesDocumentedToolShapes(t *testing.T) {
 	root := map[string]any{
 		"model":     "display",
-		"reasoning": map[string]any{"effort": "max", "summary": "auto"},
+		"reasoning": map[string]any{"effort": "xhigh", "summary": "auto"},
 		"tools": []any{
 			map[string]any{"type": "custom", "name": "apply_patch"},
 			map[string]any{"type": "web_search_2025_08_26"},
@@ -252,7 +220,7 @@ func TestNormalizeDeepSeekResponsesPreservesDocumentedToolShapes(t *testing.T) {
 		t.Fatalf("future model ID was not preserved: %#v", root)
 	}
 	reasoning := root["reasoning"].(map[string]any)
-	if reasoning["effort"] != "max" || reasoning["summary"] != "auto" {
+	if reasoning["effort"] != "xhigh" || reasoning["summary"] != "auto" {
 		t.Fatalf("Responses reasoning normalization=%#v", reasoning)
 	}
 	tools := anySlice(root["tools"])
@@ -307,7 +275,7 @@ func TestNormalizeDeepSeekMessagesThinking(t *testing.T) {
 		}
 		normalizeDeepSeekMessagesRequest(root, true)
 		output := root["output_config"].(map[string]any)
-		if len(output) != 1 || output["effort"] != "high" {
+		if len(output) != 1 || output["effort"] != "xhigh" {
 			t.Fatalf("unsupported Messages output config was forwarded: %#v", root)
 		}
 	})
@@ -337,12 +305,66 @@ func TestNormalizeDeepSeekMessagesThinking(t *testing.T) {
 		normalizeDeepSeekMessagesRequest(root, true)
 		output := root["output_config"].(map[string]any)
 		if len(output) != 1 || output["effort"] != "future-tier" {
-			t.Fatalf("unknown configured effort or protocol cleanup was incorrect: %#v", root)
+			t.Fatalf("provider-owned effort was changed: %#v", root)
+		}
+	})
+
+	t.Run("malformed provider fields are left for upstream validation", func(t *testing.T) {
+		for _, field := range []string{"thinking", "output_config"} {
+			root := map[string]any{field: "invalid"}
+			normalizeDeepSeekMessagesRequest(root, true)
+			if len(root) != 1 || root[field] != "invalid" {
+				t.Fatalf("malformed %s was rewritten: %#v", field, root)
+			}
 		}
 	})
 }
 
-func TestFutureDeepSeekChatGetsProtocolCompatibilityWithoutLosingUnknownFields(t *testing.T) {
+func TestDeepSeekMessagesReasoningSelectionFromConfig(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	raw := `[model.explicit-none]
+model = "deepseek-v4-pro"
+base_url = "https://api.deepseek.com"
+api_key = "test-key"
+api_backend = "messages"
+reasoning_effort = "none"
+
+[model.provider-default]
+model = "deepseek-v4-pro"
+base_url = "https://api.deepseek.com"
+api_key = "test-key"
+api_backend = "messages"
+`
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	models, err := config.LoadModels(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	routes, err := config.BuildRoutes(models)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := make(map[string]config.Route, len(routes))
+	for _, route := range routes {
+		byID[route.ChannelID] = route
+	}
+
+	explicit := map[string]any{"messages": []any{map[string]any{"role": "user", "content": "hello"}}}
+	normalizeDeepSeekRequest(explicit, byID["explicit-none"], wireMessages)
+	if thinking, _ := explicit["thinking"].(map[string]any); thinking["type"] != "disabled" {
+		t.Fatalf("single reasoning_effort=none did not disable DeepSeek thinking: %#v", explicit)
+	}
+
+	unconfigured := map[string]any{"messages": []any{map[string]any{"role": "user", "content": "hello"}}}
+	normalizeDeepSeekRequest(unconfigured, byID["provider-default"], wireMessages)
+	if _, exists := unconfigured["thinking"]; exists {
+		t.Fatalf("unconfigured reasoning fields overrode the provider default: %#v", unconfigured)
+	}
+}
+
+func TestFutureDeepSeekChatKeepsProviderOwnedReasoningEffort(t *testing.T) {
 	root := map[string]any{
 		"stream":           true,
 		"user":             "tenant_1",
@@ -362,12 +384,10 @@ func TestFutureDeepSeekChatGetsProtocolCompatibilityWithoutLosingUnknownFields(t
 		},
 	}
 	normalizeDeepSeekChatRequest(root)
-
-	if root["reasoning_effort"] != "future-tier" {
-		t.Fatalf("unknown future effort was rewritten: %#v", root)
+	if root["reasoning_effort"] != "future-tier" || root["thinking"].(map[string]any)["type"] != "enabled" {
+		t.Fatalf("provider-owned Chat effort was changed: %#v", root)
 	}
-	if root["thinking"].(map[string]any)["type"] != "enabled" ||
-		root["thinking"].(map[string]any)["future"] != true ||
+	if root["thinking"].(map[string]any)["future"] != true ||
 		root["response_format"].(map[string]any)["type"] != "json_object" {
 		t.Fatalf("future Chat protocol compatibility was not applied: %#v", root)
 	}
@@ -378,7 +398,7 @@ func TestFutureDeepSeekChatGetsProtocolCompatibilityWithoutLosingUnknownFields(t
 		messages[2].(map[string]any)["content"] != "" {
 		t.Fatalf("future Chat history missed protocol normalization: %#v", messages)
 	}
-	if root["user"] != nil || root["user_id"] != "tenant_1" ||
+	if _, hasUser := root["user"]; hasUser || root["user_id"] != "tenant_1" ||
 		root["stream_options"].(map[string]any)["include_usage"] != true {
 		t.Fatalf("host-level DeepSeek compatibility was lost: %#v", root)
 	}
@@ -400,7 +420,7 @@ func TestNormalizeDeepSeekChatAgentCompatibility(t *testing.T) {
 		},
 	}
 	normalizeDeepSeekChatRequest(root)
-	if root["reasoning_effort"] != "high" || root["thinking"].(map[string]any)["type"] != "enabled" {
+	if root["reasoning_effort"] != "xhigh" || root["thinking"].(map[string]any)["type"] != "enabled" {
 		t.Fatalf("Chat effort normalization=%#v", root)
 	}
 	if _, exists := root["tool_choice"]; exists || len(anySlice(root["tools"])) != 1 {

@@ -587,9 +587,9 @@ func (a *App) Start() error {
 	a.patchedIDs = append([]string(nil), res.Targets...)
 	sort.Strings(a.patchedIDs)
 	a.modelAliases = cloneStringMap(res.LegacyModelAliases)
-	a.logger.Printf("config rewrite all: model_sections=%d base=%d api_base=%d api_backend=%d context_windows=%d max_completion_tokens=%d auto_compact_thresholds=%d backend_search=%d reasoning_effort=%d reasoning_efforts=%d backend_tools=%d web_fetch=%d subagents_enabled=%d targets=%v",
-		res.ModelSections, res.BaseURLs, res.APIBaseURLs, res.APIBackends, res.ContextWindows, res.MaxCompletionTokens, res.AutoCompactThresholds, res.BackendSearch, res.ReasoningEffort, res.ReasoningEfforts, res.BackendTools, res.WebFetch, res.SubagentsEnabled, res.Targets)
-	a.logger.Printf("config validation passed: backend_protocols=capability-projected backend_tools=true web_fetch=true backend_search=configured-or-selected-or-documented-default model_limits=configured-first-otherwise-remote deepseek_efforts=protocol-native-if-unconfigured subagent_defaults=repaired-if-needed targets=%d", res.ValidatedTargets)
+	a.logger.Printf("config rewrite all: model_sections=%d base=%d api_base=%d api_backend=%d context_windows=%d max_completion_tokens=%d auto_compact_thresholds=%d backend_search=%d backend_tools=%d web_fetch=%d subagents_enabled=%d targets=%v",
+		res.ModelSections, res.BaseURLs, res.APIBaseURLs, res.APIBackends, res.ContextWindows, res.MaxCompletionTokens, res.AutoCompactThresholds, res.BackendSearch, res.BackendTools, res.WebFetch, res.SubagentsEnabled, res.Targets)
+	a.logger.Printf("config validation passed: backend_protocols=capability-projected backend_tools=true web_fetch=true backend_search=configured-or-selected-or-documented-default reasoning_config=user-or-catalog-owned model_limits=configured-first-otherwise-remote subagent_defaults=repaired-if-needed targets=%d", res.ValidatedTargets)
 	a.models = append([]config.Model(nil), models...)
 	a.routes = append([]config.Route(nil), routes...)
 	for _, route := range routes {
@@ -695,16 +695,13 @@ func buildConfigTargets(models []config.Model, routes map[string]config.Route, c
 			continue
 		}
 		target := cfgpatch.Target{
-			ID:                         model.ID,
-			APIBaseURL:                 strings.TrimSpace(model.APIBaseURL) != "",
-			APIBackend:                 route.APIBackend,
-			BuildAPIBackend:            buildAPIBackend(route),
-			SupportsBackendSearch:      buildSupportsBackendSearch(route),
-			ProjectBackendSearch:       projectBackendSearch(route),
-			ReasoningEfforts:           buildDeepSeekReasoningEfforts(route),
-			ReasoningEffortDefault:     buildDeepSeekReasoningEffortDefault(route),
-			MigrateLegacyReasoningMenu: route.LegacyGeneratedReasoningMenu,
-			MaxCompletionTokens:        configuredMaxCompletionTokens(route),
+			ID:                    model.ID,
+			APIBaseURL:            strings.TrimSpace(model.APIBaseURL) != "",
+			APIBackend:            route.APIBackend,
+			BuildAPIBackend:       buildAPIBackend(route),
+			SupportsBackendSearch: buildSupportsBackendSearch(route),
+			ProjectBackendSearch:  projectBackendSearch(route),
+			MaxCompletionTokens:   configuredMaxCompletionTokens(route),
 		}
 		if contextWindow, ok := contextWindows[model.ID]; ok {
 			target.ContextWindow = contextWindow
@@ -729,26 +726,6 @@ func configuredAutoCompactEnvironment() (*uint8, error) {
 	}
 	threshold := uint8(value)
 	return &threshold, nil
-}
-
-func buildDeepSeekReasoningEfforts(route config.Route) []cfgpatch.ReasoningEffortOption {
-	if !config.IsOfficialDeepSeekRoute(route) ||
-		(route.ReasoningEffortConfigured && !route.LegacyGeneratedReasoningMenu) {
-		return nil
-	}
-	return []cfgpatch.ReasoningEffortOption{
-		{Value: "none", Label: "None"},
-		{Value: "low", Label: "Low"},
-		{Value: "high", Label: "High", Default: true},
-		{Value: "max", Label: "Max"},
-	}
-}
-
-func buildDeepSeekReasoningEffortDefault(route config.Route) string {
-	if len(buildDeepSeekReasoningEfforts(route)) == 0 || route.ReasoningEffortSelectionConfigured {
-		return ""
-	}
-	return "high"
 }
 
 func (a *App) abortStart(err error) error {

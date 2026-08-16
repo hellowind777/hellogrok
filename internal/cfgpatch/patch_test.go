@@ -2,7 +2,7 @@ package cfgpatch
 
 import (
 	"bytes"
-	"fmt"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -670,143 +670,52 @@ func TestApplyTargetsAndRestoreExactConfig(t *testing.T) {
 	}
 }
 
-func TestApplyTargetsProjectsDeepSeekReasoningMenuAndRestoresMultilineValue(t *testing.T) {
-	dir := t.TempDir()
-	configPath := filepath.Join(dir, "config.toml")
-	statePath := filepath.Join(dir, "state.json")
-	original := strings.Join([]string{
-		"[model.pro]",
-		`base_url = "https://api.deepseek.com"`,
-		"supports_reasoning_effort = false # preserve original support flag",
-		"reasoning_efforts = [",
-		`  { value = "low", label = "Legacy Low" },`,
-		`  { value = "xhigh", label = "Legacy Deep", default = true },`,
-		"] # preserve original menu formatting",
-		"",
-	}, "\r\n")
-	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	efforts := []ReasoningEffortOption{
-		{Value: "none", Label: "None"},
-		{Value: "high", Label: "High", Default: true},
-		{Value: "max", Label: "Max"},
-	}
-	targets := []Target{{ID: "pro", ReasoningEfforts: efforts}}
-	result, err := ApplyTargets(configPath, statePath, targets)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.SupportsReasoningEffort != 0 || result.ReasoningEfforts != 1 {
-		t.Fatalf("reasoning projection result = %+v", result)
-	}
-	patched, err := os.ReadFile(configPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	wantMenu := `reasoning_efforts = ["none", "high", "max"]`
-	if !strings.Contains(string(patched), "supports_reasoning_effort = false # preserve original support flag") ||
-		!strings.Contains(string(patched), wantMenu) || strings.Contains(string(patched), "Legacy Low") {
-		t.Fatalf("DeepSeek reasoning menu was not projected:\n%s", patched)
-	}
-
-	first := string(patched)
-	secondResult, err := ApplyTargets(configPath, statePath, targets)
-	if err != nil {
-		t.Fatal(err)
-	}
-	second, _ := os.ReadFile(configPath)
-	if string(second) != first || secondResult.SupportsReasoningEffort != 0 || secondResult.ReasoningEfforts != 0 {
-		t.Fatalf("reapply changed reasoning projection: result=%+v\n%s", secondResult, second)
-	}
-
-	if _, err := Restore(configPath, statePath); err != nil {
-		t.Fatal(err)
-	}
-	restored, _ := os.ReadFile(configPath)
-	if string(restored) != original {
-		t.Fatalf("reasoning projection was not restored byte-exactly\nwant: %q\ngot:  %q", original, restored)
-	}
-}
-
-func TestRestorePreservesConcurrentDeepSeekReasoningMenuEdit(t *testing.T) {
+func TestRestoreCleansReasoningProjectionFromPreviousRelease(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.toml")
 	statePath := filepath.Join(dir, "state.json")
 	original := "[model.pro]\nbase_url = \"https://api.deepseek.com\"\n"
-	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
+	proxyURL := "http://127.0.0.1:18787/c/pro"
+	projected := "[model.pro]\nbase_url = \"" + proxyURL + "\"\n" +
+		"reasoning_effort = \"high\"\nreasoning_efforts = [\"none\", \"low\", \"high\", \"max\"]\n"
+	if err := os.WriteFile(configPath, []byte(projected), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	efforts := []ReasoningEffortOption{
-		{Value: "none", Label: "None"},
-		{Value: "high", Label: "High", Default: true},
-		{Value: "max", Label: "Max"},
-	}
-	if _, err := ApplyTargets(configPath, statePath, []Target{{ID: "pro", ReasoningEfforts: efforts}}); err != nil {
+	canonicalPath, err := canonicalConfigPath(configPath)
+	if err != nil {
 		t.Fatal(err)
 	}
-	patched, _ := os.ReadFile(configPath)
-	userEdited := strings.ReplaceAll(string(patched),
-		`reasoning_efforts = ["none", "high", "max"]`,
-		"reasoning_efforts = [\n  { value = \"high\", label = \"Focused\", default = true },\n]\n")
-	if err := os.WriteFile(configPath, []byte(userEdited), 0o600); err != nil {
+	state := State{
+		Format: stateFormat, ConfigPath: canonicalPath,
+		Models: map[string]ModelState{"pro": {
+			BaseURL:          ManagedLineState{Managed: true, Present: true, OriginalLine: `base_url = "https://api.deepseek.com"` + "\n", AppliedValue: proxyURL},
+			ReasoningEffort:  ManagedLineState{Managed: true, AppliedValue: "high"},
+			ReasoningEfforts: ManagedLineState{Managed: true, AppliedValue: `["none","low","high","max"]`},
+		}},
+	}
+	encoded, err := json.Marshal(state)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Restore(configPath, statePath); err != nil {
+	if err := os.WriteFile(statePath, encoded, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	current, _ := os.ReadFile(configPath)
-	if !strings.Contains(string(current), `label = "Focused"`) ||
-		strings.Contains(string(current), "127.0.0.1:18787") {
-		t.Fatalf("concurrent reasoning edit was not preserved while the route was restored:\n%s", current)
-	}
-}
-
-func TestLegacyReasoningMigrationRecoversStateBeforeConfigCrashWindow(t *testing.T) {
-	dir := t.TempDir()
-	configPath := filepath.Join(dir, "config.toml")
-	statePath := filepath.Join(dir, "state.json")
-	original := "[model.pro]\nbase_url = \"https://api.deepseek.com\"\n" +
-		"[[model.pro.reasoning_efforts]]\nvalue = \"none\"\nlabel = \"None\"\n" +
-		"[[model.pro.reasoning_efforts]]\nvalue = \"low\"\nlabel = \"Low\"\n" +
-		"[[model.pro.reasoning_efforts]]\nvalue = \"high\"\nlabel = \"High\"\ndefault = true\n" +
-		"[[model.pro.reasoning_efforts]]\nvalue = \"max\"\nlabel = \"Max\"\n"
-	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
+	restored, err := Restore(configPath, statePath)
+	if err != nil {
 		t.Fatal(err)
 	}
-	target := Target{
-		ID: "pro",
-		ReasoningEfforts: []ReasoningEffortOption{
-			{Value: "none", Label: "None"},
-			{Value: "low", Label: "Low"},
-			{Value: "high", Label: "High", Default: true},
-			{Value: "max", Label: "Max"},
-		},
-		ReasoningEffortDefault:     "high",
-		MigrateLegacyReasoningMenu: true,
-	}
-	if _, err := ApplyTargets(configPath, statePath, []Target{target}); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := ApplyTargets(configPath, statePath, []Target{target}); err != nil {
-		stateBytes, _ := os.ReadFile(statePath)
-		t.Fatalf("reapply after state-before-config crash window: %v\nstate=%s", err, stateBytes)
-	}
-	if _, err := Restore(configPath, statePath); err != nil {
-		t.Fatal(err)
+	if restored != 3 {
+		t.Fatalf("restored fields = %d, want 3", restored)
 	}
 	current, err := os.ReadFile(configPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(current), "[[model.pro.reasoning_efforts]]") ||
-		!strings.Contains(string(current), `reasoning_efforts = ["none", "low", "high", "max"]`) ||
-		!strings.Contains(string(current), `reasoning_effort = "high"`) ||
-		strings.Contains(string(current), "127.0.0.1:18787") {
-		t.Fatalf("migration did not recover to compact durable config:\n%s", current)
+	if string(current) != original {
+		t.Fatalf("previous reasoning projection was not removed\nwant: %q\ngot:  %q", original, current)
+	}
+	if _, err := os.Stat(statePath); !os.IsNotExist(err) {
+		t.Fatalf("legacy state remains: %v", err)
 	}
 }
 
@@ -1451,11 +1360,6 @@ func TestApplyTargetsPreservesExistingOrderAndAppendsMissingFields(t *testing.T)
 }
 
 func TestApplyTargetsPreservesConfiguredReasoningAndSearchOrder(t *testing.T) {
-	efforts := []ReasoningEffortOption{
-		{Value: "none", Label: "None"},
-		{Value: "high", Label: "High", Default: true},
-		{Value: "max", Label: "Max"},
-	}
 	tests := []struct {
 		name        string
 		modelFields []string
@@ -1474,7 +1378,10 @@ func TestApplyTargetsPreservesConfiguredReasoningAndSearchOrder(t *testing.T) {
 			},
 			wantOrder: []string{
 				`reasoning_effort = "high" # keep selection position`,
-				`reasoning_efforts = ["none", "high", "max"]`,
+				"reasoning_efforts = [",
+				`  { value = "low", label = "Low" },`,
+				`  { value = "high", label = "High", default = true },`,
+				"] # keep menu position",
 				`api_key = "test-key"`,
 				"supports_backend_search = true # keep search position",
 			},
@@ -1494,7 +1401,10 @@ func TestApplyTargetsPreservesConfiguredReasoningAndSearchOrder(t *testing.T) {
 				`reasoning_effort = "high" # keep selection position`,
 				"supports_backend_search = true # keep search position",
 				`api_key = "test-key"`,
-				`reasoning_efforts = ["none", "high", "max"]`,
+				"reasoning_efforts = [",
+				`  { value = "low", label = "Low" },`,
+				`  { value = "high", label = "High", default = true },`,
+				"] # keep menu position",
 			},
 		},
 	}
@@ -1512,10 +1422,7 @@ func TestApplyTargetsPreservesConfiguredReasoningAndSearchOrder(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			target := Target{
-				ID: "one", SupportsBackendSearch: true, ProjectBackendSearch: true,
-				ReasoningEfforts: efforts,
-			}
+			target := Target{ID: "one", SupportsBackendSearch: true, ProjectBackendSearch: true}
 			if _, err := ApplyTargets(configPath, statePath, []Target{target}); err != nil {
 				t.Fatal(err)
 			}
@@ -1550,125 +1457,11 @@ func TestApplyTargetsPreservesConfiguredReasoningAndSearchOrder(t *testing.T) {
 	}
 }
 
-func TestApplyTargetsOrdersMissingReasoningAndSearchFields(t *testing.T) {
-	efforts := []ReasoningEffortOption{
-		{Value: "none", Label: "None"},
-		{Value: "high", Label: "High", Default: true},
-		{Value: "max", Label: "Max"},
-	}
-	tests := []struct {
-		name         string
-		modelFields  []string
-		migrateModes []bool
-	}{
-		{name: "all fields missing", modelFields: []string{`api_key = "test-key"`}, migrateModes: []bool{false}},
-		{
-			name: "only backend search configured",
-			modelFields: []string{
-				"supports_backend_search = false # keep position and comment",
-				`api_key = "test-key"`,
-			},
-			migrateModes: []bool{false},
-		},
-		{
-			name: "only single-line reasoning menu configured",
-			modelFields: []string{
-				`reasoning_efforts = ["low", "high"] # keep position and comment`,
-				`api_key = "test-key"`,
-			},
-			migrateModes: []bool{false, true},
-		},
-		{
-			name: "only multiline reasoning menu configured",
-			modelFields: []string{
-				"reasoning_efforts = [",
-				`  { value = "low", label = "Low" },`,
-				`  { value = "high", label = "High", default = true },`,
-				"] # keep position and comment",
-				`api_key = "test-key"`,
-			},
-			migrateModes: []bool{false, true},
-		},
-	}
-
-	for _, test := range tests {
-		for _, migrateLegacy := range test.migrateModes {
-			name := fmt.Sprintf("%s/migrate_legacy_%t", test.name, migrateLegacy)
-			t.Run(name, func(t *testing.T) {
-				dir := t.TempDir()
-				configPath := filepath.Join(dir, "config.toml")
-				statePath := filepath.Join(dir, "state.json")
-				original := strings.Join(append([]string{
-					"[model.one]",
-					`base_url = "https://one.example/v1"`,
-				}, test.modelFields...), "\n") + "\n"
-				if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
-					t.Fatal(err)
-				}
-
-				target := Target{
-					ID: "one", SupportsBackendSearch: true, ProjectBackendSearch: true,
-					ReasoningEfforts: efforts, ReasoningEffortDefault: "high",
-					MigrateLegacyReasoningMenu: migrateLegacy,
-				}
-				if _, err := ApplyTargets(configPath, statePath, []Target{target}); err != nil {
-					t.Fatal(err)
-				}
-				first, err := os.ReadFile(configPath)
-				if err != nil {
-					t.Fatal(err)
-				}
-				model := sectionText(t, string(first), "model.one")
-				assertOrdered(t, model,
-					`reasoning_effort = "high"`,
-					`reasoning_efforts = ["none", "high", "max"]`,
-					"supports_backend_search = true",
-				)
-
-				if _, err := ApplyTargets(configPath, statePath, []Target{target}); err != nil {
-					t.Fatal(err)
-				}
-				second, err := os.ReadFile(configPath)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if !bytes.Equal(second, first) {
-					t.Fatalf("reapply changed inserted field order\nfirst:  %q\nsecond: %q", first, second)
-				}
-
-				if _, err := Restore(configPath, statePath); err != nil {
-					t.Fatal(err)
-				}
-				restored, err := os.ReadFile(configPath)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if migrateLegacy && strings.Contains(original, "reasoning_efforts") {
-					assertOrdered(t, sectionText(t, string(restored), "model.one"),
-						`reasoning_effort = "high"`,
-						`reasoning_efforts = ["none", "high", "max"]`,
-					)
-					return
-				}
-				if string(restored) != original {
-					t.Fatalf("restore changed original field order\nwant: %q\ngot:  %q", original, restored)
-				}
-			})
-		}
-	}
-}
-
 func TestApplyTargetsUsesUserOwnedCapabilityFieldsAsOrderingAnchors(t *testing.T) {
-	efforts := []ReasoningEffortOption{
-		{Value: "none", Label: "None"},
-		{Value: "high", Label: "High", Default: true},
-		{Value: "max", Label: "Max"},
-	}
 	tests := []struct {
-		name          string
-		modelFields   []string
-		targetEfforts []ReasoningEffortOption
-		wantOrder     []string
+		name        string
+		modelFields []string
+		wantOrder   []string
 	}{
 		{
 			name: "user-owned reasoning menu anchors projected search field",
@@ -1683,15 +1476,13 @@ func TestApplyTargetsUsesUserOwnedCapabilityFieldsAsOrderingAnchors(t *testing.T
 			},
 		},
 		{
-			name: "user-owned reasoning selection anchors projected menu and search field",
+			name: "user-owned reasoning selection anchors projected search field",
 			modelFields: []string{
 				`reasoning_effort = "high" # user selection`,
 				`api_key = "test-key"`,
 			},
-			targetEfforts: efforts,
 			wantOrder: []string{
 				`reasoning_effort = "high" # user selection`,
-				`reasoning_efforts = ["none", "high", "max"]`,
 				"supports_backend_search = true",
 				`api_key = "test-key"`,
 			},
@@ -1711,10 +1502,7 @@ func TestApplyTargetsUsesUserOwnedCapabilityFieldsAsOrderingAnchors(t *testing.T
 				t.Fatal(err)
 			}
 
-			target := Target{
-				ID: "one", SupportsBackendSearch: true, ProjectBackendSearch: true,
-				ReasoningEfforts: test.targetEfforts,
-			}
+			target := Target{ID: "one", SupportsBackendSearch: true, ProjectBackendSearch: true}
 			if _, err := ApplyTargets(configPath, statePath, []Target{target}); err != nil {
 				t.Fatal(err)
 			}
@@ -1744,96 +1532,6 @@ func TestApplyTargetsUsesUserOwnedCapabilityFieldsAsOrderingAnchors(t *testing.T
 			}
 			if string(restored) != original {
 				t.Fatalf("restore changed user-owned ordering anchor\nwant: %q\ngot:  %q", original, restored)
-			}
-		})
-	}
-}
-
-func TestApplyTargetsPreservesLegacyReasoningMenuAndSearchOrderDuringMigration(t *testing.T) {
-	efforts := []ReasoningEffortOption{
-		{Value: "none", Label: "None"},
-		{Value: "high", Label: "High", Default: true},
-		{Value: "max", Label: "Max"},
-	}
-	legacyMenu := []string{
-		"[[model.one.reasoning_efforts]]",
-		`value = "none"`,
-		`label = "None"`,
-		"[[model.one.reasoning_efforts]]",
-		`value = "high"`,
-		`label = "High"`,
-		"default = true",
-		"[[model.one.reasoning_efforts]]",
-		`value = "max"`,
-		`label = "Max"`,
-	}
-	tests := []struct {
-		name        string
-		modelFields []string
-		wantOrder   []string
-	}{
-		{
-			name: "legacy menu before backend search",
-			modelFields: append(append([]string(nil), legacyMenu...),
-				"supports_backend_search = false # keep search position"),
-			wantOrder: []string{
-				`reasoning_efforts = ["none", "high", "max"]`,
-				"supports_backend_search = false # keep search position",
-			},
-		},
-		{
-			name: "backend search before legacy menu",
-			modelFields: append([]string{
-				"supports_backend_search = false # keep search position",
-			}, legacyMenu...),
-			wantOrder: []string{
-				"supports_backend_search = false # keep search position",
-				`reasoning_efforts = ["none", "high", "max"]`,
-			},
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			dir := t.TempDir()
-			configPath := filepath.Join(dir, "config.toml")
-			statePath := filepath.Join(dir, "state.json")
-			original := strings.Join(append([]string{
-				"[model.one]",
-				`base_url = "https://one.example/v1"`,
-			}, test.modelFields...), "\n") + "\n"
-			if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
-				t.Fatal(err)
-			}
-
-			target := Target{
-				ID: "one", SupportsBackendSearch: true, ProjectBackendSearch: true,
-				ReasoningEfforts: efforts, ReasoningEffortDefault: "high",
-				MigrateLegacyReasoningMenu: true,
-			}
-			if _, err := ApplyTargets(configPath, statePath, []Target{target}); err != nil {
-				t.Fatal(err)
-			}
-			patched, err := os.ReadFile(configPath)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if strings.Contains(string(patched), "[[model.one.reasoning_efforts]]") {
-				t.Fatalf("legacy reasoning menu was not compacted:\n%s", patched)
-			}
-
-			if _, err := Restore(configPath, statePath); err != nil {
-				t.Fatal(err)
-			}
-			restored, err := os.ReadFile(configPath)
-			if err != nil {
-				t.Fatal(err)
-			}
-			model := sectionText(t, string(restored), "model.one")
-			assertOrdered(t, model, test.wantOrder...)
-			if strings.Contains(model, "[[model.one.reasoning_efforts]]") ||
-				!strings.Contains(model, `reasoning_effort = "high"`) {
-				t.Fatalf("legacy migration was not durable after restore:\n%s", model)
 			}
 		})
 	}

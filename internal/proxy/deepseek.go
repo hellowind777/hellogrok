@@ -62,37 +62,25 @@ func normalizeDeepSeekRequest(root map[string]any, route config.Route, protocol 
 	switch protocol {
 	case wireResponses:
 		repairDeepSeekSearchHistory(root)
-		normalizeDeepSeekResponsesRequest(root)
 	case wireMessages:
-		normalizeDeepSeekMessagesRequest(root, route.ReasoningEffortEnabled)
+		normalizeDeepSeekMessagesRequest(root, route.ReasoningSelectionConfigured)
 	case wireChatCompletions:
 		normalizeDeepSeekChatRequest(root)
 	}
 }
 
-func normalizeDeepSeekResponsesRequest(root map[string]any) {
-	reasoning, _ := root["reasoning"].(map[string]any)
-	if reasoning == nil {
-		return
-	}
-	if effort := normalizedDeepSeekResponsesEffort(stringValue(reasoning["effort"])); effort != "" {
-		reasoning["effort"] = effort
-	}
-}
-
-func normalizeDeepSeekMessagesRequest(root map[string]any, reasoningSelectionEnabled bool) {
-	thinking, _ := root["thinking"].(map[string]any)
+func normalizeDeepSeekMessagesRequest(root map[string]any, reasoningSelectionConfigured bool) {
+	rawThinking, hasThinking := root["thinking"]
+	thinking, thinkingIsObject := rawThinking.(map[string]any)
 	rawOutput, hasOutput := root["output_config"]
 	output, outputIsObject := rawOutput.(map[string]any)
-	if hasOutput && rawOutput != nil && !outputIsObject {
-		// Preserve malformed caller input so DeepSeek reports the schema error;
-		// silently deleting it would change the requested behavior.
+	// Malformed provider-owned fields must reach the provider unchanged. In
+	// particular, do not mistake their failed type assertions for an explicit
+	// Grok Build None selection.
+	if (hasThinking && !thinkingIsObject) || (hasOutput && !outputIsObject) {
 		return
 	}
-	effort := ""
-	if output != nil {
-		effort = strings.ToLower(strings.TrimSpace(stringValue(output["effort"])))
-	}
+	effort := strings.ToLower(strings.TrimSpace(stringValue(output["effort"])))
 	if output != nil {
 		// DeepSeek's Anthropic compatibility layer supports only effort inside
 		// output_config. Grok Build uses its locally validated StructuredOutput
@@ -111,26 +99,24 @@ func normalizeDeepSeekMessagesRequest(root map[string]any, reasoningSelectionEna
 		return
 	}
 	// Grok Build serializes Messages effort=None by omitting both fields, while
-	// DeepSeek interprets their absence as its default enabled/high mode. Managed
-	// First-party models have an explicit High default, so an absent pair on this
-	// private facade represents the user's None selection.
-	if thinking == nil && effort == "" && reasoningSelectionEnabled {
+	// DeepSeek interprets their absence as its default enabled/high mode. Only a
+	// user-configured selector makes an absent pair mean an explicit None choice.
+	if thinking == nil && effort == "" && reasoningSelectionConfigured {
 		root["thinking"] = map[string]any{"type": "disabled"}
 		delete(root, "output_config")
 		return
 	}
 	if thinking != nil {
 		typ := strings.ToLower(strings.TrimSpace(stringValue(thinking["type"])))
-		if typ == "adaptive" {
+		switch typ {
+		case "adaptive":
 			thinking["type"] = "enabled"
-		} else if typ == "disabled" {
+		case "disabled":
 			delete(root, "output_config")
 			return
 		}
 	}
-	if normalized := normalizedDeepSeekChatMessagesEffort(effort); normalized != "" {
-		output["effort"] = normalized
-	} else if effort == "" {
+	if effort == "" {
 		delete(root, "output_config")
 	}
 }
@@ -159,25 +145,27 @@ func normalizeDeepSeekChatRequest(root map[string]any) {
 		options["include_usage"] = true
 	}
 
-	thinking, _ := root["thinking"].(map[string]any)
+	rawThinking, hasThinking := root["thinking"]
+	thinking, thinkingIsObject := rawThinking.(map[string]any)
 	normalizeDeepSeekChatJSONOutput(root)
 	effort := strings.ToLower(strings.TrimSpace(stringValue(root["reasoning_effort"])))
+	thinkingType := ""
+	if thinking != nil {
+		thinkingType = strings.ToLower(strings.TrimSpace(stringValue(thinking["type"])))
+	}
 	switch {
 	case effort == "none":
 		root["thinking"] = map[string]any{"type": "disabled"}
 		delete(root, "reasoning_effort")
-	case thinking != nil && strings.EqualFold(stringValue(thinking["type"]), "disabled"):
+	case thinkingType == "disabled":
 		delete(root, "reasoning_effort")
 	case effort != "":
-		if normalized := normalizedDeepSeekChatMessagesEffort(effort); normalized != "" {
-			root["reasoning_effort"] = normalized
-		}
 		if thinking == nil {
 			thinking = map[string]any{}
 			root["thinking"] = thinking
 		}
 		thinking["type"] = "enabled"
-	case thinking != nil && strings.EqualFold(stringValue(thinking["type"]), "adaptive"):
+	case thinkingType == "adaptive":
 		thinking["type"] = "enabled"
 	}
 
@@ -185,8 +173,8 @@ func normalizeDeepSeekChatRequest(root map[string]any) {
 	// omitted thinking object still means enabled, so remove the selector while
 	// retaining declarations for the provider's default automatic tool use. A
 	// disabled selector is represented by omitting both the selector and tools.
-	rawThinking, hasThinking := root["thinking"]
-	thinking, thinkingIsObject := rawThinking.(map[string]any)
+	rawThinking, hasThinking = root["thinking"]
+	thinking, thinkingIsObject = rawThinking.(map[string]any)
 	thinkingEnabled := !hasThinking || rawThinking == nil ||
 		(thinkingIsObject && strings.EqualFold(stringValue(thinking["type"]), "enabled"))
 	if thinkingEnabled {
@@ -253,32 +241,6 @@ func normalizeDeepSeekChatJSONOutput(root map[string]any) {
 		}
 	}
 	root["messages"] = append([]any{map[string]any{"role": "system", "content": instruction}}, messages...)
-}
-
-func normalizedDeepSeekResponsesEffort(effort string) string {
-	switch strings.ToLower(strings.TrimSpace(effort)) {
-	case "none":
-		return "none"
-	case "minimal", "low":
-		return "low"
-	case "medium", "high", "xhigh":
-		return "high"
-	case "max":
-		return "max"
-	}
-	return ""
-}
-
-func normalizedDeepSeekChatMessagesEffort(effort string) string {
-	switch strings.ToLower(strings.TrimSpace(effort)) {
-	case "low":
-		return "low"
-	case "medium", "high", "xhigh":
-		return "high"
-	case "max":
-		return "max"
-	}
-	return ""
 }
 
 // requestModelForRoute keeps provider model IDs data-driven. The documented

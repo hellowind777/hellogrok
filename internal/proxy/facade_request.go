@@ -565,8 +565,13 @@ func responsesToMessagesRequest(root map[string]any) (map[string]any, error) {
 	}
 	if reasoning, _ := root["reasoning"].(map[string]any); reasoning != nil {
 		if effort := stringValue(reasoning["effort"]); effort != "" {
-			out["thinking"] = map[string]any{"type": "adaptive", "display": "summarized"}
-			out["output_config"] = map[string]any{"effort": effort}
+			// Match Grok Build's native Messages serializer: None and Minimal do
+			// not produce thinking or an effort field on this protocol. Other
+			// values remain provider-owned and pass through unchanged.
+			if effort != "none" && effort != "minimal" {
+				out["thinking"] = map[string]any{"type": "adaptive", "display": "summarized"}
+				out["output_config"] = map[string]any{"effort": effort}
+			}
 		}
 	}
 	if text, _ := root["text"].(map[string]any); text != nil {

@@ -1,13 +1,19 @@
-# Release Notes — v0.1.15
+# Release Notes — v0.1.16
 
-## Existing reasoning and search fields keep their positions
+## Reasoning configuration remains user-owned
 
-Enabling the proxy no longer changes the relative placement of existing `reasoning_effort`, `reasoning_efforts`, or `supports_backend_search` assignments. Single-line and multiline reasoning menus are updated in place, while comments, unrelated model settings, and user-defined field order remain intact.
+hellogrok no longer creates, migrates, reorders, or replaces `reasoning_effort`, `reasoning_efforts`, or `supports_reasoning_effort` for any channel. Users may configure a selected level, a reasoning menu, both, or neither; missing fields continue to use Grok Build's model catalog and provider defaults.
 
-This behavior is shared by every proxied channel. Reapplying the active projection produces identical configuration bytes, and a normal stop restores the original assignments and formatting exactly.
+Recovery remains compatible with temporary reasoning projections recorded by earlier releases, so stopping or recovering the proxy can still remove those obsolete managed values without changing current user-owned settings.
 
-## Missing capability fields use a stable order
+## Provider reasoning levels pass through unchanged
 
-When one or more of these fields must be projected but are absent, hellogrok now uses existing user assignments as anchors and inserts only the missing values in this order: `reasoning_effort`, `reasoning_efforts`, `supports_backend_search`.
+Responses, Chat Completions, and Messages now preserve provider-owned reasoning levels instead of normalizing them through a DeepSeek-specific mapping table. Unknown or future non-empty levels reach the provider unchanged and remain subject to that provider's validation.
 
-The same ordering applies when all three fields are absent. One-time migration of an exact legacy hellogrok reasoning menu still compacts that menu, but it preserves the relative placement of existing search and reasoning settings.
+Responses-to-Messages conversion follows Grok Build's native serializer: `none` and `minimal` do not produce Messages reasoning fields, while every other non-empty value is retained.
+
+## DeepSeek off selections keep their meaning
+
+On the first-party DeepSeek endpoint, an explicit `none` selection is converted to the native thinking-off switch for Chat Completions and Messages. This also works when `reasoning_effort = "none"` is the only reasoning field in the model configuration; a reasoning menu is not required.
+
+When no reasoning fields are configured, hellogrok does not add a thinking switch and leaves Grok Build and DeepSeek defaults unchanged.

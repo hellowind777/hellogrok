@@ -30,20 +30,11 @@ type Model struct {
 	// SupportsBackendSearchConfigured distinguishes an explicit false from an
 	// omitted capability so first-party providers can supply documented defaults.
 	SupportsBackendSearchConfigured bool
-	// ReasoningEffortConfigured records whether the model explicitly declares
-	// supports_reasoning_effort or reasoning_efforts. Provider tables do not
-	// expose these fields in Grok Build, so only [model.*] participates.
-	ReasoningEffortConfigured bool
-	// ReasoningEffortEnabled tells the protocol facade whether an omitted
-	// Messages effort can represent the user's explicit None selection.
-	ReasoningEffortEnabled bool
-	// LegacyGeneratedReasoningMenu identifies the exact object menu emitted by
-	// older hellogrok releases. It is safe to compact without treating custom
-	// labels, values, ordering, or defaults as proxy-owned.
-	LegacyGeneratedReasoningMenu bool
-	// ReasoningEffortSelectionConfigured preserves an explicit per-model or
-	// global default while compact bare-string menus are projected.
-	ReasoningEffortSelectionConfigured bool
+	// ReasoningSelectionConfigured tells the protocol facade whether local config
+	// explicitly exposes or selects a reasoning effort. Grok Build omits
+	// both Messages fields for None, so this state distinguishes an explicit off
+	// selection from an entirely unconfigured provider default.
+	ReasoningSelectionConfigured bool
 	// ContextWindowConfigured distinguishes a user-selected model/provider
 	// window from a remotely discovered maximum. Grok Build must keep the
 	// configured value as the auto-compaction denominator when it is present.
@@ -130,11 +121,8 @@ type Route struct {
 	// DefaultSearchModel records the runtime selection made through
 	// [models].web_search or GROK_WEB_SEARCH_MODEL. A selected custom route is
 	// exposed to Grok Build as hosted-search capable while the facade is active.
-	DefaultSearchModel                 bool
-	ReasoningEffortConfigured          bool
-	ReasoningEffortEnabled             bool
-	LegacyGeneratedReasoningMenu       bool
-	ReasoningEffortSelectionConfigured bool
+	DefaultSearchModel           bool
+	ReasoningSelectionConfigured bool
 	// ContextWindow is the effective explicit [model.*] or inherited
 	// [model_providers.*] value. When it is not configured, the facade leaves
 	// provider model-metadata responses free to supply the maximum window.
@@ -244,21 +232,16 @@ func LoadModels(path string) ([]Model, error) {
 		if err != nil {
 			return nil, fmt.Errorf("[model.%s].supports_reasoning_effort %w", id, err)
 		}
-		reasoningEffortsConfigured := false
 		reasoningEffortsEnabled := false
-		legacyGeneratedReasoningMenu := false
 		if rawEfforts, exists := m["reasoning_efforts"]; exists {
-			reasoningEffortsConfigured = true
 			efforts, ok := rawEfforts.([]any)
 			if !ok {
 				return nil, fmt.Errorf("[model.%s].reasoning_efforts must be an array", id)
 			}
 			reasoningEffortsEnabled = len(efforts) > 0
-			legacyGeneratedReasoningMenu = isLegacyGeneratedReasoningMenu(efforts)
 		}
-		reasoningEffortConfigured := inheritedFieldExists(m, nil, "supports_reasoning_effort") || reasoningEffortsConfigured
-		reasoningEffortSelectionConfigured := inheritedFieldExists(m, nil, "reasoning_effort") ||
-			inheritedFieldExists(modelsConfig, nil, "default_reasoning_effort")
+		reasoningSelectionConfigured := inheritedFieldExists(m, nil, "reasoning_effort") ||
+			supportsReasoningEffort || reasoningEffortsEnabled
 		contextWindow, contextWindowConfigured, err := inheritedPositiveUint64(m, provider, "context_window")
 		if err != nil {
 			return nil, fmt.Errorf("[model.%s].context_window %w", id, err)
@@ -338,63 +321,37 @@ func LoadModels(path string) ([]Model, error) {
 			upstreamAuthScheme = normalizeAuthScheme(inheritedString(nil, provider, "auth_scheme"))
 		}
 		out = append(out, Model{
-			ID:                                 id,
-			Model:                              str(m["model"]),
-			Name:                               str(m["name"]),
-			BaseURL:                            baseURL,
-			APIBaseURL:                         apiBaseURL,
-			APIBackend:                         apiBackend,
-			APIBackendConfigured:               apiBackendConfigured,
-			ChatSearchDialect:                  chatSearchDialect,
-			SupportsBackendSearch:              supportsBackendSearch,
-			SupportsBackendSearchConfigured:    supportsBackendSearchConfigured,
-			ReasoningEffortConfigured:          reasoningEffortConfigured,
-			ReasoningEffortEnabled:             supportsReasoningEffort || reasoningEffortsEnabled,
-			LegacyGeneratedReasoningMenu:       legacyGeneratedReasoningMenu,
-			ReasoningEffortSelectionConfigured: reasoningEffortSelectionConfigured,
-			ContextWindow:                      contextWindow,
-			ContextWindowConfigured:            contextWindowConfigured,
-			MaxCompletionTokens:                maxCompletionTokens,
-			MaxCompletionTokensConfigured:      maxCompletionTokensConfigured,
-			AutoCompactThresholdPercent:        uint8(autoCompactThreshold),
-			AutoCompactThresholdConfigured:     autoCompactThresholdConfigured,
-			InferenceIdleTimeoutSecs:           inferenceIdleTimeoutSecs,
-			InferenceIdleTimeoutConfigured:     inferenceIdleTimeoutConfigured,
-			AuthScheme:                         upstreamAuthScheme,
-			IncomingAuthScheme:                 modelAuthScheme,
-			APIKey:                             apiKey,
-			EnvKeys:                            envKeys,
-			EnvKey:                             first(envKeys),
-			AuthProvider:                       authProvider,
-			DynamicAuth:                        dynamicAuth,
-			ExtraHeaders:                       extraHeaders,
-			EnvHTTPHeaders:                     envHTTPHeaders,
+			ID:                              id,
+			Model:                           str(m["model"]),
+			Name:                            str(m["name"]),
+			BaseURL:                         baseURL,
+			APIBaseURL:                      apiBaseURL,
+			APIBackend:                      apiBackend,
+			APIBackendConfigured:            apiBackendConfigured,
+			ChatSearchDialect:               chatSearchDialect,
+			SupportsBackendSearch:           supportsBackendSearch,
+			SupportsBackendSearchConfigured: supportsBackendSearchConfigured,
+			ReasoningSelectionConfigured:    reasoningSelectionConfigured,
+			ContextWindow:                   contextWindow,
+			ContextWindowConfigured:         contextWindowConfigured,
+			MaxCompletionTokens:             maxCompletionTokens,
+			MaxCompletionTokensConfigured:   maxCompletionTokensConfigured,
+			AutoCompactThresholdPercent:     uint8(autoCompactThreshold),
+			AutoCompactThresholdConfigured:  autoCompactThresholdConfigured,
+			InferenceIdleTimeoutSecs:        inferenceIdleTimeoutSecs,
+			InferenceIdleTimeoutConfigured:  inferenceIdleTimeoutConfigured,
+			AuthScheme:                      upstreamAuthScheme,
+			IncomingAuthScheme:              modelAuthScheme,
+			APIKey:                          apiKey,
+			EnvKeys:                         envKeys,
+			EnvKey:                          first(envKeys),
+			AuthProvider:                    authProvider,
+			DynamicAuth:                     dynamicAuth,
+			ExtraHeaders:                    extraHeaders,
+			EnvHTTPHeaders:                  envHTTPHeaders,
 		})
 	}
 	return out, nil
-}
-
-func isLegacyGeneratedReasoningMenu(efforts []any) bool {
-	wantValues := []string{"none", "low", "high", "max"}
-	wantLabels := []string{"None", "Low", "High", "Max"}
-	if len(efforts) != len(wantValues) {
-		return false
-	}
-	for index, raw := range efforts {
-		option, ok := raw.(map[string]any)
-		if !ok || str(option["value"]) != wantValues[index] || str(option["label"]) != wantLabels[index] {
-			return false
-		}
-		isDefault, hasDefault := option["default"].(bool)
-		if index == 2 {
-			if !hasDefault || !isDefault || len(option) != 3 {
-				return false
-			}
-		} else if hasDefault || len(option) != 2 {
-			return false
-		}
-	}
-	return true
 }
 
 func usableAuthProvider(raw any) bool {
@@ -812,38 +769,29 @@ func BuildRoutes(models []Model) ([]Route, error) {
 			return nil, fmt.Errorf("model %q has invalid HTTP headers: %w", m.ID, err)
 		}
 		route := Route{
-			ChannelID:                          m.ID,
-			Host:                               displayHost,
-			OriginBase:                         origin,
-			APIBackend:                         backend,
-			APIBackendConfigured:               m.APIBackendConfigured,
-			ChatSearchDialect:                  m.ChatSearchDialect,
-			WireModel:                          wireModel,
-			APIKey:                             key,
-			AuthScheme:                         authScheme,
-			IncomingAuthScheme:                 incomingAuthScheme,
-			DynamicAuth:                        m.DynamicAuth && key == "",
-			ExtraHeaders:                       extraHeaders,
-			SupportsBackendSearch:              m.SupportsBackendSearch,
-			SupportsBackendSearchConfigured:    m.SupportsBackendSearchConfigured,
-			ReasoningEffortConfigured:          m.ReasoningEffortConfigured,
-			ReasoningEffortEnabled:             m.ReasoningEffortEnabled,
-			LegacyGeneratedReasoningMenu:       m.LegacyGeneratedReasoningMenu,
-			ReasoningEffortSelectionConfigured: m.ReasoningEffortSelectionConfigured,
-			ContextWindow:                      m.ContextWindow,
-			ContextWindowConfigured:            m.ContextWindowConfigured,
-			MaxCompletionTokens:                m.MaxCompletionTokens,
-			MaxCompletionTokensConfigured:      m.MaxCompletionTokensConfigured,
-			AutoCompactThresholdPercent:        m.AutoCompactThresholdPercent,
-			AutoCompactThresholdConfigured:     m.AutoCompactThresholdConfigured,
-			InferenceIdleTimeoutSecs:           m.InferenceIdleTimeoutSecs,
-			InferenceIdleTimeoutConfigured:     m.InferenceIdleTimeoutConfigured,
-		}
-		// DeepSeek documents the effort surface at the first-party protocol
-		// endpoints. Keep this independent of model IDs so rolling aliases and
-		// future models inherit it without a hellogrok release.
-		if !route.ReasoningEffortConfigured && IsOfficialDeepSeekRoute(route) {
-			route.ReasoningEffortEnabled = true
+			ChannelID:                       m.ID,
+			Host:                            displayHost,
+			OriginBase:                      origin,
+			APIBackend:                      backend,
+			APIBackendConfigured:            m.APIBackendConfigured,
+			ChatSearchDialect:               m.ChatSearchDialect,
+			WireModel:                       wireModel,
+			APIKey:                          key,
+			AuthScheme:                      authScheme,
+			IncomingAuthScheme:              incomingAuthScheme,
+			DynamicAuth:                     m.DynamicAuth && key == "",
+			ExtraHeaders:                    extraHeaders,
+			SupportsBackendSearch:           m.SupportsBackendSearch,
+			SupportsBackendSearchConfigured: m.SupportsBackendSearchConfigured,
+			ReasoningSelectionConfigured:    m.ReasoningSelectionConfigured,
+			ContextWindow:                   m.ContextWindow,
+			ContextWindowConfigured:         m.ContextWindowConfigured,
+			MaxCompletionTokens:             m.MaxCompletionTokens,
+			MaxCompletionTokensConfigured:   m.MaxCompletionTokensConfigured,
+			AutoCompactThresholdPercent:     m.AutoCompactThresholdPercent,
+			AutoCompactThresholdConfigured:  m.AutoCompactThresholdConfigured,
+			InferenceIdleTimeoutSecs:        m.InferenceIdleTimeoutSecs,
+			InferenceIdleTimeoutConfigured:  m.InferenceIdleTimeoutConfigured,
 		}
 		out = append(out, route)
 	}

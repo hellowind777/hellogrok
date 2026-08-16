@@ -1,13 +1,19 @@
-# 发布说明 — v0.1.15
+# 发布说明 — v0.1.16
 
-## 已有推理和搜索字段保持原位
+## 推理配置完全归用户管理
 
-启用代理不再改变已有 `reasoning_effort`、`reasoning_efforts` 或 `supports_backend_search` 赋值的相对位置。单行和多行推理菜单都在原位更新，注释、无关模型设置和用户定义的字段顺序保持不变。
+hellogrok 不再为任何渠道创建、迁移、重排或替换 `reasoning_effort`、`reasoning_efforts` 或 `supports_reasoning_effort`。用户可以配置当前档位、推理菜单、同时配置两者或全部不配置；缺失字段继续使用 Grok Build 模型目录和供应商默认行为。
 
-所有代理渠道共用这项行为。再次应用当前代理配置时，配置文件字节保持一致；正常停止代理后，原始赋值和格式会被精确恢复。
+恢复逻辑仍兼容早期版本记录的临时推理投影，因此停止代理或执行恢复时仍能清理这些旧受管值，同时不改动当前由用户管理的设置。
 
-## 缺失能力字段使用固定顺序
+## 供应商推理档位保持原值
 
-需要临时投影这些字段但其中一项或多项缺失时，hellogrok 会以用户已有赋值为位置锚点，只补写缺失值，并统一采用以下顺序：`reasoning_effort`、`reasoning_efforts`、`supports_backend_search`。
+Responses、Chat Completions 和 Messages 不再通过 DeepSeek 专用映射表归一化供应商推理档位。未知或未来的非空档位会原样传给供应商，由供应商自行校验。
 
-三个字段全部缺失时也使用相同顺序。精确匹配旧版 hellogrok 生成格式的推理菜单仍会执行一次性紧凑化迁移，但已有搜索与推理设置的相对位置保持不变。
+Responses 转 Messages 时遵循 Grok Build 原生序列化行为：`none` 和 `minimal` 不生成 Messages 推理字段，其他非空值保持不变。
+
+## DeepSeek 关闭选择保持原有语义
+
+对于 DeepSeek 官方端点，显式选择 `none` 时，Chat Completions 和 Messages 都会收到原生思考关闭开关。即使模型配置中只有 `reasoning_effort = "none"`，无需同时配置推理菜单，也能正确关闭思考。
+
+未配置任何推理字段时，hellogrok 不添加思考开关，保持 Grok Build 和 DeepSeek 的默认行为。
