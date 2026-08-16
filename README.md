@@ -6,7 +6,7 @@
 
 A cross-platform local proxy that makes Grok Build custom model channels work with common API formats, native Web tools, isolated authentication, and automatic configuration recovery.
 
-[![Version](https://img.shields.io/badge/version-0.1.16-2f6feb.svg)](./internal/appinfo/appinfo.go)
+[![Version](https://img.shields.io/badge/version-0.1.17-2f6feb.svg)](./internal/appinfo/appinfo.go)
 [![Go](https://img.shields.io/badge/Go-1.26.6-00ADD8.svg)](./go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#platform-support)
@@ -50,6 +50,7 @@ It is intended for users who maintain multiple third-party model channels and wa
 
 - Supports upstream channels that use `responses`, `messages`, or `chat_completions`.
 - Keeps the provider's configured upstream protocol, URL path, model, credential, reasoning, and tool semantics at the provider boundary.
+- Gives every proxied custom channel a unique runtime model identity equal to its model-table ID. The configured `model` value remains the upstream wire model, while Grok Build persists the channel ID and normalized responses report the same ID. `/resume` therefore returns to the selected custom channel even when several channels and an official model all use `grok-4.6`. The original `model` line is restored byte-for-byte when the proxy stops.
 - When `supports_backend_search = true`, temporarily exposes the channel to Grok Build as Responses, then translates requests, responses, and SSE events to and from the provider's real protocol. Grok Build can therefore consume `web_search_call` across every supported upstream format, plus sources and site counts whenever the upstream returns real result URLs.
 - When `supports_backend_search = false`, keeps Grok Build on the configured native consumer so its client `web_search` uses `[models].web_search`, `GROK_WEB_SEARCH_MODEL`, or the authenticated official fallback. Omission preserves Grok Build catalog behavior, except that models on the exact first-party DeepSeek endpoint enable its documented provider-hosted search by default. An explicit false still opts out unless that custom route is selected as the default search model.
 - Exposes channel-scoped `/responses`, `/messages`, and `/chat/completions` routes and restores the original `api_backend` byte-for-byte when the proxy stops.
@@ -58,7 +59,7 @@ It is intended for users who maintain multiple third-party model channels and wa
 - Bounds ordinary upstream response-header waits and gaps between reads from every response body at 601 seconds, one second beyond Grok Build's 600-second shell default. First-party `api.deepseek.com` routes use 660 seconds to cover the provider's documented ten-minute queue. There is no total request deadline, and every upstream byte, including a non-streaming queue newline or normalized heartbeat, renews the idle window.
 - Logs the model declared by the raw upstream response before normalization, including terminal-frame precedence, case-insensitive mismatch detection, and conflicting declarations, without changing routing or response data.
 - Completes a missing empty `signature` on Messages `thinking` block starts while preserving the provider's later `signature_delta`, so Messages-compatible relays remain consumable by Grok Build's strict native decoder.
-- Preserves each configured upstream URL path and model identifier.
+- Preserves each configured upstream URL path and wire-model identifier at the provider boundary.
 - Prepares every explicit custom channel before use, avoiding first-request failures after `/model` switching.
 - Preserves portable conversation history during model hot switching while withholding only encrypted reasoning known to belong to a different channel, protocol, wire model, or upstream endpoint.
 - Preserves arbitrary Grok Build local function tools, including shell, file, patch, task, and MCP functions, through Responses, Messages, and Chat Completions bridges. Third-party channels never receive xAI-only `x_search`; provider-hosted tools still require real upstream support.
@@ -82,10 +83,12 @@ It is intended for users who maintain multiple third-party model channels and wa
 - Validates channel-owned header names and values while loading configuration. Request framing, content, and connection headers remain controlled by the proxy.
 - Checks and temporarily completes required Grok settings when the proxy starts.
 - Leaves `reasoning_effort`, `reasoning_efforts`, and `supports_reasoning_effort` entirely user- or Grok Build-owned: it never creates, migrates, reorders, or replaces them. Temporary proxy-owned settings such as `supports_backend_search` remain byte-stable across repeated applies, and stop restores only values managed by the active transaction.
+- Preserves upstream error status and body while classifying retry behavior from structured error codes. Authentication, permission, billing, insufficient balance/quota, invalid request, and invalid model failures are non-retryable; rate limits, timeouts, overload, and temporary service failures remain retryable. An explicit upstream `X-Should-Retry` header always wins.
 - Accepts `config.toml` as UTF-8 with or without a BOM. Read-only checks never rewrite the file; every successful proxy apply, restore, or rollback write saves it atomically as UTF-8 without BOM. Invalid TOML reports the file path, line, and column instead of an undecorated parser error.
 - Computes an independent auto-compaction budget for each custom model from its effective context window and maximum output. It temporarily lowers only unsafe thresholds, never raises a lower user value, and restores every managed value when the proxy stops.
 - On normal stop, tray exit, Ctrl+C, SIGTERM, or failed startup, restores untouched temporary values while preserving concurrent user edits through a field-level three-way merge. If unrelated edits make the full TOML document invalid but it remains valid UTF-8, line-scoped recovery still restores independently valid managed assignments while preserving the malformed user text.
 - Always honors the tray **Exit** command after attempting cleanup. If safe restoration is impossible because the file cannot be accessed or an unowned local route remains, the recovery transaction stays on disk for the next launch instead of trapping the user in the tray process.
+- Keeps a diagnostic listener after an ordinary proxy stop so stale sessions receive a structured, non-retryable `proxy_stopped` error that asks the user to reselect a model. Tray **Exit** closes that listener and releases the port even when configuration cleanup must be deferred.
 - Recovers proxy-managed settings after an unclean exit with `hellogrok restore`.
 
 ### Desktop and operations
@@ -142,7 +145,7 @@ The original false in this example remains user-owned, but selection temporarily
 
 | Setting | Required | Default | Purpose |
 |---------|----------|---------|---------|
-| `model` | No | Model table ID | Model identifier sent to the upstream channel. |
+| `model` | No | Model table ID | Upstream wire-model identifier. While the proxy is active, hellogrok temporarily exposes the model-table ID to Grok Build as the runtime identity and translates requests back to this configured value at the provider boundary. |
 | `base_url` or `api_base_url` | Yes | None | Custom upstream endpoint. Models without a custom URL are not proxied. |
 | `api_backend` | No | Model catalog, then `chat_completions` | Native upstream API format: `responses`, `messages`, or `chat_completions`. A capable non-Responses channel is temporarily projected as Responses only to Grok Build; hellogrok converts at the provider boundary while preserving the selected native protocol unless an explicit search bridge applies. |
 | `chat_search_dialect` | No | Host-based | Hosted-search strategy override: `web_search_options`, `search_parameters`, `messages`, or `responses`. Official DeepSeek and xAI Chat default to `responses`; other Chat routes default to `web_search_options`. Responses and Messages stay native unless this field explicitly requests a bridge. |
@@ -450,9 +453,11 @@ Confirm that the intended `[model.<id>]` or referenced provider has a valid `bas
 
 Check the startup log for the channel's Build and upstream protocols, then inspect the first failing search request. A Responses channel marked enabled must implement the Responses hosted tool; Messages must support `web_search_20250305`; Chat must support its selected `chat_search_dialect`. A channel marked false instead needs a valid `[models].web_search` / `GROK_WEB_SEARCH_MODEL` selection or usable official xAI credentials. Selecting that custom route temporarily makes it backend-search enabled, so a provider rejection or the non-retryable “did not complete backend web_search” error means the upstream capability is missing; the proxy will not hide it with another fallback. `web_fetch` is independent but can still be removed by active tool permissions.
 
-### A request returns 401, 403, or 502
+### A request returns 401, 403, 429, 502, or 503
 
 Run `hellogrok routes` and inspect **Status and logs**. Confirm the channel URL, backend, credential source, model identifier, and provider availability. An upstream outage, rate limit, unsupported payload, or stripped search tool must be fixed by the provider or relay.
+
+hellogrok preserves the upstream status and error body. Structured authentication, permission, billing, insufficient-balance/quota, invalid-request, and invalid-model errors receive `X-Should-Retry: false`, so Grok Build can show the original provider explanation instead of hiding it behind repeated retries. Structured rate-limit, timeout, overload, and temporary-unavailable errors remain retryable. If a relay returns only a generic `503`, hellogrok cannot infer that the account is out of balance; the relay must return a billing code or message.
 
 A 502 can also mean that an upstream returned a malformed success response. hellogrok validates the minimum Responses, Messages, or Chat Completions envelope before forwarding it; the log identifies the missing or invalid field.
 
@@ -518,6 +523,10 @@ Use `api_backend = "messages"` (plural). Grok Build defines only `chat_completio
 
 Check the **Grok session hot switch** line in **Status and logs**. Automatic switching applies to idle custom-model sessions on a shared leader and supports both current and legacy ACP model-switch method names. On Windows, a live named-pipe leader misreported as stale by Grok Build 1.0.x is accepted only when its leader lock is actively held. A working or input-blocked session is skipped safely; reselect its current model in `/model` after the active operation finishes. A window started with `--no-leader` exposes no external IPC to hellogrok and also requires manual reselection or a new window.
 
+### `/resume` selects official `grok-4.6` instead of the prior custom channel
+
+Upgrade to the current release, enable the proxy, and select the intended custom channel once in `/model`. While enabled, hellogrok temporarily uses the channel's model-table ID as Grok Build's runtime identity and sends the original configured `model` only at the upstream boundary. New and subsequently updated session summaries therefore remain unambiguous even when multiple channels share `grok-4.6`. A historical summary that already contains only `grok-4.6` has no channel evidence to recover automatically; it requires that one explicit reselection.
+
 ### A model switch asks to start a new conversation
 
 Grok Build replays all historical reasoning items, including provider-encrypted state, after `/model` changes. hellogrok records the emitting signature domain and removes only known foreign encrypted reasoning from the target request; normal messages, tool calls, tool results, search history, and unencrypted reasoning remain unchanged. For an older conversation whose opaque state predates the local provenance index, hellogrok first preserves the request and performs one clean replay only if the upstream returns a structured signature or decryption rejection. A repeated deterministic rejection is marked non-retryable instead of entering Grok Build's generic retry loop.
@@ -528,11 +537,11 @@ Ensure no hellogrok process is running, then execute `hellogrok restore`. Do not
 
 ### Proxy stop is deferred after editing the active configuration
 
-hellogrok merges proxy-managed fields individually during shutdown, so changing `supports_backend_search` or leaving an unrelated TOML setting unfinished does not need to be rolled back before exit. A normal proxy stop is deferred only when recovery still finds an unowned `127.0.0.1:18787` route, the configuration file cannot be accessed, or another manager owns it. Restore the model header or replace the temporary URL with the intended upstream URL for a clean stop. Tray **Exit** always terminates and leaves unresolved recovery state for the next launch.
+hellogrok merges proxy-managed fields individually during shutdown, so changing `supports_backend_search` or leaving an unrelated TOML setting unfinished does not need to be rolled back before exit. A normal proxy stop is deferred only when recovery still finds an unowned `127.0.0.1:18787` route, the configuration file cannot be accessed, or another manager owns it. Restore the model header or replace the temporary URL with the intended upstream URL for a clean stop. Tray **Exit** always terminates, releases the local port, and leaves unresolved recovery state for the next launch.
 
 ### Port `18787` is already in use
 
-Stop the process that owns `127.0.0.1:18787` before enabling the proxy. hellogrok claims the port before changing Grok configuration and shows a startup error if it is unavailable; it does not silently switch ports because the rewritten channel URLs and recovery state must agree on one address.
+Stop the process that owns `127.0.0.1:18787` before enabling the proxy. hellogrok claims the port before changing Grok configuration and shows a startup error if it is unavailable; it does not silently switch ports because the rewritten channel URLs and recovery state must agree on one address. An open hellogrok tray keeps this port in diagnostic mode after **Stop proxy** so stale sessions receive a clear error. Use tray **Exit** when another application needs the port.
 
 ### Autostart works, but a channel has no credentials
 

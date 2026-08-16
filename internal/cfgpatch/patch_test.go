@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"unicode/utf8"
+
+	"github.com/pelletier/go-toml/v2"
 )
 
 func TestApplyAndRestoreWriteUTF8WithoutBOM(t *testing.T) {
@@ -1717,6 +1719,88 @@ func TestApplyTargetsLeavesNonTargetsUntouched(t *testing.T) {
 	two := sectionText(t, string(patched), "model.two")
 	if two != "[model.two]\nbase_url = \"https://two.example/v1\"\n" {
 		t.Fatalf("non-target changed: %q", two)
+	}
+}
+
+func TestRuntimeModelIdentityIsUniqueAndRestoresExactly(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	statePath := filepath.Join(dir, "state.json")
+	original := "[features]\nbackend_tools = true\nweb_fetch = true\n\n" +
+		"[model.grok-one]\nmodel = \"grok-4.6\" # upstream wire model\n" +
+		"base_url = \"https://one.example/v1\"\nreasoning_effort = \"xhigh\"\n" +
+		"reasoning_efforts = [\n    \"xhigh\",\n    \"high\",\n    \"low\",\n]\n" +
+		"supports_backend_search = false\n\n" +
+		"[model.grok-two]\nbase_url = \"https://two.example/v1\"\n"
+	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := ApplyTargets(configPath, statePath, []Target{
+		{ID: "grok-one", RuntimeModelID: "grok-one"},
+		{ID: "grok-two", RuntimeModelID: "grok-two"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.RuntimeModels != 2 {
+		t.Fatalf("runtime model rewrites = %d, want 2", result.RuntimeModels)
+	}
+	patched, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var root map[string]any
+	if err := toml.Unmarshal(patched, &root); err != nil {
+		t.Fatal(err)
+	}
+	models := ModelTables(root)
+	if models["grok-one"]["model"] != "grok-one" || models["grok-two"]["model"] != "grok-two" {
+		t.Fatalf("runtime identities are not unique: %#v", models)
+	}
+	one := sectionText(t, string(patched), "model.grok-one")
+	assertOrdered(t, one, `reasoning_effort = "xhigh"`, "reasoning_efforts = [", "supports_backend_search = false")
+
+	if _, err := Restore(configPath, statePath); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(restored) != original {
+		t.Fatalf("runtime identity transaction was not byte-exact\nwant: %q\ngot:  %q", original, restored)
+	}
+}
+
+func TestRuntimeModelIdentityPreservesConcurrentUserReplacement(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	statePath := filepath.Join(dir, "state.json")
+	original := "[model.grok]\nmodel = \"grok-4.6\"\nbase_url = \"https://example.test/v1\"\n"
+	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ApplyTargets(configPath, statePath, []Target{{ID: "grok", RuntimeModelID: "grok"}}); err != nil {
+		t.Fatal(err)
+	}
+	patched, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	edited := strings.Replace(string(patched), `model = "grok"`, `model = "user-selected-model"`, 1)
+	if err := os.WriteFile(configPath, []byte(edited), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Restore(configPath, statePath); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := strings.Replace(original, `model = "grok-4.6"`, `model = "user-selected-model"`, 1)
+	if string(restored) != want {
+		t.Fatalf("concurrent model replacement was not preserved\nwant: %q\ngot:  %q", want, restored)
 	}
 }
 

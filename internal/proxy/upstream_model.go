@@ -66,7 +66,7 @@ func (observer *upstreamModelObserver) mismatch(configured string) bool {
 
 func (observer *upstreamModelObserver) log(logger *log.Logger, route config.Route) {
 	actual, source := observer.actual()
-	expected := responseModelForRoute(route)
+	expected := upstreamResponseModelForRoute(route)
 	configured, ok := validObservedUpstreamModel(expected)
 	if !ok {
 		configured = "<invalid>"

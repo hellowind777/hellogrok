@@ -405,10 +405,14 @@ func (a *App) StatusDetail() string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if !a.running {
-		if a.lastError != "" {
-			return "【代理】 状态：已停止\n配置：未改写\n本地端口：未监听\n\n【上次错误】 " + a.lastError
+		portStatus := "未监听"
+		if a.server != nil && a.server.IsServing() {
+			portStatus = "诊断监听（旧会话会收到代理已停止提示）"
 		}
-		return "【代理】 状态：已停止\n配置：未改写\n本地端口：未监听"
+		if a.lastError != "" {
+			return "【代理】 状态：已停止\n配置：未改写\n本地端口：" + portStatus + "\n\n【上次错误】 " + a.lastError
+		}
+		return "【代理】 状态：已停止\n配置：未改写\n本地端口：" + portStatus
 	}
 	patched := append([]string(nil), a.patchedIDs...)
 	sort.Strings(patched)
@@ -460,11 +464,14 @@ func (a *App) Start() error {
 
 	// Own the facade address before touching config. A second instance must not
 	// mistake the active instance's rewrite state for an orphan and restore it.
-	if err := a.server.ReservePath(); err != nil {
-		if addressInUse(err) {
-			return a.abortStart(fmt.Errorf("本地代理端口 %s 已被占用，请关闭占用该端口的程序后重试", a.server.PathAddr))
+	serverAlreadyServing := a.server.IsServing()
+	if !serverAlreadyServing {
+		if err := a.server.ReservePath(); err != nil {
+			if addressInUse(err) {
+				return a.abortStart(fmt.Errorf("本地代理端口 %s 已被占用，请关闭占用该端口的程序后重试", a.server.PathAddr))
+			}
+			return a.abortStart(fmt.Errorf("reserve local facade: %w", err))
 		}
-		return a.abortStart(fmt.Errorf("reserve local facade: %w", err))
 	}
 	a.beginSessionLog()
 
@@ -558,8 +565,12 @@ func (a *App) Start() error {
 	}
 	a.server.SetRoutes(routes)
 	a.server.SetCapacityObserver(a.queueCapacityObservation)
-	if err := a.server.ServePath(); err != nil {
-		return a.abortStart(fmt.Errorf("start local facade: %w", err))
+	if serverAlreadyServing {
+		a.server.Enable()
+	} else {
+		if err := a.server.ServePath(); err != nil {
+			return a.abortStart(fmt.Errorf("start local facade: %w", err))
+		}
 	}
 	a.logger.Printf("channel facade on http://%s/c/<channel>/{responses|messages|chat/completions}", a.server.PathAddr)
 
@@ -587,8 +598,8 @@ func (a *App) Start() error {
 	a.patchedIDs = append([]string(nil), res.Targets...)
 	sort.Strings(a.patchedIDs)
 	a.modelAliases = cloneStringMap(res.LegacyModelAliases)
-	a.logger.Printf("config rewrite all: model_sections=%d base=%d api_base=%d api_backend=%d context_windows=%d max_completion_tokens=%d auto_compact_thresholds=%d backend_search=%d backend_tools=%d web_fetch=%d subagents_enabled=%d targets=%v",
-		res.ModelSections, res.BaseURLs, res.APIBaseURLs, res.APIBackends, res.ContextWindows, res.MaxCompletionTokens, res.AutoCompactThresholds, res.BackendSearch, res.BackendTools, res.WebFetch, res.SubagentsEnabled, res.Targets)
+	a.logger.Printf("config rewrite all: model_sections=%d runtime_models=%d base=%d api_base=%d api_backend=%d context_windows=%d max_completion_tokens=%d auto_compact_thresholds=%d backend_search=%d backend_tools=%d web_fetch=%d subagents_enabled=%d targets=%v",
+		res.ModelSections, res.RuntimeModels, res.BaseURLs, res.APIBaseURLs, res.APIBackends, res.ContextWindows, res.MaxCompletionTokens, res.AutoCompactThresholds, res.BackendSearch, res.BackendTools, res.WebFetch, res.SubagentsEnabled, res.Targets)
 	a.logger.Printf("config validation passed: backend_protocols=capability-projected backend_tools=true web_fetch=true backend_search=configured-or-selected-or-documented-default reasoning_config=user-or-catalog-owned model_limits=configured-first-otherwise-remote subagent_defaults=repaired-if-needed targets=%d", res.ValidatedTargets)
 	a.models = append([]config.Model(nil), models...)
 	a.routes = append([]config.Route(nil), routes...)
@@ -696,6 +707,7 @@ func buildConfigTargets(models []config.Model, routes map[string]config.Route, c
 		}
 		target := cfgpatch.Target{
 			ID:                    model.ID,
+			RuntimeModelID:        model.ID,
 			APIBaseURL:            strings.TrimSpace(model.APIBaseURL) != "",
 			APIBackend:            route.APIBackend,
 			BuildAPIBackend:       buildAPIBackend(route),
@@ -729,8 +741,12 @@ func configuredAutoCompactEnvironment() (*uint8, error) {
 }
 
 func (a *App) abortStart(err error) error {
-	a.server.Stop()
-	a.server = proxy.NewPersistent(a.logger, a.dataDir)
+	if a.server.IsServing() {
+		a.server.Disable()
+	} else {
+		a.server.Stop()
+		a.server = proxy.NewPersistent(a.logger, a.dataDir)
+	}
 	a.lastError = err.Error()
 	return err
 }
@@ -1291,8 +1307,7 @@ func (a *App) Stop() error {
 		a.refreshOpenGrokSessions("disable", disableGrokSessionSelectionsForReferences(activeReferences, a.modelAliases))
 	}
 
-	a.server.Stop()
-	a.server = proxy.NewPersistent(a.logger, a.dataDir)
+	a.server.Disable()
 	a.running = false
 	a.patchedIDs = nil
 	a.modelAliases = nil
@@ -1307,6 +1322,19 @@ func (a *App) Stop() error {
 	a.lastError = ""
 	a.logger.Printf("stopped")
 	return nil
+}
+
+// Shutdown is the final process-exit path. It always releases the local port,
+// even when configuration cleanup must be deferred to crash recovery.
+func (a *App) Shutdown() error {
+	err := a.Stop()
+	a.stopBackgroundWorkers()
+	a.mu.Lock()
+	server := a.server
+	a.running = false
+	a.mu.Unlock()
+	server.Stop()
+	return err
 }
 
 func ccSwitchConflictError(takeover cfgpatch.CCSwitchTakeover, action string) error {

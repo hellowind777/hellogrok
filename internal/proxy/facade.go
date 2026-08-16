@@ -235,7 +235,7 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 			w.Header().Set(grokContextWindowHeader, fmt.Sprintf("%d", discoveredContextWindow))
 		}
 		copySafeResponseHeaders(w.Header(), response.Header)
-		setRetryDisposition(w.Header(), response.StatusCode)
+		setRetryDisposition(w.Header(), response.StatusCode, data)
 		if reasoningRejected {
 			w.Header().Set("X-Should-Retry", "false")
 		}
@@ -438,13 +438,99 @@ func requestKindLabel(kind facadeRequestKind) string {
 	return "native_session"
 }
 
-func setRetryDisposition(header http.Header, status int) {
+func setRetryDisposition(header http.Header, status int, body []byte) {
 	if strings.TrimSpace(header.Get("X-Should-Retry")) != "" {
 		return
 	}
 	retry := status == http.StatusTooManyRequests || status == http.StatusInternalServerError ||
 		status == http.StatusBadGateway || status == http.StatusServiceUnavailable || status == http.StatusGatewayTimeout
+	if classified, value := classifyStructuredRetry(body); classified {
+		retry = value
+	}
 	header.Set("X-Should-Retry", fmt.Sprintf("%t", retry))
+}
+
+func classifyStructuredRetry(body []byte) (bool, bool) {
+	root, err := decodeJSONMap(body)
+	if err != nil {
+		return false, false
+	}
+	errorBody, _ := root["error"].(map[string]any)
+	identifiers := []string{
+		firstString(errorBody, "code"),
+		firstString(errorBody, "type"),
+		firstString(root, "code"),
+		firstString(root, "type"),
+	}
+	transient := false
+	for _, identifier := range identifiers {
+		normalized := normalizeErrorIdentifier(identifier)
+		if normalized == "" || normalized == "error" {
+			continue
+		}
+		if hasErrorIdentifier(normalized,
+			"insufficient_quota", "insufficient_balance", "quota_exceeded",
+			"billing", "payment_required", "credit_balance", "account_balance",
+			"authentication", "invalid_api_key", "unauthorized", "permission",
+			"forbidden", "access_denied", "invalid_request", "invalid_model",
+			"model_not_found", "unsupported_model",
+		) {
+			return true, false
+		}
+		if hasErrorIdentifier(normalized,
+			"rate_limit", "too_many_requests", "overloaded", "temporarily_unavailable",
+			"temporary_unavailable", "service_unavailable", "timeout", "timed_out",
+		) {
+			transient = true
+		}
+	}
+	if transient {
+		return true, true
+	}
+
+	message := strings.ToLower(strings.TrimSpace(firstString(errorBody, "message")))
+	if message == "" {
+		message = strings.ToLower(strings.TrimSpace(firstString(root, "message")))
+	}
+	if containsErrorPhrase(message,
+		"insufficient balance", "insufficient quota", "quota exceeded", "billing",
+		"payment required", "credit balance", "account balance", "invalid api key",
+		"incorrect api key", "authentication failed", "permission denied",
+		"model not found", "invalid model", "账户余额不足", "余额不足", "额度不足",
+		"欠费", "无效的 api key", "api key 无效", "鉴权失败", "认证失败", "无权限", "模型不存在",
+	) {
+		return true, false
+	}
+	if containsErrorPhrase(message,
+		"rate limit", "too many requests", "temporarily unavailable", "temporary unavailable",
+		"service unavailable", "overloaded", "timed out", "timeout", "请求过于频繁",
+		"服务暂时不可用", "服务不可用", "超时",
+	) {
+		return true, true
+	}
+	return false, false
+}
+
+func normalizeErrorIdentifier(value string) string {
+	return strings.NewReplacer("-", "_", ".", "_", "/", "_", " ", "_").Replace(strings.ToLower(strings.TrimSpace(value)))
+}
+
+func hasErrorIdentifier(value string, fragments ...string) bool {
+	for _, fragment := range fragments {
+		if value == fragment || strings.Contains(value, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsErrorPhrase(message string, phrases ...string) bool {
+	for _, phrase := range phrases {
+		if strings.Contains(message, phrase) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) normalizeResponsesJSON(data []byte, route config.Route, request facadeRequest) (map[string]any, []byte, error) {
@@ -466,6 +552,7 @@ func (s *Server) normalizeResponsesJSON(data []byte, route config.Route, request
 	if err != nil {
 		return nil, nil, err
 	}
+	setDownstreamResponseModel(root, responseModelForRoute(route))
 	backfillResponseSearchSources(root, request.HostedWebSearch, request.SearchQuery)
 	if err := validateResponsesEnvelope(root); err != nil {
 		return nil, nil, err
@@ -503,6 +590,7 @@ func (s *Server) normalizeNativeJSON(
 		normalizeNativeChatRequiredFields(root, route, false, compatID("chatcmpl"), time.Now().Unix())
 		normalizeNativeChatUsage(root)
 	}
+	setDownstreamResponseModel(root, responseModelForRoute(route))
 	if err := validate(root); err != nil {
 		return nil, nil, err
 	}

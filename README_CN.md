@@ -6,7 +6,7 @@
 
 跨平台 Grok Build 本地代理，让自定义模型渠道兼容常见 API 格式、Build 原生 Web 工具、独立鉴权和自动配置恢复。
 
-[![Version](https://img.shields.io/badge/version-0.1.16-2f6feb.svg)](./internal/appinfo/appinfo.go)
+[![Version](https://img.shields.io/badge/version-0.1.17-2f6feb.svg)](./internal/appinfo/appinfo.go)
 [![Go](https://img.shields.io/badge/Go-1.26.6-00ADD8.svg)](./go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#平台支持)
@@ -50,6 +50,7 @@ hellogrok 为这些自定义渠道提供统一的本地兼容层。运行时准�
 
 - 支持采用 `responses`、`messages` 或 `chat_completions` 的上游渠道。
 - 在供应商边界保留渠道配置的真实协议、URL 路径、模型、凭据、推理和工具语义。
+- 为每个代理自定义渠道分配与模型表 ID 相同的唯一运行时模型身份。配置的 `model` 值仍是发送给上游的模型，而 Grok Build 会保存渠道 ID，规范化响应也会报告同一 ID。因此，即使多个渠道和官方模型都使用 `grok-4.6`，`/resume` 仍会回到之前选择的自定义渠道。代理停止时会逐字节恢复原始 `model` 行。
 - 当 `supports_backend_search = true` 时，临时让 Grok Build 将该渠道作为 Responses 消费，再在代理内把请求、响应和 SSE 事件转换到供应商的真实协议。三种上游格式因此都能向 Grok Build 返回 `web_search_call`；上游真实返回结果 URL 时，还会返回来源和站点数量。
 - 当 `supports_backend_search = false` 时，Grok Build 保持使用配置的原生消费者，其客户端 `web_search` 依次使用 `[models].web_search`、`GROK_WEB_SEARCH_MODEL` 或已登录官方账号的回退路径。字段缺省时保留 Grok Build 模型目录行为，但精确指向 DeepSeek 官方端点的模型默认启用其文档所述 hosted 搜索。显式 false 仍会关闭它，除非该自定义渠道被选为默认搜索模型。
 - 提供渠道隔离的 `/responses`、`/messages` 和 `/chat/completions` 路由，并在代理停止时逐字节恢复原始 `api_backend`。
@@ -58,7 +59,7 @@ hellogrok 为这些自定义渠道提供统一的本地兼容层。运行时准�
 - 普通渠道的上游响应头等待及所有响应正文的两次读取间隔最多为 601 秒，比 Grok Build shell 默认的 600 秒多一秒；`api.deepseek.com` 官方路由使用 660 秒，以覆盖服务商记录的最长十分钟排队。请求没有总时限，非流式排队空行或规范化心跳等任意上游字节都会刷新空闲时限。
 - 在规范化前记录原始上游响应声明的模型，支持终止帧优先、大小写不敏感的不一致判断和多帧冲突标记，不改变路由或响应数据。
 - Messages 的 `thinking` 起始块缺少空 `signature` 时补齐该字段，同时保留供应商随后发送的真实 `signature_delta`，使 Messages 兼容中转可被 Grok Build 的严格原生解码器消费。
-- 保留每个渠道配置的上游 URL 路径和模型标识。
+- 在供应商边界保留每个渠道配置的上游 URL 路径和上游模型标识。
 - 使用前准备所有显式自定义渠道，避免通过 `/model` 切换后首次请求失败。
 - 热切换模型时保留可移植的会话历史，只排除已知属于不同渠道、协议、线上模型或上游端点的加密推理。
 - 在 Responses、Messages 与 Chat Completions 桥接中保留 Grok Build 的任意本地函数工具，包括 Shell、文件、补丁、Task 和 MCP 函数。第三方渠道不会收到 xAI 专属的 `x_search`；供应商 hosted 工具仍须由上游真实支持。
@@ -82,10 +83,12 @@ hellogrok 为这些自定义渠道提供统一的本地兼容层。运行时准�
 - 加载配置时校验渠道请求头名称和值；请求分帧、内容和连接请求头仍由代理控制。
 - 代理启动时检查并临时补全 Grok 必需设置。
 - `reasoning_effort`、`reasoning_efforts` 和 `supports_reasoning_effort` 完全归用户或 Grok Build 管理，hellogrok 不会创建、迁移、重排或替换这些字段。`supports_backend_search` 等代理临时管理的设置在重复应用时保持稳定，停止时只恢复当前事务管理的值。
+- 保留上游错误状态和正文，并根据结构化错误代码判断是否重试。鉴权、权限、账单、余额或额度不足、无效请求和无效模型错误不可重试；限流、超时、过载和临时服务错误仍可重试。上游显式返回的 `X-Should-Retry` 始终优先。
 - 接受带或不带 BOM 的 UTF-8 `config.toml`。只读检查不会改写文件；代理每次成功应用、恢复或回滚配置时，都会以 UTF-8 无 BOM 原子写入。TOML 无效时会显示文件路径、行号和列号，不再只输出缺少上下文的解析器错误。
 - 根据每个自定义模型的有效上下文窗口和最大输出分别计算自动压缩预算；只临时降低不安全的阈值，不会提高用户设置的较低值，停止代理时恢复全部受管值。
 - 正常停止、退出托盘、Ctrl+C、SIGTERM 或启动失败时恢复未被用户改动的临时值，并通过字段级三方合并保留代理运行期间的用户修改。无关修改使整份 TOML 无效但文件仍是有效 UTF-8 时，逐行恢复仍会撤销可独立解析的受管字段，并保留用户写入的无效 TOML 文本。
 - 托盘“退出”始终会在尝试清理后结束进程。若文件无法访问或仍有不属于原事务结构的本地路由，恢复事务会留在磁盘供下次启动处理，不会把用户困在托盘程序中。
+- 普通停止代理后保留诊断监听，让旧会话收到结构化、不可重试的 `proxy_stopped` 错误，并提示用户重新选择模型。托盘“退出”会关闭该监听并释放端口，即使配置清理需要推迟也不例外。
 - 异常退出后可以使用 `hellogrok restore` 恢复代理管理的设置。
 
 ### 桌面与运维
@@ -142,7 +145,7 @@ supports_backend_search = false
 
 | 设置 | 是否必需 | 默认值 | 用途 |
 |------|----------|--------|------|
-| `model` | 否 | 模型表 ID | 发送给上游渠道的模型标识。 |
+| `model` | 否 | 模型表 ID | 发送给上游渠道的模型标识。代理运行期间，hellogrok 会临时向 Grok Build 暴露模型表 ID 作为运行时身份，并在供应商边界把请求转换回此配置值。 |
 | `base_url` 或 `api_base_url` | 是 | 无 | 自定义上游端点；没有自定义 URL 的模型不会进入代理。 |
 | `api_backend` | 否 | 模型目录，其次 `chat_completions` | 上游真实 API 格式：`responses`、`messages` 或 `chat_completions`。启用搜索能力的非 Responses 渠道只会在 Grok Build 侧临时投影为 Responses；hellogrok 在供应商边界转换，并保持选定的原生协议，除非显式搜索桥接生效。 |
 | `chat_search_dialect` | 否 | 按主机判断 | hosted 搜索策略覆盖：`web_search_options`、`search_parameters`、`messages` 或 `responses`。DeepSeek 与 xAI 官方 Chat 默认 `responses`，其他 Chat 主机默认 `web_search_options`；Responses 与 Messages 只有在该字段显式要求时才桥接。 |
@@ -450,9 +453,11 @@ Responses 供应商继续使用 Responses。Messages 供应商接收 Messages �
 
 先查看启动日志中的 Build 协议和上游协议，再检查首次失败的真实搜索请求。标记为启用的 Responses 渠道必须实现 Responses hosted 工具，Messages 必须支持 `web_search_20250305`，Chat 必须支持选定的 `chat_search_dialect`。标记为 false 的渠道则需要有效的 `[models].web_search` / `GROK_WEB_SEARCH_MODEL`，或可用的 xAI 官方凭据。选中该自定义渠道后会在运行期临时启用其后端搜索；供应商拒绝或不可重试的“未完成 backend web_search”错误就表示上游缺少真实能力，代理不会用其他回退掩盖。`web_fetch` 与搜索模型独立，但仍可能被当前工具权限排除。
 
-### 请求返回 401、403 或 502
+### 请求返回 401、403、429、502 或 503
 
 执行 `hellogrok routes` 并查看“状态与日志”，确认渠道 URL、后端、凭据来源、模型标识和服务商状态。上游故障、限流、不支持的载荷或被中转丢弃的搜索工具需要由服务商或中转解决。
+
+hellogrok 会保留上游状态和错误正文。结构化鉴权、权限、账单、余额或额度不足、无效请求和无效模型错误会收到 `X-Should-Retry: false`，让 Grok Build 显示原始供应商说明，而不是通过重复重试掩盖错误。结构化限流、超时、过载和临时不可用错误仍可重试。如果中转只返回通用 `503`，hellogrok 无法推断账号余额不足；中转必须提供账单错误代码或消息。
 
 502 也可能表示上游返回了结构不完整的成功响应。hellogrok 会在转发前校验 Responses、Messages 或 Chat Completions 的最小响应结构，日志会指出缺失或类型错误的字段。
 
@@ -518,6 +523,10 @@ DeepSeek 的 1M 上下文是输入与生成输出共享的总预算，Responses 
 
 查看“状态与日志”中的“Grok 会话热切换”。自动热切换只适用于共享 leader 中的空闲自定义模型会话，并兼容新旧 ACP 模型切换方法。Windows 上若 Grok Build 1.0.x 把活动的命名管道 leader 误报为 stale，hellogrok 只会在其 leader 锁确实被占用时接管。正在生成或等待输入的会话会被安全跳过；完成当前操作后在 `/model` 中重新选择当前模型。使用 `--no-leader` 打开的窗口没有可供 hellogrok 连接的外部 IPC，也需要手动重选或新开窗口。
 
+### `/resume` 恢复为官方 `grok-4.6`，而不是之前的自定义渠道
+
+升级到当前版本并启用代理，然后在 `/model` 中重新选择一次目标自定义渠道。代理运行期间，hellogrok 会临时使用渠道的模型表 ID 作为 Grok Build 运行时身份，只在供应商边界发送原始配置的 `model`。因此，新建或之后更新的会话摘要即使面对多个共用 `grok-4.6` 的渠道也不会产生歧义。历史会话摘要如果只保存了 `grok-4.6`，已经没有可自动恢复的渠道证据，需要手动重选一次。
+
 ### 切换模型后提示必须新建会话
 
 Grok Build 在 `/model` 切换后会重放全部历史推理项，其中可能包含服务商加密状态。hellogrok 会记录其来源签名域，并仅从目标请求中删除已知异域的加密推理；普通消息、工具调用、工具结果、搜索历史和未加密推理均保持不变。对于早于本地来源索引的旧会话不透明状态，hellogrok 首次仍保持透传，只有上游返回结构化签名或解密拒绝时才执行一次清理重放；若确定性拒绝再次发生，则标记为不可重试，避免进入 Grok Build 通用重试循环。
@@ -528,11 +537,11 @@ Grok Build 在 `/model` 切换后会重放全部历史推理项，其中可能�
 
 ### 修改运行中的配置后仍无法停止代理
 
-hellogrok 会在停止时逐字段合并代理受管配置，因此修改 `supports_backend_search` 或让无关 TOML 设置暂时未完成，都不需要在退出前手动回滚。只有恢复后仍发现不属于原事务结构的 `127.0.0.1:18787` 路由、配置文件无法访问，或其他工具持有配置时，普通停止才会推迟。恢复模型表头或把临时 URL 改为预期上游地址即可干净停止。托盘“退出”始终结束进程，并把未解决的恢复状态留给下次启动。
+hellogrok 会在停止时逐字段合并代理受管配置，因此修改 `supports_backend_search` 或让无关 TOML 设置暂时未完成，都不需要在退出前手动回滚。只有恢复后仍发现不属于原事务结构的 `127.0.0.1:18787` 路由、配置文件无法访问，或其他工具持有配置时，普通停止才会推迟。恢复模型表头或把临时 URL 改为预期上游地址即可干净停止。托盘“退出”始终结束进程、释放本地端口，并把未解决的恢复状态留给下次启动。
 
 ### 端口 `18787` 已占用
 
-启用代理前先停止占用 `127.0.0.1:18787` 的进程。hellogrok 会先占用端口再修改 Grok 配置；端口不可用时直接显示启动错误。它不会静默改用随机端口，因为临时渠道地址与恢复状态必须使用同一地址。
+启用代理前先停止占用 `127.0.0.1:18787` 的进程。hellogrok 会先占用端口再修改 Grok 配置；端口不可用时直接显示启动错误。它不会静默改用随机端口，因为临时渠道地址与恢复状态必须使用同一地址。hellogrok 托盘仍打开时，选择“停止代理”后会继续以诊断模式占用该端口，让旧会话收到明确错误；其他应用需要该端口时，应从托盘选择“退出”。
 
 ### 开机启动成功，但渠道没有凭据
 

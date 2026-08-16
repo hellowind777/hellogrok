@@ -280,6 +280,9 @@ func TestNativeSessionsUseNativePathsBodiesAndResponses(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			if response["model"] != route.ChannelID {
+				t.Fatalf("downstream model=%q want runtime channel %q: %s", response["model"], route.ChannelID, data)
+			}
 			switch backend {
 			case "responses":
 				if response["object"] != "response" || response["type"] != nil {
@@ -1042,6 +1045,9 @@ func TestNativeStreamsNormalizeHeartbeatsAndStopAtProtocolTerminal(t *testing.T)
 				!bytes.Contains(data, []byte(": keepalive\n\n")) || bytes.Contains(data, []byte("response.completed")) {
 				t.Fatalf("native stream was corrupted or translated: %s", data)
 			}
+			if bytes.Contains(data, []byte(`"model":"wire"`)) || !bytes.Contains(data, []byte(`"model":"stream"`)) {
+				t.Fatalf("native stream did not expose the runtime channel identity: %s", data)
+			}
 			if test.backend == "messages" && (!bytes.Contains(data, []byte(`"signature":""`)) ||
 				!bytes.Contains(data, []byte(`"signature":"opaque-signature"`)) ||
 				!bytes.Contains(data, []byte(`"content_block":{"text":"","type":"text"}`)) ||
@@ -1085,6 +1091,9 @@ func TestResponsesStreamFiltersPrivateKeepaliveAndStopsAtTerminal(t *testing.T) 
 			if status != http.StatusOK || bytes.Contains(data, []byte(`"type":"keepalive"`)) || bytes.Contains(data, []byte("event: keepalive")) ||
 				!bytes.Contains(data, []byte(": keepalive\n\n")) || !bytes.Contains(data, []byte(terminal)) {
 				t.Fatalf("status=%d body=%s", status, data)
+			}
+			if bytes.Contains(data, []byte(`"model":"wire"`)) || !bytes.Contains(data, []byte(`"model":"responses-stream"`)) {
+				t.Fatalf("Responses stream did not expose the runtime channel identity: %s", data)
 			}
 			select {
 			case <-upstreamCanceled:
@@ -1564,12 +1573,18 @@ func TestRetryDispositionPreservesUpstreamAndClassifiesDefaults(t *testing.T) {
 		name      string
 		status    int
 		upstream  string
+		body      string
 		wantRetry string
 	}{
-		{"bad request", http.StatusBadRequest, "", "false"},
-		{"rate limit", http.StatusTooManyRequests, "", "true"},
-		{"recoverable service", http.StatusServiceUnavailable, "", "true"},
-		{"upstream veto", http.StatusServiceUnavailable, "false", "false"},
+		{"bad request", http.StatusBadRequest, "", `{"error":{"message":"failure"}}`, "false"},
+		{"rate limit", http.StatusTooManyRequests, "", `{"error":{"type":"rate_limit_error","message":"too many requests"}}`, "true"},
+		{"recoverable service", http.StatusServiceUnavailable, "", `{"error":{"code":"service_unavailable","message":"temporarily unavailable"}}`, "true"},
+		{"insufficient quota", http.StatusTooManyRequests, "", `{"error":{"code":"insufficient_quota","message":"quota exhausted"}}`, "false"},
+		{"insufficient balance", http.StatusServiceUnavailable, "", `{"error":{"type":"billing_error","message":"insufficient balance"}}`, "false"},
+		{"invalid key", http.StatusUnauthorized, "", `{"error":{"type":"authentication_error","message":"invalid api key"}}`, "false"},
+		{"invalid model", http.StatusServiceUnavailable, "", `{"error":{"code":"model_not_found","message":"unknown model"}}`, "false"},
+		{"upstream veto", http.StatusServiceUnavailable, "false", `{"error":{"code":"service_unavailable"}}`, "false"},
+		{"upstream retry wins", http.StatusUnauthorized, "true", `{"error":{"code":"invalid_api_key"}}`, "true"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -1580,7 +1595,7 @@ func TestRetryDispositionPreservesUpstreamAndClassifiesDefaults(t *testing.T) {
 					w.Header().Set("X-Should-Retry", test.upstream)
 				}
 				w.WriteHeader(test.status)
-				_, _ = io.WriteString(w, `{"error":{"message":"failure"}}`)
+				_, _ = io.WriteString(w, test.body)
 			}))
 			defer upstream.Close()
 			route := facadeRoute("retry", "responses", "wire", "key", upstream.URL)
@@ -1592,6 +1607,34 @@ func TestRetryDispositionPreservesUpstreamAndClassifiesDefaults(t *testing.T) {
 				t.Fatalf("status=%d retry=%q retry-after=%q", status, header.Get("X-Should-Retry"), header.Get("Retry-After"))
 			}
 		})
+	}
+}
+
+func TestDisabledFacadeExplainsStoppedStateAndCanReenable(t *testing.T) {
+	var calls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, nativeSuccessBody("responses", "grok-4.6", "ok"))
+	}))
+	defer upstream.Close()
+
+	route := facadeRoute("grok-third-party", "responses", "grok-4.6", "key", upstream.URL)
+	s := New(log.New(io.Discard, "", 0))
+	s.SetRoutes([]config.Route{route})
+	startPathTestServer(t, s)
+	s.Disable()
+
+	data, status, header := postFacadeResponse(t, s, route.ChannelID, nativeRequestBody("responses", false), "")
+	if status != http.StatusServiceUnavailable || header.Get("X-Should-Retry") != "false" || calls.Load() != 0 ||
+		!bytes.Contains(data, []byte(`"type":"proxy_stopped"`)) || !bytes.Contains(data, []byte("请重新选择模型")) {
+		t.Fatalf("status=%d retry=%q calls=%d body=%s", status, header.Get("X-Should-Retry"), calls.Load(), data)
+	}
+
+	s.Enable()
+	data, status, _ = postFacadeResponse(t, s, route.ChannelID, nativeRequestBody("responses", false), "")
+	if status != http.StatusOK || calls.Load() != 1 {
+		t.Fatalf("reenabled status=%d calls=%d body=%s", status, calls.Load(), data)
 	}
 }
 

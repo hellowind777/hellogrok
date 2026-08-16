@@ -254,14 +254,41 @@ func requestModelForRoute(route config.Route, protocol wireProtocol) string {
 	return model
 }
 
-// responseModelForRoute is the model ID DeepSeek reports in response objects.
+// upstreamResponseModelForRoute is the model ID expected from the provider.
 // Anthropic's [1m] request alias resolves to the underlying model.
-func responseModelForRoute(route config.Route) string {
+func upstreamResponseModelForRoute(route config.Route) string {
 	if !isOfficialDeepSeekRoute(route) {
 		return route.WireModel
 	}
 	model, _ := splitDeepSeekMessagesAlias(route.WireModel)
 	return model
+}
+
+// responseModelForRoute is the stable runtime identity exposed to Grok Build.
+// The channel ID must survive response normalization and session persistence;
+// only requestModelForRoute and upstream diagnostics use the provider model.
+func responseModelForRoute(route config.Route) string {
+	if model := strings.TrimSpace(route.ChannelID); model != "" {
+		return model
+	}
+	return upstreamResponseModelForRoute(route)
+}
+
+func setDownstreamResponseModel(root map[string]any, model string) {
+	model = strings.TrimSpace(model)
+	if root == nil || model == "" {
+		return
+	}
+	for _, key := range []string{"response", "message"} {
+		if nested, _ := root[key].(map[string]any); nested != nil {
+			nested["model"] = model
+		}
+	}
+	object := stringValue(root["object"])
+	typ := stringValue(root["type"])
+	if object == "response" || strings.HasPrefix(object, "chat.completion") || typ == "message" {
+		root["model"] = model
+	}
 }
 
 func splitDeepSeekMessagesAlias(value string) (string, bool) {

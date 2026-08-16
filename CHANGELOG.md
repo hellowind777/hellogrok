@@ -6,6 +6,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.1.17] — 2026-08-16
+
+### Changed
+
+- Proxied custom channels now use their model-table ID as the Grok Build runtime identity while retaining the configured `model` as the upstream wire model. Normal stop restores the original assignment byte-for-byte, and new or updated session summaries can distinguish channels that share the same provider model.
+- An ordinary proxy stop keeps a diagnostic listener so stale sessions receive a structured, non-retryable `proxy_stopped` response. Final application shutdown closes that listener and releases the local port.
+
+### Fixed
+
+- `/resume` no longer falls back to an official model merely because a custom channel uses the same upstream model name; the selected custom channel identity is preserved across Responses, Messages, and Chat Completions.
+- Upstream error status and body remain visible while structured retry classification stops authentication, permission, billing, insufficient-balance/quota, invalid-request, and invalid-model failures from entering generic retry loops. Rate-limit, overload, timeout, and temporary-service failures remain retryable, and an upstream `X-Should-Retry` override is honored.
+- Tray **Exit** now uses a final shutdown path that always releases the facade listener after attempting configuration recovery, including when recovery must remain pending for the next launch.
+
 ## [0.1.16] — 2026-08-16
 
 ### Changed
@@ -266,7 +279,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - CC Switch compatibility detection and conflict warnings.
 - Builds for Windows, Linux, and macOS on amd64 and arm64.
 
-[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.16...HEAD
+[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.17...HEAD
+[0.1.17]: https://github.com/hellowind777/hellogrok/compare/v0.1.16...v0.1.17
 [0.1.16]: https://github.com/hellowind777/hellogrok/compare/v0.1.15...v0.1.16
 [0.1.15]: https://github.com/hellowind777/hellogrok/compare/v0.1.14...v0.1.15
 [0.1.14]: https://github.com/hellowind777/hellogrok/compare/v0.1.13...v0.1.14

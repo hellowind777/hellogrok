@@ -93,7 +93,7 @@ func TestGrokBuildProcessRetriesContextBudget(t *testing.T) {
 default = "context-e2e"
 
 [model.context-e2e]
-model = "wire-model"
+model = "context-e2e"
 base_url = "http://%s/c/context-e2e"
 api_key = "test-key"
 api_backend = "responses"
@@ -206,7 +206,7 @@ func TestGrokBuildProcessCompactsAtNextPromptAllProtocols(t *testing.T) {
 default = %q
 
 [model.%s]
-model = "wire-model"
+model = %q
 base_url = "http://%s/c/%s"
 api_key = "test-key"
 api_backend = %q
@@ -214,7 +214,7 @@ context_window = 100000
 max_completion_tokens = 4096
 supports_backend_search = false
 supports_reasoning_effort = false
-`, route.ChannelID, route.ChannelID, server.PathAddr, route.ChannelID, backend)
+`, route.ChannelID, route.ChannelID, route.ChannelID, server.PathAddr, route.ChannelID, backend)
 			if err := os.WriteFile(filepath.Join(grokHome, "config.toml"), []byte(configText), 0o600); err != nil {
 				t.Fatal(err)
 			}
@@ -262,7 +262,111 @@ supports_reasoning_effort = false
 	}
 }
 
+func TestGrokBuildProcessResumePreservesCustomChannelIdentity(t *testing.T) {
+	if os.Getenv("HELLOGROK_GROK_E2E") != "1" {
+		t.Skip("set HELLOGROK_GROK_E2E=1 to run the installed Grok Build process test")
+	}
+	grokPath, err := exec.LookPath("grok")
+	if err != nil {
+		t.Skipf("grok executable is not installed: %v", err)
+	}
+
+	var mu sync.Mutex
+	paths := make([]string, 0, 4)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		body, _ := io.ReadAll(request.Body)
+		mu.Lock()
+		paths = append(paths, request.URL.Path)
+		mu.Unlock()
+		text := "FIRST"
+		if bytes.Contains(body, []byte("Reply exactly SECOND")) {
+			text = "SECOND"
+		} else if bytes.Contains(body, []byte("generating the session title")) {
+			text = "Resume identity"
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, nativeSuccessBody("responses", "grok-4.6", text))
+	}))
+	defer upstream.Close()
+
+	parsedUpstream, _ := url.Parse(upstream.URL)
+	routes := []config.Route{
+		{
+			ChannelID: "grok-resume-a", Host: parsedUpstream.Host, OriginBase: upstream.URL + "/a/v1",
+			APIBackend: "responses", APIBackendConfigured: true, WireModel: "grok-4.6",
+			APIKey: "test-key-a", AuthScheme: "bearer", IncomingAuthScheme: "bearer",
+		},
+		{
+			ChannelID: "grok-resume-b", Host: parsedUpstream.Host, OriginBase: upstream.URL + "/b/v1",
+			APIBackend: "responses", APIBackendConfigured: true, WireModel: "grok-4.6",
+			APIKey: "test-key-b", AuthScheme: "bearer", IncomingAuthScheme: "bearer",
+		},
+	}
+	server := New(log.New(io.Discard, "", 0))
+	server.SetRoutes(routes)
+	startPathTestServer(t, server)
+
+	grokHome := filepath.Join(t.TempDir(), "grok-home")
+	if err := os.MkdirAll(grokHome, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	configText := fmt.Sprintf(`[models]
+default = "grok-resume-b"
+
+[model.grok-4.6]
+model = "grok-4.6"
+base_url = "http://127.0.0.1:1"
+api_key = "unused-test-key"
+api_backend = "responses"
+
+[model.grok-resume-a]
+model = "grok-resume-a"
+base_url = "http://%s/c/grok-resume-a"
+api_key = "test-key-a"
+api_backend = "responses"
+
+[model.grok-resume-b]
+model = "grok-resume-b"
+base_url = "http://%s/c/grok-resume-b"
+api_key = "test-key-b"
+api_backend = "responses"
+`, server.PathAddr, server.PathAddr)
+	if err := os.WriteFile(filepath.Join(grokHome, "config.toml"), []byte(configText), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	env := append(os.Environ(),
+		"GROK_HOME="+grokHome,
+		"HOME="+grokHome,
+		"USERPROFILE="+grokHome,
+	)
+	workDir := t.TempDir()
+	first := runGrokHeadlessWithModel(t, grokPath, workDir, env, "", "grok-resume-b", "Reply exactly FIRST")
+	if first.SessionID == "" || first.Text != "FIRST" {
+		t.Fatalf("first result = %+v", first)
+	}
+	second := runGrokHeadlessWithModel(t, grokPath, workDir, env, first.SessionID, "", "Reply exactly SECOND")
+	if second.SessionID != first.SessionID || second.Text != "SECOND" {
+		t.Fatalf("resumed result = %+v, first = %+v", second, first)
+	}
+
+	mu.Lock()
+	gotPaths := append([]string(nil), paths...)
+	mu.Unlock()
+	if len(gotPaths) < 2 {
+		t.Fatalf("upstream paths = %v", gotPaths)
+	}
+	for _, path := range gotPaths {
+		if !strings.HasPrefix(path, "/b/v1/") {
+			t.Fatalf("resumed session left the selected channel: %v", gotPaths)
+		}
+	}
+}
+
 func runGrokHeadless(t *testing.T, grokPath, workDir string, env []string, sessionID, prompt string) grokHeadlessResult {
+	return runGrokHeadlessWithModel(t, grokPath, workDir, env, sessionID, "", prompt)
+}
+
+func runGrokHeadlessWithModel(t *testing.T, grokPath, workDir string, env []string, sessionID, model, prompt string) grokHeadlessResult {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
@@ -272,6 +376,8 @@ func runGrokHeadless(t *testing.T, grokPath, workDir string, env []string, sessi
 	}
 	if sessionID != "" {
 		args = append(args, "--resume", sessionID)
+	} else if model != "" {
+		args = append(args, "-m", model)
 	}
 	command := exec.CommandContext(ctx, grokPath, args...)
 	command.Dir = workDir

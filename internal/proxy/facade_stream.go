@@ -1184,6 +1184,7 @@ func (s *Server) streamNativeSSE(w http.ResponseWriter, response *http.Response,
 			normalizeNativeChatRequiredFields(root, route, true, chatStreamID, chatCreatedAt)
 			normalizeNativeChatUsage(root)
 		}
+		setDownstreamResponseModel(root, responseModelForRoute(route))
 		restoreClientWebSearchAlias(root, request.ClientSearchAlias, request.Protocol)
 		s.captureReasoningProvenance(route, root)
 		encoded, err := json.Marshal(root)

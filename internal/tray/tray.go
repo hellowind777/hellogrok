@@ -14,6 +14,7 @@ type Controller interface {
 	IsRunning() bool
 	Start() error
 	Stop() error
+	Shutdown() error
 	ProxyEnabledOnLaunch() (bool, error)
 	SetProxyEnabledOnLaunch(bool) error
 	IsAutostart() bool
@@ -28,7 +29,7 @@ func Run(c Controller, icon []byte, logger *log.Logger) {
 	systray.Run(func() {
 		onReady(c, icon, logger)
 	}, func() {
-		_ = c.Stop()
+		_ = c.Shutdown()
 	})
 }
 
@@ -155,7 +156,7 @@ func onReady(c Controller, icon []byte, logger *log.Logger) {
 				}
 
 			case <-mQuit.ClickedCh:
-				if err := stopAndQuit(c.Stop, systray.Quit); err != nil {
+				if err := stopAndQuit(c.Shutdown, systray.Quit); err != nil {
 					// A recovery record remains on disk for the next launch. Quitting
 					// must never trap the user in the tray application.
 					logger.Printf("quit after cleanup warning: %v", err)

@@ -850,6 +850,7 @@ func TestAppStartStopLifecycleRestoresConfigExactly(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, expected := range []string{
+		`model = "one"`,
 		`base_url = "http://127.0.0.1:18787/c/one"`,
 		`api_backend = "responses"`,
 		"supports_backend_search = true",
@@ -880,6 +881,79 @@ func TestAppStartStopLifecycleRestoresConfigExactly(t *testing.T) {
 	}
 	if _, err := os.Stat(cfgpatch.StatePath(dataDir)); !os.IsNotExist(err) {
 		t.Fatalf("rewrite state remains after stop: %v", err)
+	}
+}
+
+func TestAppStopKeepsDiagnosticFacadeAndShutdownReleasesPort(t *testing.T) {
+	dir := t.TempDir()
+	grokHome := filepath.Join(dir, "grok")
+	dataDir := filepath.Join(dir, "data")
+	if err := os.MkdirAll(grokHome, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GROK_HOME", grokHome)
+	configPath := filepath.Join(grokHome, "config.toml")
+	original := "[model.grok-third-party]\nmodel = \"grok-4.6\"\nbase_url = \"https://example.invalid/v1\"\napi_key = \"test-key\"\napi_backend = \"responses\"\n"
+	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := probe.Addr().String()
+	_ = probe.Close()
+	server := proxy.New(log.New(io.Discard, "", 0))
+	server.PathAddr = address
+	app := &App{logger: log.New(io.Discard, "", 0), dataDir: dataDir, server: server}
+	if err := app.Start(); err != nil {
+		t.Fatal(err)
+	}
+	patched, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(patched), `model = "grok-third-party"`) {
+		t.Fatalf("runtime channel identity was not projected:\n%s", patched)
+	}
+	if err := app.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	if detail := app.StatusDetail(); !strings.Contains(detail, "本地端口：诊断监听") {
+		t.Fatalf("stopped status did not report diagnostic listener: %s", detail)
+	}
+
+	request, err := http.NewRequest(http.MethodPost, "http://"+address+"/c/grok-third-party/responses", strings.NewReader(`{"model":"grok-third-party","input":"hi"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := (&http.Client{Timeout: 2 * time.Second}).Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusServiceUnavailable || response.Header.Get("X-Should-Retry") != "false" ||
+		!bytes.Contains(body, []byte(`"type":"proxy_stopped"`)) {
+		t.Fatalf("stopped response status=%d retry=%q body=%s", response.StatusCode, response.Header.Get("X-Should-Retry"), body)
+	}
+
+	if err := app.Shutdown(); err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("tcp", address)
+	if err != nil {
+		t.Fatalf("shutdown did not release %s: %v", address, err)
+	}
+	_ = listener.Close()
+	restored, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(restored) != original {
+		t.Fatalf("shutdown lifecycle was not byte-exact\nwant: %q\ngot:  %q", original, restored)
 	}
 }
 

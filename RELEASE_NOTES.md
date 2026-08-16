@@ -1,19 +1,17 @@
-# Release Notes — v0.1.16
+# Release Notes — v0.1.17
 
-## Reasoning configuration remains user-owned
+## Custom channels retain their identity across `/resume`
 
-hellogrok no longer creates, migrates, reorders, or replaces `reasoning_effort`, `reasoning_efforts`, or `supports_reasoning_effort` for any channel. Users may configure a selected level, a reasoning menu, both, or neither; missing fields continue to use Grok Build's model catalog and provider defaults.
+Every proxied custom channel now uses its model-table ID as the runtime identity seen and persisted by Grok Build. The configured `model` remains the upstream wire model and is restored byte-for-byte when the proxy stops.
 
-Recovery remains compatible with temporary reasoning projections recorded by earlier releases, so stopping or recovering the proxy can still remove those obsolete managed values without changing current user-owned settings.
+Sessions can therefore resume through the channel that created them even when several custom channels and an official model share the same upstream model name, such as `grok-4.6`. Historical summaries that already contain only the shared model name require one manual model reselection.
 
-## Provider reasoning levels pass through unchanged
+## Provider errors remain actionable
 
-Responses, Chat Completions, and Messages now preserve provider-owned reasoning levels instead of normalizing them through a DeepSeek-specific mapping table. Unknown or future non-empty levels reach the provider unchanged and remain subject to that provider's validation.
+hellogrok now preserves upstream error status and body while deriving retry behavior from structured error codes and messages. Authentication, permission, billing, insufficient balance or quota, invalid request, and invalid model failures are non-retryable; rate limits, timeouts, overload, and temporary service failures remain retryable. An explicit upstream `X-Should-Retry` header takes precedence.
 
-Responses-to-Messages conversion follows Grok Build's native serializer: `none` and `minimal` do not produce Messages reasoning fields, while every other non-empty value is retained.
+This allows billing and account failures from compatible relays to reach the conversation instead of being hidden behind generic retries.
 
-## DeepSeek off selections keep their meaning
+## Stopped sessions receive a clear diagnostic
 
-On the first-party DeepSeek endpoint, an explicit `none` selection is converted to the native thinking-off switch for Chat Completions and Messages. This also works when `reasoning_effort = "none"` is the only reasoning field in the model configuration; a reasoning menu is not required.
-
-When no reasoning fields are configured, hellogrok does not add a thinking switch and leaves Grok Build and DeepSeek defaults unchanged.
+An ordinary proxy stop keeps a diagnostic listener for stale sessions and returns a structured, non-retryable `proxy_stopped` response that asks the user to reselect a model. Tray **Exit** always closes the listener and releases the local port after attempting configuration recovery, including when cleanup must be deferred.

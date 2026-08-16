@@ -29,10 +29,12 @@ type Server struct {
 
 	mu       sync.RWMutex
 	channels map[string]config.Route
+	enabled  bool
 	log      *log.Logger
 
 	pathLn        net.Listener
 	pathServer    *http.Server
+	serverMu      sync.RWMutex
 	wg            sync.WaitGroup
 	lifecycleMu   sync.RWMutex
 	requestCtx    context.Context
@@ -86,6 +88,7 @@ func newServer(logger *log.Logger, reasoningPath string) *Server {
 	return &Server{
 		PathAddr:                "127.0.0.1:18787",
 		channels:                map[string]config.Route{},
+		enabled:                 true,
 		log:                     logger,
 		transport:               transport,
 		deepSeekTransport:       deepSeekTransport,
@@ -141,6 +144,48 @@ func (s *Server) lookupChannel(id string) (config.Route, bool) {
 	return route, ok
 }
 
+func (s *Server) isEnabled() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.enabled
+}
+
+// Enable accepts channel traffic on an already serving facade. It also opens
+// a fresh upstream lifecycle after a prior proxy stop.
+func (s *Server) Enable() {
+	s.lifecycleMu.Lock()
+	if s.requestCtx == nil || s.requestCtx.Err() != nil {
+		s.requestCtx, s.requestCancel = context.WithCancel(context.Background())
+	}
+	s.connections.Open()
+	s.lifecycleMu.Unlock()
+	s.mu.Lock()
+	s.enabled = true
+	s.mu.Unlock()
+}
+
+// Disable keeps the local listener alive so stale Grok sessions receive a
+// deterministic non-retryable diagnostic, while all upstream work is stopped.
+func (s *Server) Disable() {
+	s.mu.Lock()
+	s.enabled = false
+	s.mu.Unlock()
+	s.lifecycleMu.Lock()
+	if s.requestCancel != nil {
+		s.requestCancel()
+	}
+	s.connections.CloseAll()
+	s.lifecycleMu.Unlock()
+	s.transport.CloseIdleConnections()
+	s.deepSeekTransport.CloseIdleConnections()
+}
+
+func (s *Server) IsServing() bool {
+	s.serverMu.RLock()
+	defer s.serverMu.RUnlock()
+	return s.pathServer != nil
+}
+
 func (s *Server) StartPath() error {
 	if err := s.ReservePath(); err != nil {
 		return err
@@ -156,6 +201,8 @@ func (s *Server) StartPath() error {
 // uses this to establish single-instance ownership before recovering config.
 func (s *Server) ReservePath() error {
 	purgeLegacyRequestDiagnostics()
+	s.serverMu.Lock()
+	defer s.serverMu.Unlock()
 	if s.pathLn != nil {
 		return fmt.Errorf("local facade address is already reserved")
 	}
@@ -169,18 +216,15 @@ func (s *Server) ReservePath() error {
 
 // ServePath starts accepting requests on the previously reserved address.
 func (s *Server) ServePath() error {
+	s.serverMu.Lock()
+	defer s.serverMu.Unlock()
 	if s.pathLn == nil {
 		return fmt.Errorf("local facade address is not reserved")
 	}
 	if s.pathServer != nil {
 		return fmt.Errorf("local facade is already serving")
 	}
-	s.lifecycleMu.Lock()
-	if s.requestCtx == nil || s.requestCtx.Err() != nil {
-		s.requestCtx, s.requestCancel = context.WithCancel(context.Background())
-	}
-	s.connections.Open()
-	s.lifecycleMu.Unlock()
+	s.Enable()
 	s.pathServer = &http.Server{
 		Handler:           http.HandlerFunc(s.servePath),
 		ReadHeaderTimeout: 15 * time.Second,
@@ -201,14 +245,11 @@ func (s *Server) ServePath() error {
 }
 
 func (s *Server) Stop() {
-	s.lifecycleMu.Lock()
-	if s.requestCancel != nil {
-		s.requestCancel()
-	}
-	s.connections.CloseAll()
-	s.lifecycleMu.Unlock()
+	s.Disable()
+	s.serverMu.RLock()
 	server := s.pathServer
 	listener := s.pathLn
+	s.serverMu.RUnlock()
 	if server != nil {
 		timeout := s.shutdownTimeout
 		if timeout <= 0 {
@@ -230,12 +271,14 @@ func (s *Server) Stop() {
 	if err := s.reasoning.flush(); err != nil {
 		s.log.Printf("reasoning provenance flush failed: %v", err)
 	}
+	s.serverMu.Lock()
 	if s.pathServer == server {
 		s.pathServer = nil
 	}
 	if s.pathLn == listener {
 		s.pathLn = nil
 	}
+	s.serverMu.Unlock()
 }
 
 func (s *Server) upstreamLifecycleContext() context.Context {
@@ -259,6 +302,10 @@ func (s *Server) servePath(w http.ResponseWriter, request *http.Request) {
 	channelID, protocol, ok := channelFromPath(request.URL.EscapedPath())
 	if !ok {
 		writeJSONError(w, http.StatusNotFound, "unknown proxy route")
+		return
+	}
+	if !s.isEnabled() {
+		writeTypedJSONError(w, http.StatusServiceUnavailable, "hellogrok 代理已停止，请重新选择模型", "proxy_stopped", false)
 		return
 	}
 	route, found := s.lookupChannel(channelID)
@@ -380,10 +427,14 @@ func writeRetryableJSONError(w http.ResponseWriter, code int, message string) {
 }
 
 func writeJSONErrorWithRetry(w http.ResponseWriter, code int, message string, shouldRetry bool) {
+	writeTypedJSONError(w, code, message, "proxy_error", shouldRetry)
+}
+
+func writeTypedJSONError(w http.ResponseWriter, code int, message, errorType string, shouldRetry bool) {
 	body, _ := json.Marshal(map[string]any{
 		"error": map[string]any{
 			"message": message,
-			"type":    "proxy_error",
+			"type":    errorType,
 			"code":    code,
 		},
 	})
@@ -536,6 +587,7 @@ func (s *Server) streamResponsesSSE(w http.ResponseWriter, response *http.Respon
 		if err != nil {
 			return fmt.Errorf("invalid upstream Responses SSE data: %w", err)
 		}
+		setDownstreamResponseModel(event, responseModelForRoute(route))
 		s.captureReasoningProvenance(route, event)
 		streamedURLs = mergeUniqueStrings(streamedURLs, urlsFromJSON(event)...)
 		switch stringValue(event["type"]) {

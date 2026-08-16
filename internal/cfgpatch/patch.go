@@ -32,6 +32,7 @@ const (
 var (
 	sectionRe                      = regexp.MustCompile(`^\[([^\]]+)\]\s*(?:#.*)?$`)
 	modelSectionRe                 = regexp.MustCompile(`^model\.(?:"([^"]+)"|'([^']+)'|(.+))$`)
+	modelLine                      = regexp.MustCompile(`^(\s*model\s*=\s*)(?:"[^"]*"|'[^']*')(\s*(?:#.*)?)?$`)
 	baseURLLine                    = regexp.MustCompile(`^(\s*base_url\s*=\s*)(?:"[^"]*"|'[^']*')(\s*(?:#.*)?)?$`)
 	apiBaseURLLine                 = regexp.MustCompile(`^(\s*api_base_url\s*=\s*)(?:"[^"]*"|'[^']*')(\s*(?:#.*)?)?$`)
 	apiBackendLine                 = regexp.MustCompile(`^(\s*api_backend\s*=\s*)(?:"[^"]*"|'[^']*')(\s*(?:#.*)?)?$`)
@@ -46,6 +47,7 @@ var (
 	subagentsEnabledLine           = regexp.MustCompile(`^(\s*enabled\s*=\s*)(?:true|false)(\s*(?:#.*)?)?$`)
 	subagentsEnabledDottedLine     = regexp.MustCompile(`^(\s*subagents\.enabled\s*=\s*)(?:true|false)(\s*(?:#.*)?)?$`)
 	baseURLAnyLine                 = regexp.MustCompile(`^(\s*base_url\s*=\s*).*$`)
+	modelAnyLine                   = regexp.MustCompile(`^(\s*model\s*=\s*).*$`)
 	apiBaseURLAnyLine              = regexp.MustCompile(`^(\s*api_base_url\s*=\s*).*$`)
 	apiBackendAnyLine              = regexp.MustCompile(`^(\s*api_backend\s*=\s*).*$`)
 	contextWindowAnyLine           = regexp.MustCompile(`^(\s*context_window\s*=\s*).*$`)
@@ -68,7 +70,11 @@ var (
 // Build while the facade is active. An empty protocol remains catalog-owned:
 // the rewrite must not pin Grok Build's local or remote model resolution.
 type Target struct {
-	ID                    string
+	ID string
+	// RuntimeModelID is the unique model identity exposed to Grok Build while
+	// the facade is active. The proxy still sends the route's original wire
+	// model upstream, so sessions can persist the selected custom channel.
+	RuntimeModelID        string
 	APIBaseURL            bool
 	APIBackend            string
 	BuildAPIBackend       string
@@ -124,6 +130,7 @@ type SubagentState struct {
 
 type ModelState struct {
 	Section              ModelSectionState `json:"section,omitempty"`
+	Model                ManagedLineState  `json:"model,omitempty"`
 	BaseURL              ManagedLineState  `json:"base_url"`
 	APIBaseURL           ManagedLineState  `json:"api_base_url,omitempty"`
 	APIBackend           ManagedLineState  `json:"api_backend,omitempty"`
@@ -160,6 +167,7 @@ type ManagedLineState struct {
 
 type ApplyResult struct {
 	ModelSections         int
+	RuntimeModels         int
 	BaseURLs              int
 	APIBaseURLs           int
 	APIBackends           int
@@ -387,6 +395,7 @@ func ApplyTargets(configPath, statePath string, targets []Target) (ApplyResult, 
 		if target.ID == "" {
 			continue
 		}
+		target.RuntimeModelID = strings.TrimSpace(target.RuntimeModelID)
 		target.APIBackend = strings.ToLower(strings.TrimSpace(target.APIBackend))
 		switch target.APIBackend {
 		case "", "responses", "messages", "chat_completions":
@@ -597,6 +606,11 @@ func validateManagedConfig(raw []byte, targets map[string]Target, state State) e
 		}
 		if section := state.Models[id].Section; section.Managed && sectionLines[id] != section.AppliedLine {
 			return fmt.Errorf("[model.%s] header changed while preparing config", id)
+		}
+		if expected := targets[id].RuntimeModelID; expected != "" {
+			if value, ok := model["model"].(string); !ok || value != expected {
+				return fmt.Errorf("[model.%s].model must be %q", id, expected)
+			}
 		}
 		proxyURL, err := ToChannelProxyURL(id)
 		if err != nil {
@@ -1028,6 +1042,12 @@ func rewriteModelBlock(block []string, id string, target Target, state *State, e
 	fields := []managedField{
 		{name: "base_url", pattern: baseURLLine, anyPattern: baseURLAnyLine, value: quoteTOML(proxyURL), state: &modelState.BaseURL, changed: &result.BaseURLs},
 	}
+	if target.RuntimeModelID != "" {
+		fields = append([]managedField{{
+			name: "model", pattern: modelLine, anyPattern: modelAnyLine,
+			value: quoteTOML(target.RuntimeModelID), state: &modelState.Model, changed: &result.RuntimeModels,
+		}}, fields...)
+	}
 	if target.APIBaseURL {
 		fields = append(fields, managedField{name: "api_base_url", pattern: apiBaseURLLine, anyPattern: apiBaseURLAnyLine, value: quoteTOML(proxyURL), state: &modelState.APIBaseURL, changed: &result.APIBaseURLs})
 	}
@@ -1422,6 +1442,7 @@ func matchesOriginalManagedState(raw []byte, state State) (bool, error) {
 		}
 		model := models[id]
 		for _, check := range []managedValueCheck{
+			{key: "model", state: modelState.Model},
 			{key: "base_url", state: modelState.BaseURL},
 			{key: "api_base_url", state: modelState.APIBaseURL},
 			{key: "api_backend", state: modelState.APIBackend},
@@ -1564,6 +1585,10 @@ func prepareRestoreState(raw []byte, state State) (State, error) {
 			modelState.Section.Managed = false
 		}
 		section := fmt.Sprintf("[model.%s]", id)
+		modelState.Model, _, err = managedStateForRestore(section, model, "model", modelState.Model)
+		if err != nil {
+			return State{}, err
+		}
 		modelState.BaseURL, _, err = managedStateForRestore(section, model, "base_url", modelState.BaseURL)
 		if err != nil {
 			return State{}, err
@@ -1652,6 +1677,7 @@ func prepareRestoreStateText(raw []byte, state State) (State, error) {
 			pattern *regexp.Regexp
 			state   *ManagedLineState
 		}{
+			{"model", modelAnyLine, &modelState.Model},
 			{"base_url", baseURLAnyLine, &modelState.BaseURL},
 			{"api_base_url", apiBaseURLAnyLine, &modelState.APIBaseURL},
 			{"api_backend", apiBackendAnyLine, &modelState.APIBackend},
@@ -1912,6 +1938,7 @@ func validateRestorableConfig(raw []byte, state State) error {
 			return fmt.Errorf("[model.%s] header changed while proxy was active", id)
 		}
 		if err := validateManagedTable(fmt.Sprintf("[model.%s]", id), model, []managedValueCheck{
+			{key: "model", state: modelState.Model},
 			{key: "base_url", state: modelState.BaseURL},
 			{key: "api_base_url", state: modelState.APIBaseURL},
 			{key: "api_backend", state: modelState.APIBackend},
@@ -2185,6 +2212,7 @@ func restoreModelBlock(block []string, modelState ModelState, restored int, fina
 		anyPattern *regexp.Regexp
 		state      ManagedLineState
 	}{
+		{modelLine, modelAnyLine, modelState.Model},
 		{baseURLLine, baseURLAnyLine, modelState.BaseURL},
 		{apiBaseURLLine, apiBaseURLAnyLine, modelState.APIBaseURL},
 		{apiBackendLine, apiBackendAnyLine, modelState.APIBackend},
@@ -2222,7 +2250,7 @@ func restoreModelBlock(block []string, modelState ModelState, restored int, fina
 	}
 	block, restored = restoreManagedCompositeField(block, reasoningEffortsAnyLine, modelState.ReasoningEfforts, restored)
 	if finalBlock {
-		restoreTerminalBlockEnding(block, modelState.BaseURL, modelState.APIBaseURL,
+		restoreTerminalBlockEnding(block, modelState.Model, modelState.BaseURL, modelState.APIBaseURL,
 			modelState.APIBackend, modelState.ContextWindow, modelState.MaxCompletionTokens, modelState.AutoCompactThreshold, modelState.BackendSearch,
 			modelState.SupportsReasoningEffort, modelState.ReasoningEffort, modelState.ReasoningEfforts)
 	}
