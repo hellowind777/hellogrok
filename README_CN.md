@@ -6,7 +6,7 @@
 
 跨平台 Grok Build 本地代理，让自定义模型渠道兼容常见 API 格式、Build 原生 Web 工具、独立鉴权和自动配置恢复。
 
-[![Version](https://img.shields.io/badge/version-0.1.17-2f6feb.svg)](./internal/appinfo/appinfo.go)
+[![Version](https://img.shields.io/badge/version-0.1.18-2f6feb.svg)](./internal/appinfo/appinfo.go)
 [![Go](https://img.shields.io/badge/Go-1.26.6-00ADD8.svg)](./go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#平台支持)
@@ -57,6 +57,7 @@ hellogrok 为这些自定义渠道提供统一的本地兼容层。运行时准�
 - 转发前校验各协议的工具历史：Responses 调用必须有匹配的 `function_call_output`，Messages 的 `tool_use` 必须由紧邻的下一条 user 消息中的 `tool_result` 完整配对，Chat 工具调用必须有匹配的 tool 消息。确定性错误返回不可重试的 `400`，不会进入 Grok Build 重试循环。
 - 在私有 `keepalive`、`keep-alive`、`keep_alive`、`heartbeat`、`ping` 帧到达 Grok Build 前将其转换为标准 SSE 注释，不占用 Responses 事件序号；收到各协议的终止事件后立即关闭上游流。
 - 普通渠道的上游响应头等待及所有响应正文的两次读取间隔最多为 601 秒，比 Grok Build shell 默认的 600 秒多一秒；`api.deepseek.com` 官方路由使用 660 秒，以覆盖服务商记录的最长十分钟排队。请求没有总时限，非流式排队空行或规范化心跳等任意上游字节都会刷新空闲时限。
+- 为每个渠道维护独立的上游失败熔断器。同一渠道连续 4 次可重试上游失败（5xx、传输错误或错误正文读取失败）后，代理不再把请求转给上游，而是立即返回不可重试的 `503 proxy_circuit_open`（`X-Should-Retry: false`），让 Grok Build 立刻结束本轮，而不是空烧最多 15 次的重试预算。熔断后每 90 秒放行一次探测请求：成功则自动合闸，失败则重新计时；任何非 5xx 上游响应（含 429 限流）都会清零失败计数，响应头发送后的流式失败不受影响。
 - 在规范化前记录原始上游响应声明的模型，支持终止帧优先、大小写不敏感的不一致判断和多帧冲突标记，不改变路由或响应数据。
 - Messages 的 `thinking` 起始块缺少空 `signature` 时补齐该字段，同时保留供应商随后发送的真实 `signature_delta`，使 Messages 兼容中转可被 Grok Build 的严格原生解码器消费。
 - 在供应商边界保留每个渠道配置的上游 URL 路径和上游模型标识。
@@ -458,6 +459,17 @@ Responses 供应商继续使用 Responses。Messages 供应商接收 Messages �
 执行 `hellogrok routes` 并查看“状态与日志”，确认渠道 URL、后端、凭据来源、模型标识和服务商状态。上游故障、限流、不支持的载荷或被中转丢弃的搜索工具需要由服务商或中转解决。
 
 hellogrok 会保留上游状态和错误正文。结构化鉴权、权限、账单、余额或额度不足、无效请求和无效模型错误会收到 `X-Should-Retry: false`，让 Grok Build 显示原始供应商说明，而不是通过重复重试掩盖错误。结构化限流、超时、过载和临时不可用错误仍可重试。如果中转只返回通用 `503`，hellogrok 无法推断账号余额不足；中转必须提供账单错误代码或消息。
+
+### 一直显示正在重试
+
+Grok Build 对可重试状态码（429、5xx）最多重试 15 次，单轮最长约 5.5 分钟。当中转渠道的源站持续宕机（例如 Cloudflare `502 The origin web server returned an invalid or incomplete response`）时，每一轮都会把这 15 次重试全部烧完，界面会长时间停在“重试中”，看起来像渠道彻底不可用。
+
+从当前版本起，hellogrok 为每个渠道维护独立熔断器：同一渠道连续 4 次可重试上游失败后，代理不再把请求转给上游，而是立即返回不可重试的 `503 proxy_circuit_open`（`X-Should-Retry: false`），让 Grok Build 立刻结束本轮并显示错误，而不是空烧重试预算。熔断后每 90 秒放行一次探测请求：上游恢复则自动合闸继续使用；探测仍失败则重新计时。任何非 5xx 上游响应（含 429 限流）都会清零失败计数，不触发熔断。
+
+看到 `proxy_circuit_open` 时：
+
+- 渠道只是暂时不可用时，等 90 秒再发消息即可自动恢复，无需重启代理或重新选择模型。
+- 连续看到该错误说明该中转源站长期故障，请切换到其它渠道（`/model`），或在代理日志中确认 `UP breaker` 记录的中转状态。
 
 502 也可能表示上游返回了结构不完整的成功响应。hellogrok 会在转发前校验 Responses、Messages 或 Chat Completions 的最小响应结构，日志会指出缺失或类型错误的字段。
 

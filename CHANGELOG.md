@@ -4,8 +4,12 @@ All notable changes to this project are documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.18] — 2026-08-28
 
+### Added
+
+- Per-channel upstream failure circuit breaker. Grok Build retries retryable statuses up to 15 times (≈5.5 minutes per turn), so a channel whose relay is down leaves the user stuck in the "retrying" phase until every attempt fails. After 4 consecutive retryable upstream failures (5xx, transport errors, or error-body read failures) the proxy now answers immediately with a non-retryable `503 proxy_circuit_open` and `X-Should-Retry: false`, so the turn fails fast instead of burning the retry budget. A single probe request is allowed through after a 90-second cooldown: success closes the breaker automatically, failure re-arms it. Any non-5xx upstream response (including 429) resets the failure streak, and each channel has an independent breaker. Streaming failures that occur after headers are sent are unaffected.
+10→
 ## [0.1.17] — 2026-08-16
 
 ### Changed
@@ -279,7 +283,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - CC Switch compatibility detection and conflict warnings.
 - Builds for Windows, Linux, and macOS on amd64 and arm64.
 
-[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.17...HEAD
+[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.18...HEAD
+[0.1.18]: https://github.com/hellowind777/hellogrok/compare/v0.1.17...v0.1.18
 [0.1.17]: https://github.com/hellowind777/hellogrok/compare/v0.1.16...v0.1.17
 [0.1.16]: https://github.com/hellowind777/hellogrok/compare/v0.1.15...v0.1.16
 [0.1.15]: https://github.com/hellowind777/hellogrok/compare/v0.1.14...v0.1.15

@@ -1,17 +1,9 @@
-# Release Notes — v0.1.17
+# Release Notes — v0.1.18
 
-## Custom channels retain their identity across `/resume`
+## Channels with a dead relay fail fast instead of stalling
 
-Every proxied custom channel now uses its model-table ID as the runtime identity seen and persisted by Grok Build. The configured `model` remains the upstream wire model and is restored byte-for-byte when the proxy stops.
+Grok Build retries retryable statuses (429, 5xx) up to 15 times, roughly 5.5 minutes per turn. When a relay's origin stayed down, every turn burned that entire retry budget and the UI stayed in the "retrying" phase, making the channel look permanently unusable.
 
-Sessions can therefore resume through the channel that created them even when several custom channels and an official model share the same upstream model name, such as `grok-4.6`. Historical summaries that already contain only the shared model name require one manual model reselection.
+hellogrok now keeps an independent circuit breaker per channel. After 4 consecutive retryable upstream failures (5xx, transport errors, or error-body read failures), the proxy stops forwarding and immediately answers a non-retryable `503 proxy_circuit_open` with `X-Should-Retry: false`, so Grok Build fails the turn right away. After a 90-second cooldown one probe request is allowed through: success closes the breaker automatically and the channel keeps working, failure re-arms the cooldown. Any non-5xx upstream response, including 429, resets the failure streak. Streaming failures that occur after response headers are sent are unaffected.
 
-## Provider errors remain actionable
-
-hellogrok now preserves upstream error status and body while deriving retry behavior from structured error codes and messages. Authentication, permission, billing, insufficient balance or quota, invalid request, and invalid model failures are non-retryable; rate limits, timeouts, overload, and temporary service failures remain retryable. An explicit upstream `X-Should-Retry` header takes precedence.
-
-This allows billing and account failures from compatible relays to reach the conversation instead of being hidden behind generic retries.
-
-## Stopped sessions receive a clear diagnostic
-
-An ordinary proxy stop keeps a diagnostic listener for stale sessions and returns a structured, non-retryable `proxy_stopped` response that asks the user to reselect a model. Tray **Exit** always closes the listener and releases the local port after attempting configuration recovery, including when cleanup must be deferred.
+When `proxy_circuit_open` appears, wait about 90 seconds and retry for a temporary outage; if the error repeats, the relay's origin is down for the long term and the channel should be switched with `/model`. The proxy log records breaker transitions as `UP breaker` lines.

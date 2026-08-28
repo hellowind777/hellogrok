@@ -48,6 +48,7 @@ type Server struct {
 	shutdownTimeout         time.Duration
 	bodyIdleTimeout         time.Duration
 	deepSeekBodyIdleTimeout time.Duration
+	breakers                *breakerStore
 
 	probedMu         sync.Mutex
 	probed           map[string]bool
@@ -98,6 +99,7 @@ func newServer(logger *log.Logger, reasoningPath string) *Server {
 		shutdownTimeout:         5 * time.Second,
 		bodyIdleTimeout:         defaultUpstreamBodyIdleTimeout,
 		deepSeekBodyIdleTimeout: defaultDeepSeekBodyIdleTimeout,
+		breakers:                newBreakerStore(),
 		requestCtx:              requestCtx,
 		requestCancel:           requestCancel,
 		probed:                  map[string]bool{},
@@ -159,6 +161,7 @@ func (s *Server) Enable() {
 	}
 	s.connections.Open()
 	s.lifecycleMu.Unlock()
+	s.breakers.reset()
 	s.mu.Lock()
 	s.enabled = true
 	s.mu.Unlock()

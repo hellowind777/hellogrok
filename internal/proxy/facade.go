@@ -70,6 +70,11 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 		writeJSONError(w, http.StatusUnauthorized, "custom channel has no channel-owned credential")
 		return
 	}
+	if !s.breakers.allow(route.ChannelID) {
+		s.log.Printf("UP breaker fast-fail channel=%s: upstream circuit open", route.ChannelID)
+		writeTypedJSONError(w, http.StatusServiceUnavailable, circuitOpenErrorMessage, "proxy_circuit_open", false)
+		return
+	}
 
 	tools, webSearch, hostedSearch, functionSearch, xSearch := summarizeBody(request.Body)
 	logTarget := safeDiagnosticTarget(target)
@@ -137,6 +142,7 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 		if err != nil {
 			detail := safeUpstreamError(err)
 			s.log.Printf("UP channel=%s request failed: %s", route.ChannelID, detail)
+			s.logBreakerTransition(route.ChannelID, s.breakers.recordFailure(route.ChannelID))
 			if isUpstreamTimeout(err) {
 				writeRetryableJSONError(w, http.StatusGatewayTimeout, "upstream timed out before returning response headers")
 				return
@@ -167,10 +173,12 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 		_ = response.Body.Close()
 		if readErr != nil {
 			if errors.Is(readErr, errUpstreamBodyIdleTimeout) {
+				s.logBreakerTransition(route.ChannelID, s.breakers.recordFailure(route.ChannelID))
 				writeRetryableJSONError(w, http.StatusGatewayTimeout, "upstream timed out waiting for error response body data")
 			} else if errors.Is(readErr, errBodyTooLarge) {
 				writeJSONError(w, http.StatusBadGateway, "upstream error body exceeds 64 MiB")
 			} else {
+				s.logBreakerTransition(route.ChannelID, s.breakers.recordFailure(route.ChannelID))
 				writeRetryableJSONError(w, http.StatusBadGateway, "read upstream error response: "+readErr.Error())
 			}
 			return
@@ -235,15 +243,26 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 			w.Header().Set(grokContextWindowHeader, fmt.Sprintf("%d", discoveredContextWindow))
 		}
 		copySafeResponseHeaders(w.Header(), response.Header)
-		setRetryDisposition(w.Header(), response.StatusCode, data)
+		retryable := setRetryDisposition(w.Header(), response.StatusCode, data)
 		if reasoningRejected {
 			w.Header().Set("X-Should-Retry", "false")
+			retryable = false
+		}
+		if response.StatusCode >= http.StatusInternalServerError {
+			if retryable {
+				s.logBreakerTransition(route.ChannelID, s.breakers.recordFailure(route.ChannelID))
+			}
+		} else if s.breakers.recordSuccess(route.ChannelID) {
+			s.log.Printf("UP breaker channel=%s closed after upstream response", route.ChannelID)
 		}
 		w.WriteHeader(response.StatusCode)
 		_, _ = w.Write(data)
 		return
 	}
 	defer response.Body.Close()
+	if s.breakers.recordSuccess(route.ChannelID) {
+		s.log.Printf("UP breaker channel=%s closed after upstream response", route.ChannelID)
+	}
 	mergeGrokModelHeaders(w.Header(), response.Header)
 	if !positiveModelHeader(w.Header().Get(grokContextWindowHeader), 64) && discoveredContextWindow > 0 {
 		w.Header().Set(grokContextWindowHeader, fmt.Sprintf("%d", discoveredContextWindow))
@@ -438,9 +457,11 @@ func requestKindLabel(kind facadeRequestKind) string {
 	return "native_session"
 }
 
-func setRetryDisposition(header http.Header, status int, body []byte) {
-	if strings.TrimSpace(header.Get("X-Should-Retry")) != "" {
-		return
+func setRetryDisposition(header http.Header, status int, body []byte) bool {
+	if upstreamHint := strings.TrimSpace(header.Get("X-Should-Retry")); upstreamHint != "" {
+		// An explicit upstream override wins; report its effective value so
+		// breaker accounting matches what Grok Build will actually retry.
+		return !strings.EqualFold(upstreamHint, "false")
 	}
 	retry := status == http.StatusTooManyRequests || status == http.StatusInternalServerError ||
 		status == http.StatusBadGateway || status == http.StatusServiceUnavailable || status == http.StatusGatewayTimeout
@@ -448,6 +469,17 @@ func setRetryDisposition(header http.Header, status int, body []byte) {
 		retry = value
 	}
 	header.Set("X-Should-Retry", fmt.Sprintf("%t", retry))
+	return retry
+}
+
+func (s *Server) logBreakerTransition(channel string, transition breakerTransition) {
+	switch transition {
+	case breakerOpened:
+		s.log.Printf("UP breaker channel=%s opened after %d consecutive retryable upstream failures",
+			channel, circuitOpenThreshold)
+	case breakerProbeFailed:
+		s.log.Printf("UP breaker channel=%s probe failed; cooldown re-armed", channel)
+	}
 }
 
 func classifyStructuredRetry(body []byte) (bool, bool) {

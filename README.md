@@ -6,7 +6,7 @@
 
 A cross-platform local proxy that makes Grok Build custom model channels work with common API formats, native Web tools, isolated authentication, and automatic configuration recovery.
 
-[![Version](https://img.shields.io/badge/version-0.1.17-2f6feb.svg)](./internal/appinfo/appinfo.go)
+[![Version](https://img.shields.io/badge/version-0.1.18-2f6feb.svg)](./internal/appinfo/appinfo.go)
 [![Go](https://img.shields.io/badge/Go-1.26.6-00ADD8.svg)](./go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#platform-support)
@@ -57,6 +57,7 @@ It is intended for users who maintain multiple third-party model channels and wa
 - Validates protocol tool history before forwarding: Responses calls require matching `function_call_output` items, Messages `tool_use` blocks require `tool_result` blocks in the immediately following user message, and Chat tool calls require matching tool messages. Deterministic failures return a non-retryable `400` instead of entering Grok Build's retry loop.
 - Converts provider-private `keepalive`, `keep-alive`, `keep_alive`, `heartbeat`, and `ping` frames into standard SSE comments before they reach Grok Build, without consuming Responses sequence numbers, and closes each upstream stream as soon as its protocol terminal event arrives.
 - Bounds ordinary upstream response-header waits and gaps between reads from every response body at 601 seconds, one second beyond Grok Build's 600-second shell default. First-party `api.deepseek.com` routes use 660 seconds to cover the provider's documented ten-minute queue. There is no total request deadline, and every upstream byte, including a non-streaming queue newline or normalized heartbeat, renews the idle window.
+- Keeps an independent circuit breaker per channel. After 4 consecutive retryable upstream failures (5xx, transport errors, or error-body read failures), the proxy stops forwarding and immediately answers a non-retryable `503 proxy_circuit_open` with `X-Should-Retry: false`, so Grok Build fails the turn right away instead of burning its 15-attempt retry budget. A single probe request is allowed through after a 90-second cooldown: success closes the breaker automatically, failure re-arms it. Any non-5xx upstream response (including 429) resets the failure streak; streaming failures after headers are sent are unaffected.
 - Logs the model declared by the raw upstream response before normalization, including terminal-frame precedence, case-insensitive mismatch detection, and conflicting declarations, without changing routing or response data.
 - Completes a missing empty `signature` on Messages `thinking` block starts while preserving the provider's later `signature_delta`, so Messages-compatible relays remain consumable by Grok Build's strict native decoder.
 - Preserves each configured upstream URL path and wire-model identifier at the provider boundary.
@@ -460,6 +461,17 @@ Run `hellogrok routes` and inspect **Status and logs**. Confirm the channel URL,
 hellogrok preserves the upstream status and error body. Structured authentication, permission, billing, insufficient-balance/quota, invalid-request, and invalid-model errors receive `X-Should-Retry: false`, so Grok Build can show the original provider explanation instead of hiding it behind repeated retries. Structured rate-limit, timeout, overload, and temporary-unavailable errors remain retryable. If a relay returns only a generic `503`, hellogrok cannot infer that the account is out of balance; the relay must return a billing code or message.
 
 A 502 can also mean that an upstream returned a malformed success response. hellogrok validates the minimum Responses, Messages, or Chat Completions envelope before forwarding it; the log identifies the missing or invalid field.
+
+### Stuck on “retrying” forever
+
+Grok Build retries retryable statuses (429, 5xx) up to 15 times, roughly 5.5 minutes per turn. When a relay's origin stays down (for example a Cloudflare `502 The origin web server returned an invalid or incomplete response`), every turn burns that entire retry budget and the UI stays in the retrying phase, making the channel look permanently unusable.
+
+Current hellogrok releases keep an independent circuit breaker per channel: after 4 consecutive retryable upstream failures the proxy stops forwarding and immediately answers `503 proxy_circuit_open` with `X-Should-Retry: false`, so Grok Build fails the turn right away instead of burning the retry budget. After a 90-second cooldown one probe request is allowed through: success closes the breaker automatically and the channel keeps working; failure re-arms the cooldown. Any non-5xx upstream response (including 429) resets the failure streak and never opens the breaker.
+
+When you see `proxy_circuit_open`:
+
+- If the outage is temporary, wait about 90 seconds and send again; the channel recovers automatically without restarting the proxy or reselecting the model.
+- If the error repeats, the relay's origin is down for the long term: switch to another channel with `/model`, and check the `UP breaker` lines in the proxy log for the relay status.
 
 Prefer `[model."full.ID"]` when a channel ID contains dots. TOML interprets an unquoted `[model.foo.bar]` as nested tables, so Grok Build originally sees only `foo`; hellogrok temporarily normalizes and validates that header while enabled. Dots or dashes in `name` do not participate in authentication.
 
