@@ -612,6 +612,112 @@ func TestContextDetailsDerivationIsOptInAndPreservesProviderValue(t *testing.T) 
 	}
 }
 
+func TestUsageLargerThanContextWindowRemainsUnknown(t *testing.T) {
+	raw := `{"id":"resp_1","object":"response","created_at":1,"status":"completed","model":"m","output":[],"usage":{"input_tokens":1727149,"output_tokens":6514,"total_tokens":1733663}}`
+	discarded := false
+	patched := PatchJSONBytes([]byte(raw), Options{
+		GPTResponses:            true,
+		ContextDetailsFromUsage: true,
+		ContextWindow:           1_000_000,
+		UntrustedUsage: func(input, output int64) {
+			discarded = true
+			if input != 1_727_149 || output != 6_514 {
+				t.Fatalf("discarded counts = %d %d", input, output)
+			}
+		},
+	})
+	var response map[string]any
+	if err := json.Unmarshal(patched, &response); err != nil {
+		t.Fatal(err)
+	}
+	if response["usage"] != nil || !discarded {
+		t.Fatalf("cumulative billing usage reached Grok Build: %s discarded=%t", patched, discarded)
+	}
+}
+
+func TestUsageInsideContextWindowStillProjectsLiveContext(t *testing.T) {
+	raw := `{"id":"resp_1","object":"response","created_at":1,"status":"completed","model":"m","output":[],"usage":{"input_tokens":571165,"output_tokens":3492,"total_tokens":574657}}`
+	patched := PatchJSONBytes([]byte(raw), Options{
+		GPTResponses:            true,
+		ContextDetailsFromUsage: true,
+		ContextWindow:           1_000_000,
+	})
+	var response map[string]any
+	if err := json.Unmarshal(patched, &response); err != nil {
+		t.Fatal(err)
+	}
+	usage := response["usage"].(map[string]any)
+	contextDetails := usage["context_details"].(map[string]any)
+	if usage["total_tokens"] != float64(574657) ||
+		contextDetails["input_tokens"] != float64(571165) ||
+		contextDetails["output_tokens"] != float64(3492) {
+		t.Fatalf("in-window usage was rewritten: %s", patched)
+	}
+}
+
+func TestUnknownContextWindowDoesNotDropLargeUsage(t *testing.T) {
+	raw := `{"id":"resp_1","object":"response","created_at":1,"status":"completed","model":"m","output":[],"usage":{"input_tokens":1727149,"output_tokens":6514,"total_tokens":1733663}}`
+	patched := PatchJSONBytes([]byte(raw), Options{GPTResponses: true, ContextDetailsFromUsage: true})
+	var response map[string]any
+	if err := json.Unmarshal(patched, &response); err != nil {
+		t.Fatal(err)
+	}
+	if response["usage"] == nil {
+		t.Fatal("unknown window dropped usage that could not be checked")
+	}
+}
+
+func TestOversizedContextDetailsFallBackToInWindowBilling(t *testing.T) {
+	raw := `{"id":"resp_1","object":"response","created_at":1,"status":"completed","model":"m","output":[],"usage":{"input_tokens":571165,"output_tokens":3492,"total_tokens":574657,"context_details":{"input_tokens":1727149,"output_tokens":6514}}}`
+	patched := PatchJSONBytes([]byte(raw), Options{
+		GPTResponses:            true,
+		ContextDetailsFromUsage: true,
+		ContextWindow:           1_000_000,
+	})
+	var response map[string]any
+	if err := json.Unmarshal(patched, &response); err != nil {
+		t.Fatal(err)
+	}
+	usage := response["usage"].(map[string]any)
+	contextDetails := usage["context_details"].(map[string]any)
+	if contextDetails["input_tokens"] != float64(571165) || contextDetails["output_tokens"] != float64(3492) {
+		t.Fatalf("in-window billing was not used after oversized context_details: %s", patched)
+	}
+}
+
+func TestOversizedContextDetailsAndBillingRemainUnknown(t *testing.T) {
+	raw := `{"id":"resp_1","object":"response","created_at":1,"status":"completed","model":"m","output":[],"usage":{"input_tokens":1727149,"output_tokens":6514,"total_tokens":1733663,"context_details":{"input_tokens":1800000,"output_tokens":1}}}`
+	patched := PatchJSONBytes([]byte(raw), Options{
+		GPTResponses:            true,
+		ContextDetailsFromUsage: true,
+		ContextWindow:           1_000_000,
+	})
+	var response map[string]any
+	if err := json.Unmarshal(patched, &response); err != nil {
+		t.Fatal(err)
+	}
+	if response["usage"] != nil {
+		t.Fatalf("untrustworthy live context reached Grok Build: %s", patched)
+	}
+}
+
+func TestInWindowContextDetailsSurviveOversizedBilling(t *testing.T) {
+	raw := `{"id":"resp_1","object":"response","created_at":1,"status":"completed","model":"m","output":[],"usage":{"input_tokens":1727149,"output_tokens":6514,"total_tokens":1733663,"context_details":{"input_tokens":571165,"output_tokens":3492}}}`
+	patched := PatchJSONBytes([]byte(raw), Options{
+		GPTResponses:            true,
+		ContextDetailsFromUsage: true,
+		ContextWindow:           1_000_000,
+	})
+	var response map[string]any
+	if err := json.Unmarshal(patched, &response); err != nil {
+		t.Fatal(err)
+	}
+	contextDetails := response["usage"].(map[string]any)["context_details"].(map[string]any)
+	if contextDetails["input_tokens"] != float64(571165) || contextDetails["output_tokens"] != float64(3492) {
+		t.Fatalf("trustworthy live context was discarded: %s", patched)
+	}
+}
+
 func TestPatchJSONBytesStrictRejectsTrailingContent(t *testing.T) {
 	for _, input := range [][]byte{
 		[]byte(`{"object":"response","output":[]} {"second":true}`),

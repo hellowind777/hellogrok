@@ -284,13 +284,7 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 		}
 		switch request.Protocol {
 		case wireResponses:
-			options := patch.Options{
-				GPTResponses:            true,
-				WebSearch:               true,
-				RequestModel:            responseModelForRoute(route),
-				ContextDetailsFromUsage: true,
-			}
-			s.streamResponsesSSE(w, response, route, request, options, started)
+			s.streamResponsesSSE(w, response, route, request, s.responsesPatchOptions(route, response.Header), started)
 		case wireMessages:
 			s.streamMessagesSSE(w, response, route, request, started)
 		case wireChatCompletions:
@@ -328,7 +322,7 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 	if request.IncomingProtocol == wireResponses {
 		switch request.Protocol {
 		case wireResponses:
-			canonical, normalized, normalizeErr := s.normalizeResponsesJSON(data, route, request)
+			canonical, normalized, normalizeErr := s.normalizeResponsesJSON(data, route, request, response.Header)
 			if normalizeErr != nil {
 				writeJSONError(w, http.StatusBadGateway, "invalid upstream Responses body: "+normalizeErr.Error())
 				return
@@ -353,7 +347,7 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 
 	switch request.Protocol {
 	case wireResponses:
-		canonical, normalized, normalizeErr := s.normalizeResponsesJSON(data, route, request)
+		canonical, normalized, normalizeErr := s.normalizeResponsesJSON(data, route, request, response.Header)
 		if normalizeErr != nil {
 			writeJSONError(w, http.StatusBadGateway, "invalid upstream Responses body: "+normalizeErr.Error())
 			return
@@ -369,7 +363,7 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 		copySafeResponseHeaders(w.Header(), response.Header)
 		writeJSONBody(w, response.StatusCode, normalized)
 	case wireMessages:
-		root, normalized, normalizeErr := s.normalizeNativeJSON(data, route, request, validateNativeMessagesEnvelope)
+		root, normalized, normalizeErr := s.normalizeNativeJSON(data, route, request, response.Header, validateNativeMessagesEnvelope)
 		if normalizeErr != nil {
 			writeJSONError(w, http.StatusBadGateway, "invalid upstream Messages body: "+normalizeErr.Error())
 			return
@@ -385,7 +379,7 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 		copySafeResponseHeaders(w.Header(), response.Header)
 		writeJSONBody(w, response.StatusCode, normalized)
 	case wireChatCompletions:
-		root, normalized, normalizeErr := s.normalizeNativeJSON(data, route, request, validateNativeChatEnvelope)
+		root, normalized, normalizeErr := s.normalizeNativeJSON(data, route, request, response.Header, validateNativeChatEnvelope)
 		if normalizeErr != nil {
 			if errors.Is(normalizeErr, errDeepSeekInsufficientSystemResource) {
 				writeRetryableJSONError(w, http.StatusServiceUnavailable, normalizeErr.Error())
@@ -433,7 +427,12 @@ func (s *Server) writeTranslatedResponse(
 		writeJSONError(w, http.StatusBadGateway, "invalid upstream response: "+err.Error())
 		return
 	}
+	hadUsage := result.UsagePresent
 	canonical := canonicalResponse(route, request, result)
+	if hadUsage && canonical["usage"] == nil && liveContextWindow(route, upstreamHeader) > 0 {
+		s.log.Printf("UP channel=%s usage discarded: live context exceeds window input=%d output=%d window=%d",
+			route.ChannelID, result.InputTokens, result.OutputTokens, liveContextWindow(route, upstreamHeader))
+	}
 	restoreClientWebSearchAlias(canonical, request.ClientSearchAlias, wireResponses)
 	backfillResponseSearchSources(canonical, request.HostedWebSearch, request.SearchQuery)
 	if err := validateResponsesEnvelope(canonical); err != nil {
@@ -565,18 +564,43 @@ func containsErrorPhrase(message string, phrases ...string) bool {
 	return false
 }
 
-func (s *Server) normalizeResponsesJSON(data []byte, route config.Route, request facadeRequest) (map[string]any, []byte, error) {
-	data, err := restoreClientWebSearchAliasJSON(data, request.ClientSearchAlias, wireResponses)
-	if err != nil {
-		return nil, nil, fmt.Errorf("restore client search alias: %w", err)
-	}
+func (s *Server) responsesPatchOptions(route config.Route, header http.Header) patch.Options {
+	window := liveContextWindow(route, header)
 	options := patch.Options{
 		GPTResponses:            true,
 		WebSearch:               true,
 		RequestModel:            responseModelForRoute(route),
 		ContextDetailsFromUsage: true,
+		ContextWindow:           window,
 	}
-	data, err = patch.PatchJSONBytesStrict(data, options)
+	if window > 0 {
+		channel := route.ChannelID
+		options.UntrustedUsage = func(input, output int64) {
+			s.log.Printf("UP channel=%s usage discarded: live context exceeds window input=%d output=%d window=%d",
+				channel, input, output, window)
+		}
+	}
+	return options
+}
+
+func liveContextWindow(route config.Route, header http.Header) uint64 {
+	if route.ContextWindow > 0 {
+		return route.ContextWindow
+	}
+	if header != nil {
+		if value, ok := positiveCapacityHeader(header.Get(grokContextWindowHeader), 64); ok {
+			return value
+		}
+	}
+	return 0
+}
+
+func (s *Server) normalizeResponsesJSON(data []byte, route config.Route, request facadeRequest, header http.Header) (map[string]any, []byte, error) {
+	data, err := restoreClientWebSearchAliasJSON(data, request.ClientSearchAlias, wireResponses)
+	if err != nil {
+		return nil, nil, fmt.Errorf("restore client search alias: %w", err)
+	}
+	data, err = patch.PatchJSONBytesStrict(data, s.responsesPatchOptions(route, header))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -604,6 +628,7 @@ func (s *Server) normalizeNativeJSON(
 	data []byte,
 	route config.Route,
 	request facadeRequest,
+	header http.Header,
 	validate func(map[string]any) error,
 ) (map[string]any, []byte, error) {
 	root, err := decodeJSONMap(data)
@@ -619,8 +644,14 @@ func (s *Server) normalizeNativeJSON(
 		stripMessagesHostedSearchBlocks(root)
 	}
 	if request.Protocol == wireChatCompletions {
+		window := liveContextWindow(route, header)
+		hadUsage := root["usage"] != nil
 		normalizeNativeChatRequiredFields(root, route, false, compatID("chatcmpl"), time.Now().Unix())
-		normalizeNativeChatUsage(root)
+		normalizeNativeChatUsage(root, window)
+		if hadUsage && root["usage"] == nil && window > 0 {
+			s.log.Printf("UP channel=%s usage discarded: live context exceeds window window=%d",
+				route.ChannelID, window)
+		}
 	}
 	setDownstreamResponseModel(root, responseModelForRoute(route))
 	if err := validate(root); err != nil {
@@ -643,7 +674,7 @@ func (s *Server) writeClientSearchResponse(
 	var canonical map[string]any
 	var err error
 	if request.Protocol == wireResponses {
-		canonical, _, err = s.normalizeResponsesJSON(data, route, request)
+		canonical, _, err = s.normalizeResponsesJSON(data, route, request, upstreamHeader)
 	} else {
 		var result canonicalResult
 		if request.Protocol == wireMessages {
@@ -652,7 +683,12 @@ func (s *Server) writeClientSearchResponse(
 			result, err = canonicalFromChat(data, true, request.SearchQuery)
 		}
 		if err == nil {
+			hadUsage := result.UsagePresent
 			canonical = canonicalResponse(route, request, result)
+			if hadUsage && canonical["usage"] == nil && liveContextWindow(route, upstreamHeader) > 0 {
+				s.log.Printf("UP channel=%s usage discarded: live context exceeds window input=%d output=%d window=%d",
+					route.ChannelID, result.InputTokens, result.OutputTokens, liveContextWindow(route, upstreamHeader))
+			}
 			restoreClientWebSearchAlias(canonical, request.ClientSearchAlias, wireResponses)
 			backfillResponseSearchSources(canonical, true, request.SearchQuery)
 			err = validateResponsesEnvelope(canonical)

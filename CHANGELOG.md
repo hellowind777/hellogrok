@@ -4,6 +4,12 @@ All notable changes to this project are documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.19] — 2026-08-29
+
+### Fixed
+
+- Provider token counts larger than the known `context_window` are no longer forwarded as Grok Build live context. Hosted-search billing totals, oversized `context_details`, and translated Messages/Chat measurements that cannot be the prompt of a successful request become `usage: null`, so Grok keeps the previous baseline instead of compacting on a 1.7M / 1.0M display. Ordinary in-window usage is unchanged.
+
 ## [0.1.18] — 2026-08-28
 
 ### Added
@@ -283,7 +289,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - CC Switch compatibility detection and conflict warnings.
 - Builds for Windows, Linux, and macOS on amd64 and arm64.
 
-[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.18...HEAD
+[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.19...HEAD
+[0.1.19]: https://github.com/hellowind777/hellogrok/compare/v0.1.18...v0.1.19
 [0.1.18]: https://github.com/hellowind777/hellogrok/compare/v0.1.17...v0.1.18
 [0.1.17]: https://github.com/hellowind777/hellogrok/compare/v0.1.16...v0.1.17
 [0.1.16]: https://github.com/hellowind777/hellogrok/compare/v0.1.15...v0.1.16

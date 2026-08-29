@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hellowind777/hellogrok/internal/capacity"
 	"github.com/hellowind777/hellogrok/internal/config"
 )
 
@@ -703,7 +704,7 @@ func validateMessagesDeltaBody(delta map[string]any) error {
 // live-context total is normalized from complete input/output counts because
 // Grok Build's Chat consumer uses total_tokens directly. DeepSeek's cache-hit
 // field is projected only after the complete measurement has passed validation.
-func normalizeNativeChatUsage(root map[string]any) {
+func normalizeNativeChatUsage(root map[string]any, window uint64) {
 	rawUsage, present := root["usage"]
 	if !present || rawUsage == nil {
 		return
@@ -719,6 +720,12 @@ func normalizeNativeChatUsage(root map[string]any) {
 			"accepted_prediction_tokens",
 			"rejected_prediction_tokens",
 		) || !validOptionalChatCost(usage) {
+		root["usage"] = nil
+		return
+	}
+	prompt, _, _ := firstCanonicalToken(usage, "prompt_tokens", "input_tokens")
+	completion, _, _ := firstCanonicalToken(usage, "completion_tokens", "output_tokens")
+	if !intFitsLiveContext(window, prompt, completion) {
 		root["usage"] = nil
 		return
 	}
@@ -1247,6 +1254,25 @@ func nonEmptyJSONValue(value any) bool {
 	}
 }
 
+func liveContextFitsRoute(route config.Route, result canonicalResult) bool {
+	input, output := result.InputTokens, result.OutputTokens
+	if !result.LiveContextPresent {
+		input, output = result.TotalTokens, 0
+	}
+	return intFitsLiveContext(route.ContextWindow, input, output)
+}
+
+func intFitsLiveContext(window uint64, counts ...int64) bool {
+	converted := make([]uint64, len(counts))
+	for i, count := range counts {
+		if count < 0 {
+			return window == 0
+		}
+		converted[i] = uint64(count)
+	}
+	return capacity.FitsLiveContext(window, converted...)
+}
+
 func canonicalResponse(route config.Route, request facadeRequest, result canonicalResult) map[string]any {
 	now := time.Now().Unix()
 	status := "completed"
@@ -1260,7 +1286,7 @@ func canonicalResponse(route config.Route, request facadeRequest, result canonic
 		incomplete = map[string]any{"reason": result.IncompleteReason}
 	}
 	var usage any
-	if result.UsagePresent {
+	if result.UsagePresent && liveContextFitsRoute(route, result) {
 		measurement := map[string]any{
 			"input_tokens":  result.InputTokens,
 			"output_tokens": result.OutputTokens,

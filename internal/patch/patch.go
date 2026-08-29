@@ -11,6 +11,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/hellowind777/hellogrok/internal/capacity"
 )
 
 var (
@@ -23,6 +25,13 @@ type Options struct {
 	WebSearch               bool
 	RequestModel            string
 	ContextDetailsFromUsage bool
+	// ContextWindow is the window Grok Build uses as its auto-compaction
+	// denominator. A live-context measurement larger than this cannot be the
+	// prompt of a successful request and is discarded. Zero means unknown.
+	ContextWindow uint64
+	// UntrustedUsage is invoked when a complete measurement is dropped because
+	// it cannot be live context. It must not log request content.
+	UntrustedUsage func(input, output int64)
 }
 
 // Output-item types that Grok's Responses deserializer typically requires an id on.
@@ -235,18 +244,21 @@ func ensureResponse(m map[string]any, opt Options, ctx string) {
 		}
 	}
 	usage, ok := m["usage"].(map[string]any)
-	contextInput, contextOutput, addContextDetails := contextDetailsFromUsage(usage, opt.ContextDetailsFromUsage)
-	if !ok || !normalizeUsageTokenFields(usage) {
+	if !ok || !normalizeUsageTokenFields(usage) || !trustLiveContextUsage(usage, opt) {
 		// Grok Build treats total_tokens as the current complete context size.
 		// An invented or partial value would corrupt that counter and postpone
 		// auto-compaction, so an unusable provider measurement stays unknown.
 		m["usage"] = nil
 		return
 	}
+	contextInput, contextOutput, addContextDetails := contextDetailsFromUsage(usage, opt.ContextDetailsFromUsage)
 	if addContextDetails {
 		usage["context_details"] = map[string]any{
 			"input_tokens":  contextInput,
 			"output_tokens": contextOutput,
+		}
+		if !trustLiveContextUsage(usage, opt) {
+			m["usage"] = nil
 		}
 	}
 }
@@ -468,6 +480,62 @@ func missingOrEmpty(m map[string]any, key string) bool {
 }
 
 const maxWireTokenCount = int64(^uint32(0))
+
+func trustLiveContextUsage(usage map[string]any, opt Options) bool {
+	if usage == nil {
+		return false
+	}
+	if details, _ := usage["context_details"].(map[string]any); details != nil {
+		input, hasInput, validInput := optionalTokenCount(details, "input_tokens")
+		output, hasOutput, validOutput := optionalTokenCount(details, "output_tokens")
+		if hasInput && hasOutput && validInput && validOutput &&
+			!intFitsWindow(opt.ContextWindow, input, output) {
+			delete(usage, "context_details")
+		}
+	}
+	input, output, ok := liveContextCounts(usage)
+	if !ok {
+		return true
+	}
+	if intFitsWindow(opt.ContextWindow, input, output) {
+		return true
+	}
+	if opt.UntrustedUsage != nil {
+		opt.UntrustedUsage(input, output)
+	}
+	return false
+}
+
+func liveContextCounts(usage map[string]any) (int64, int64, bool) {
+	if details, _ := usage["context_details"].(map[string]any); details != nil {
+		input, hasInput, validInput := optionalTokenCount(details, "input_tokens")
+		output, hasOutput, validOutput := optionalTokenCount(details, "output_tokens")
+		if hasInput && hasOutput && validInput && validOutput {
+			return input, output, true
+		}
+	}
+	input, hasInput, validInput := canonicalUsageTokenCount(usage, "input_tokens", "prompt_tokens")
+	output, hasOutput, validOutput := canonicalUsageTokenCount(usage, "output_tokens", "completion_tokens")
+	if hasInput && hasOutput && validInput && validOutput {
+		return input, output, true
+	}
+	total, hasTotal, validTotal := optionalTokenCount(usage, "total_tokens")
+	if hasTotal && validTotal {
+		return total, 0, true
+	}
+	return 0, 0, false
+}
+
+func intFitsWindow(window uint64, counts ...int64) bool {
+	converted := make([]uint64, len(counts))
+	for i, count := range counts {
+		if count < 0 {
+			return window == 0
+		}
+		converted[i] = uint64(count)
+	}
+	return capacity.FitsLiveContext(window, converted...)
+}
 
 func contextDetailsFromUsage(usage map[string]any, enabled bool) (int64, int64, bool) {
 	if !enabled || usage == nil {

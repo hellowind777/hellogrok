@@ -12,6 +12,20 @@ import (
 	"github.com/hellowind777/hellogrok/internal/config"
 )
 
+func TestLiveContextWindowPrefersConfiguredRoute(t *testing.T) {
+	header := http.Header{}
+	header.Set(grokContextWindowHeader, "262144")
+	if got := liveContextWindow(config.Route{ContextWindow: 1_000_000}, header); got != 1_000_000 {
+		t.Fatalf("configured window = %d, want 1000000", got)
+	}
+	if got := liveContextWindow(config.Route{}, header); got != 262144 {
+		t.Fatalf("header window = %d, want 262144", got)
+	}
+	if got := liveContextWindow(config.Route{}, nil); got != 0 {
+		t.Fatalf("unknown window = %d, want 0", got)
+	}
+}
+
 func TestTranslatedUsageAbsenceDoesNotInventZero(t *testing.T) {
 	messagesBodies := []string{
 		`{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"wire","stop_reason":"end_turn"}`,
@@ -151,6 +165,50 @@ func TestTranslatedUsageDoesNotEmitOverflowingLiveContext(t *testing.T) {
 		if _, exists := usage["context_details"]; exists {
 			t.Fatalf("overflowing live context was emitted: %#v", usage)
 		}
+	}
+}
+
+func TestTranslatedUsageLargerThanContextWindowRemainsUnknown(t *testing.T) {
+	route := config.Route{ContextWindow: 1_000_000}
+	for _, apply := range []func(*canonicalResult, any){applyMessagesUsage, applyChatUsage} {
+		var result canonicalResult
+		apply(&result, map[string]any{
+			"input_tokens":      1_727_149,
+			"prompt_tokens":     1_727_149,
+			"output_tokens":     6_514,
+			"completion_tokens": 6_514,
+			"total_tokens":      1_733_663,
+		})
+		if !result.UsagePresent || !result.LiveContextPresent {
+			t.Fatalf("complete usage was rejected before the window guard: %#v", result)
+		}
+		if canonicalResponse(route, facadeRequest{}, result)["usage"] != nil {
+			t.Fatalf("cumulative billing usage reached Grok Build: %#v", result)
+		}
+	}
+}
+
+func TestTranslatedUsageInsideContextWindowIsKept(t *testing.T) {
+	var result canonicalResult
+	applyChatUsage(&result, map[string]any{
+		"prompt_tokens": 571_165, "completion_tokens": 3_492, "total_tokens": 574_657,
+	})
+	usage := canonicalResponse(config.Route{ContextWindow: 1_000_000}, facadeRequest{}, result)["usage"].(map[string]any)
+	contextDetails := usage["context_details"].(map[string]any)
+	if usage["total_tokens"] != int64(574_657) ||
+		contextDetails["input_tokens"] != int64(571_165) ||
+		contextDetails["output_tokens"] != int64(3_492) {
+		t.Fatalf("in-window translated usage was rewritten: %#v", usage)
+	}
+}
+
+func TestNativeChatUsageLargerThanContextWindowRemainsUnknown(t *testing.T) {
+	root := map[string]any{"usage": map[string]any{
+		"prompt_tokens": 1_727_149, "completion_tokens": 6_514, "total_tokens": 1_733_663,
+	}}
+	normalizeNativeChatUsage(root, 1_000_000)
+	if root["usage"] != nil {
+		t.Fatalf("cumulative Chat usage reached Grok Build: %#v", root["usage"])
 	}
 }
 
@@ -680,7 +738,7 @@ func TestNormalizeNativeChatUsage(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			root := map[string]any{"usage": test.usage}
-			normalizeNativeChatUsage(root)
+			normalizeNativeChatUsage(root, 0)
 			if test.wantNull {
 				if root["usage"] != nil {
 					t.Fatalf("usage=%#v want null", root["usage"])
@@ -973,7 +1031,7 @@ func TestNativeChatNormalizationAndValidationMatchGrokBuildTypes(t *testing.T) {
 		t.Fatal(err)
 	}
 	normalizeNativeChatRequiredFields(response, route, false, "chatcmpl_fallback", 123)
-	normalizeNativeChatUsage(response)
+	normalizeNativeChatUsage(response, 0)
 	if err := validateNativeChatEnvelope(response); err != nil {
 		t.Fatalf("normalized Chat response was rejected: %v; %#v", err, response)
 	}
@@ -991,7 +1049,7 @@ func TestNativeChatNormalizationAndValidationMatchGrokBuildTypes(t *testing.T) {
 		t.Fatal(err)
 	}
 	normalizeNativeChatRequiredFields(chunk, route, true, "chatcmpl_stream", 456)
-	normalizeNativeChatUsage(chunk)
+	normalizeNativeChatUsage(chunk, 0)
 	if err := validateNativeChatChunk(chunk); err != nil {
 		t.Fatalf("normalized Chat chunk was rejected: %v; %#v", err, chunk)
 	}
@@ -1041,7 +1099,7 @@ func TestNativeChatCostRejectsInvalidMeasurements(t *testing.T) {
 			t.Fatalf("invalid cost was accepted: %#v", value)
 		}
 		root := map[string]any{"usage": usage}
-		normalizeNativeChatUsage(root)
+		normalizeNativeChatUsage(root, 0)
 		if root["usage"] != nil {
 			t.Fatalf("invalid cost measurement reached Grok Build: %#v", root)
 		}

@@ -1,9 +1,9 @@
-# Release Notes — v0.1.18
+# Release Notes — v0.1.19
 
-## Channels with a dead relay fail fast instead of stalling
+## Hosted-search billing totals no longer trigger false auto-compaction
 
-Grok Build retries retryable statuses (429, 5xx) up to 15 times, roughly 5.5 minutes per turn. When a relay's origin stayed down, every turn burned that entire retry budget and the UI stayed in the "retrying" phase, making the channel look permanently unusable.
+Grok Build treats a terminal Responses `usage` block as the current live context. When a provider such as DeepSeek hosted Web Search reports cumulative billing tokens instead of the final prompt size, that number can jump above the model's `context_window` (for example `1.7M / 1.0M`) and Grok compact immediately, even though the real conversation still fits.
 
-hellogrok now keeps an independent circuit breaker per channel. After 4 consecutive retryable upstream failures (5xx, transport errors, or error-body read failures), the proxy stops forwarding and immediately answers a non-retryable `503 proxy_circuit_open` with `X-Should-Retry: false`, so Grok Build fails the turn right away. After a 90-second cooldown one probe request is allowed through: success closes the breaker automatically and the channel keeps working, failure re-arms the cooldown. Any non-5xx upstream response, including 429, resets the failure streak. Streaming failures that occur after response headers are sent are unaffected.
+hellogrok now discards any prompt or output count larger than the known `context_window` and forwards `usage: null` instead. Grok keeps the previous baseline. In-window usage, including a provider `context_details` extension that itself fits the window, is unchanged. The check uses the configured model window, or a trustworthy upstream `X-Grok-Context-Window` header when the model has none.
 
-When `proxy_circuit_open` appears, wait about 90 seconds and retry for a temporary outage; if the error repeats, the relay's origin is down for the long term and the channel should be switched with `/model`. The proxy log records breaker transitions as `UP breaker` lines.
+Restart the proxy after upgrading. Keep an explicit `context_window` on custom models so this guard can run. Logs record discards as `usage discarded: live context exceeds window`.

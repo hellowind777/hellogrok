@@ -772,6 +772,101 @@ func TestDeepSeekResponsesExposeLiveContextToGrokBuild(t *testing.T) {
 	}
 }
 
+func TestDeepSeekCumulativeUsageDoesNotDriveGrokLiveContext(t *testing.T) {
+	tests := []struct {
+		name   string
+		stream bool
+	}{
+		{name: "JSON"},
+		{name: "SSE", stream: true},
+	}
+	usage := `{"input_tokens":1727149,"output_tokens":6514,"total_tokens":1733663}`
+	body := `{"id":"resp_search","object":"response","created_at":1,"status":"completed","model":"deepseek-v4-pro","output":[],"usage":` + usage + `}`
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				if test.stream {
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = io.WriteString(w, `data: {"type":"response.completed","response":`+body+`}`+"\n\n")
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, body)
+			}))
+			defer upstream.Close()
+
+			route := facadeRoute("deepseek-search-usage", "responses", "deepseek-v4-pro", "key", upstream.URL)
+			route.Host = "api.deepseek.com"
+			route.ContextWindow = 1_000_000
+			s := New(log.New(io.Discard, "", 0))
+			s.SetRoutes([]config.Route{route})
+			startPathTestServer(t, s)
+
+			data, status := postFacade(t, s, route.ChannelID, nativeRequestBody("responses", test.stream), "")
+			if status != http.StatusOK {
+				t.Fatalf("status=%d body=%s", status, data)
+			}
+			var response map[string]any
+			if test.stream {
+				err := scanSSEPayloads(bytes.NewReader(data), func(_ []string, payload []byte) error {
+					event, err := decodeJSONMap(payload)
+					if err != nil {
+						return err
+					}
+					if stringValue(event["type"]) == "response.completed" {
+						response, _ = event["response"].(map[string]any)
+					}
+					return nil
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				var err error
+				response, err = decodeJSONMap(data)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if response == nil {
+				t.Fatalf("terminal response missing: %s", data)
+			}
+			if response["usage"] != nil {
+				t.Fatalf("cumulative hosted-search usage reached Grok Build: %#v", response["usage"])
+			}
+			if stringValue(response["status"]) != "completed" {
+				t.Fatalf("response was not forwarded after discarding usage: %#v", response)
+			}
+		})
+	}
+}
+
+func TestUpstreamContextWindowHeaderDiscardsImpossibleLiveContext(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		w.Header().Set(grokContextWindowHeader, "1000000")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"resp_header_window","object":"response","created_at":1,"status":"completed","model":"wire","output":[],"usage":{"input_tokens":1727149,"output_tokens":6514,"total_tokens":1733663}}`)
+	}))
+	defer upstream.Close()
+
+	route := facadeRoute("header-window", "responses", "wire", "key", upstream.URL)
+	s := New(log.New(io.Discard, "", 0))
+	s.SetRoutes([]config.Route{route})
+	startPathTestServer(t, s)
+
+	data, status := postFacade(t, s, route.ChannelID, nativeRequestBody("responses", false), "")
+	if status != http.StatusOK {
+		t.Fatalf("status=%d body=%s", status, data)
+	}
+	response, err := decodeJSONMap(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response["usage"] != nil {
+		t.Fatalf("header-window usage reached Grok Build: %#v", response["usage"])
+	}
+}
+
 func TestDeepSeekResponsesPreserveProviderUsageExtensions(t *testing.T) {
 	tests := []struct {
 		name           string

@@ -68,3 +68,26 @@ func TestCalculateDoesNotGenerateZeroThreshold(t *testing.T) {
 		t.Fatalf("near-exhausted capacity must be reported as a conflict: %+v", got)
 	}
 }
+
+func TestFitsLiveContext(t *testing.T) {
+	tests := []struct {
+		name   string
+		window uint64
+		counts []uint64
+		want   bool
+	}{
+		{name: "unknown window cannot reject", counts: []uint64{1_727_149, 6_514}, want: true},
+		{name: "prompt inside window", window: 1_000_000, counts: []uint64{571_165, 6_514}, want: true},
+		{name: "prompt at window", window: 1_000_000, counts: []uint64{1_000_000}, want: true},
+		{name: "cumulative hosted-search prompt", window: 1_000_000, counts: []uint64{1_727_149, 6_514}, want: false},
+		{name: "output larger than window", window: 128_000, counts: []uint64{100, 128_001}, want: false},
+		{name: "empty counts", window: 1_000_000, want: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := FitsLiveContext(test.window, test.counts...); got != test.want {
+				t.Fatalf("FitsLiveContext(%d, %v) = %t, want %t", test.window, test.counts, got, test.want)
+			}
+		})
+	}
+}

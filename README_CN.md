@@ -6,7 +6,7 @@
 
 跨平台 Grok Build 本地代理，让自定义模型渠道兼容常见 API 格式、Build 原生 Web 工具、独立鉴权和自动配置恢复。
 
-[![Version](https://img.shields.io/badge/version-0.1.18-2f6feb.svg)](./internal/appinfo/appinfo.go)
+[![Version](https://img.shields.io/badge/version-0.1.19-2f6feb.svg)](./internal/appinfo/appinfo.go)
 [![Go](https://img.shields.io/badge/Go-1.26.6-00ADD8.svg)](./go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#平台支持)
@@ -87,6 +87,7 @@ hellogrok 为这些自定义渠道提供统一的本地兼容层。运行时准�
 - 保留上游错误状态和正文，并根据结构化错误代码判断是否重试。鉴权、权限、账单、余额或额度不足、无效请求和无效模型错误不可重试；限流、超时、过载和临时服务错误仍可重试。上游显式返回的 `X-Should-Retry` 始终优先。
 - 接受带或不带 BOM 的 UTF-8 `config.toml`。只读检查不会改写文件；代理每次成功应用、恢复或回滚配置时，都会以 UTF-8 无 BOM 原子写入。TOML 无效时会显示文件路径、行号和列号，不再只输出缺少上下文的解析器错误。
 - 根据每个自定义模型的有效上下文窗口和最大输出分别计算自动压缩预算；只临时降低不安全的阈值，不会提高用户设置的较低值，停止代理时恢复全部受管值。
+- 只转发能放入已知 `context_window` 的实时上下文用量。hosted search 的累计计费总量以及其他大于窗口的测量会变成 `usage: null`，让 Grok Build 保留原基线，而不是按不可能的计数去压缩。
 - 正常停止、退出托盘、Ctrl+C、SIGTERM 或启动失败时恢复未被用户改动的临时值，并通过字段级三方合并保留代理运行期间的用户修改。无关修改使整份 TOML 无效但文件仍是有效 UTF-8 时，逐行恢复仍会撤销可独立解析的受管字段，并保留用户写入的无效 TOML 文本。
 - 托盘“退出”始终会在尝试清理后结束进程。若文件无法访问或仍有不属于原事务结构的本地路由，恢复事务会留在磁盘供下次启动处理，不会把用户困在托盘程序中。
 - 普通停止代理后保留诊断监听，让旧会话收到结构化、不可重试的 `proxy_stopped` 错误，并提示用户重新选择模型。托盘“退出”会关闭该监听并释放端口，即使配置清理需要推迟也不例外。
@@ -242,7 +243,7 @@ hellogrok 不会重新解释供应商的推理档位。Responses 转 Messages �
 | Responses | 保留 `instructions`、developer 消息、推理、原生 `text.format` JSON Schema、函数工具和原生 Web Search；发送标准来源 `include` 提示但不虚构缺失结果，来源展示仅限 DeepSeek 实际返回的 URL。供应商 `action.queries` 数组保持原样，同时为每次调用补充 Grok Build 用于显示的单值 `action.query`；`response.completed`、`response.incomplete`、`response.failed` 都作为终止事件。 |
 | Chat Completions | 保留工具调用历史中的 `reasoning_content`，请求流式终止用量块，在未显式设置 `max_tokens` 时把 `max_completion_tokens` 映射为 `max_tokens`，把 developer 消息转换为 system，为 assistant 工具消息补非 null 内容，并把显式 Responses `user` 映射为 DeepSeek `user_id`。DeepSeek 在该接口只记录了 function 工具，因此 hosted Web Search 必须桥接到 Messages 或 Responses。DeepSeek 在开启思考时不接受 `tool_choice`，因此会移除该选择器但保留函数声明供模型自动使用；显式关闭思考时仍保留官方支持的选择器形式。Grok Build 的 `json_schema` 会转换为官方支持的 `json_object` 加 schema 指令，返回 JSON 仍由 Grok Build 本地校验。 |
 | Anthropic Messages | 使用 `X-Api-Key`，保留思考/工具历史、推理强度、函数工具及原生服务端 Web Search 块。显式配置推理选择器时，Grok Build 省略字段表示的 `None` 会转换为 `thinking.type=disabled`，不会误落到 DeepSeek 默认的 `high`；只发送受支持的 `output_config.effort`，显式 Responses `user` 映射为 `metadata.user_id`，官方 `deepseek-v4-pro[1m]` 别名会继续保留在 Messages 请求中。 |
-| 排队与用量 | 接受非流式空行保活和流式 `: keep-alive` 注释；保留真实终止用量，让 Grok Build 正确统计上下文并触发自动压缩。 |
+| 排队与用量 | 接受非流式空行保活和流式 `: keep-alive` 注释；保留真实终止用量，让 Grok Build 正确统计上下文并触发自动压缩。大于已知 `context_window` 的测量保持未知。 |
 
 在这三套接口中，只有 Responses 原生支持 JSON Schema 输出。Chat 只支持 `json_object`，且官方说明它偶尔可能返回空 content，因此适配依赖注入的 schema 指令和 Grok Build 本地校验。Chat 函数的 `strict: true` 是另一项 Beta 能力：确实需要该行为时，应配置 `base_url = "https://api.deepseek.com/beta"`。Messages 的结构化输出继续使用 Grok Build 自带且会校验的 `StructuredOutput` 函数，因为 DeepSeek Anthropic 兼容接口的 `output_config` 只支持 effort。调用方显式提供的用户隔离 ID 会在协议桥接时保留，但 hellogrok 不会凭空生成，也不会从无关身份请求头推导。Chat 返回 `insufficient_system_resource` 时，hellogrok 会输出结构化失败；若原生非流式协议仍能改写 HTTP 响应，则返回可重试的 `503`。
 
@@ -501,7 +502,7 @@ Grok Build 对可重试状态码（429、5xx）最多重试 15 次，单轮最�
 
 Grok Build 不会把每次响应的 `usage.total_tokens` 累加到一个总和。当前公开源码会在 Responses 终止事件的 `usage.context_details.input_tokens` 与 `usage.context_details.output_tokens` 都有效时，用两者之和覆盖类型化的 `total_tokens`；没有该扩展时才沿用供应商的 `total_tokens`。随后 Chat State 把这个结果视为“当前完整上下文”的测量值，用它覆盖 token 基线，再加上该响应之后由本地估算的新增项，并在下一次请求模型前检查配置的自动压缩阈值。
 
-hellogrok 按这套合同统一处理所有渠道，而不是按供应商名称分支。完整有效的 Responses 用量可以采用 `input_tokens` / `output_tokens`，也可以采用常见的 `prompt_tokens` / `completion_tokens` 别名；详情容器会按相同方式规范化。Messages 与 Chat 转为 Responses 后也遵循同一规则。只有完整可信的一对计数才会得到 `context_details`；缺失、冲突、负数、小数、溢出或占位测量统一保持 `usage: null`，让 Grok Build 保留原基线。
+hellogrok 按这套合同统一处理所有渠道，而不是按供应商名称分支。完整有效的 Responses 用量可以采用 `input_tokens` / `output_tokens`，也可以采用常见的 `prompt_tokens` / `completion_tokens` 别名；详情容器会按相同方式规范化。Messages 与 Chat 转为 Responses 后也遵循同一规则。只有完整可信的一对计数才会得到 `context_details`；缺失、冲突、负数、小数、溢出、占位，或大于已知 `context_window` 的实时上下文计数，统一保持 `usage: null`，让 Grok Build 保留原基线。
 
 DeepSeek 的 1M 上下文是输入与生成输出共享的总预算，Responses 的 `max_output_tokens` 同时包含隐藏推理和可见输出。用尽单次输出上限时，Responses 返回 `status = "incomplete"` 且原因为 `max_output_tokens`；Chat 返回 `finish_reason = "length"`，hellogrok 会映射为同一种不完整结果。已生成的部分仍可使用，但若推理消耗了额度，可见正文可能很少。此时可以在下一轮继续、降低推理档位，或仅在总上下文剩余空间足够时提高输出额度。只达到输出上限本身不应触发自动压缩。
 
@@ -519,7 +520,7 @@ DeepSeek 的 1M 上下文是输入与生成输出共享的总预算，Responses 
 
 如果一个已经结束或恢复的会话在有效阈值之上，下一次用户输入会先触发 Grok Build 的采样前自动压缩，然后才向供应商发请求。hellogrok 的进程级测试已覆盖 Responses、Messages 与 Chat Completions 的恢复会话路径。活动轮次中的大工具结果仍可能在两次检查之间越过阈值；随后同一工具循环的下一道保护会压缩当前活动上下文。
 
-常规 DeepSeek 请求的完整输入/输出用量可以精确更新上述基线。服务端 Web Search 是唯一需要保留的语义边界：DeepSeek 官方 Responses 文档没有公开 `context_details`，也没有说明一次服务端多步搜索的输入/输出用量代表最终活动上下文还是累计计费量；hellogrok 只能把完整返回值投影到 Grok Build 的该扩展中。因此自动压缩不会再因零基线失效，但 hosted search 的精确触发时点仍取决于 DeepSeek 返回值的实际语义，需要用真实 API 响应继续校验。非 DeepSeek 渠道同理：有可信终止用量且配置了正确 `context_window` 时可精确触发；完全不返回用量时只能保留基线并近似增长。
+常规 DeepSeek 请求的完整输入/输出用量可以精确更新上述基线。服务端 Web Search 可能返回多步累计计费量而不是最终活动 prompt。当输入或输出计数超过已知 `context_window` 时，hellogrok 会丢弃该次测量（`usage: null`），而不是让 Grok Build 按不可能的实时上下文去压缩。窗口内的可信计数，以及自身也落在窗口内的供应商 `context_details`，仍会更新基线。非 DeepSeek 渠道使用同一条护栏。完全不返回用量时只能保留基线并近似增长。此检查需要显式配置 `context_window`。
 
 ### Grok Build 整个窗口无法点击
 

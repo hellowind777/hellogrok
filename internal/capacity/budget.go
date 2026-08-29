@@ -62,3 +62,20 @@ func Calculate(contextWindow, maxCompletionTokens uint64, desiredThreshold uint8
 	budget.Ready = true
 	return budget
 }
+
+// FitsLiveContext reports whether token counts can be the live context of a
+// completed request against a known window. A successful model call cannot
+// occupy more prompt or output tokens than the window; larger values are
+// billing totals or otherwise untrustworthy and must not drive Grok Build
+// auto-compaction. An unknown window (0) cannot be checked.
+func FitsLiveContext(window uint64, counts ...uint64) bool {
+	if window == 0 {
+		return true
+	}
+	for _, count := range counts {
+		if count > window {
+			return false
+		}
+	}
+	return true
+}

@@ -1182,7 +1182,7 @@ func (s *Server) streamNativeSSE(w http.ResponseWriter, response *http.Response,
 		}
 		if request.Protocol == wireChatCompletions {
 			normalizeNativeChatRequiredFields(root, route, true, chatStreamID, chatCreatedAt)
-			normalizeNativeChatUsage(root)
+			normalizeNativeChatUsage(root, liveContextWindow(route, response.Header))
 		}
 		setDownstreamResponseModel(root, responseModelForRoute(route))
 		restoreClientWebSearchAlias(root, request.ClientSearchAlias, request.Protocol)

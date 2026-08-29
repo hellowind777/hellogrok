@@ -1,9 +1,9 @@
-# 发布说明 — v0.1.18
+# 发布说明 — v0.1.19
 
-## 中转故障的渠道快速失败，不再长时间卡在重试
+## hosted search 的累计计费量不再误触发自动压缩
 
-Grok Build 对可重试状态码（429、5xx）最多重试 15 次，单轮最长约 5.5 分钟。当中转渠道的源站持续宕机时，此前每一轮都会烧完整个重试预算，界面一直停在“重试中”，看起来像渠道彻底不可用。
+Grok Build 把 Responses 终止包里的 `usage` 当作当前活动上下文。DeepSeek hosted Web Search 这类供应商可能返回多步累计计费 token，而不是最终 prompt 大小。这个数字一旦超过模型的 `context_window`（例如 `1.7M / 1.0M`），Grok 会立刻压缩，即使真实对话仍在窗口内。
 
-hellogrok 现在为每个渠道维护独立熔断器。同一渠道连续 4 次可重试上游失败（5xx、传输错误或错误正文读取失败）后，代理不再转发请求，而是立即返回不可重试的 `503 proxy_circuit_open`（`X-Should-Retry: false`），让 Grok Build 立刻结束本轮。熔断后每 90 秒放行一次探测请求：上游恢复则自动合闸继续使用，探测仍失败则重新计时。任何非 5xx 上游响应（含 429 限流）都会清零失败计数。响应头发送之后发生的流式失败不受影响。
+hellogrok 现在会丢弃大于已知 `context_window` 的输入或输出计数，改为转发 `usage: null`，让 Grok 保留上一跳基线。窗口内的用量，以及自身也落在窗口内的供应商 `context_details`，保持不变。检查优先使用模型配置的窗口；未配置时才采用可信的上游 `X-Grok-Context-Window` 响应头。
 
-看到 `proxy_circuit_open` 时，暂时性故障等 90 秒重试即可自动恢复；若持续出现，说明该中转源站长期故障，请用 `/model` 切换到其它渠道。代理日志中以 `UP breaker` 记录熔断状态变化。
+升级后请重启代理。自定义模型请继续显式填写 `context_window`，否则这条护栏不会生效。丢弃事件记为 `usage discarded: live context exceeds window`。
