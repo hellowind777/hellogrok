@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -24,6 +25,94 @@ import (
 type grokHeadlessResult struct {
 	Text      string `json:"text"`
 	SessionID string `json:"sessionId"`
+}
+
+// TestGrokBuildProcessSurvivesTransientBusy reproduces the busy-503 scenario:
+// the upstream answers "The service is busy. Wait a minute and send again."
+// for the first two requests. The proxy's absorb layer must retry inside its
+// window so the turn completes without the client ever seeing the failure.
+func TestGrokBuildProcessSurvivesTransientBusy(t *testing.T) {
+	if os.Getenv("HELLOGROK_GROK_E2E") != "1" {
+		t.Skip("set HELLOGROK_GROK_E2E=1 to run the installed Grok Build process test")
+	}
+	grokPath, err := exec.LookPath("grok")
+	if err != nil {
+		t.Skipf("grok executable is not installed: %v", err)
+	}
+
+	var calls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		call := calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		if call <= 2 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = fmt.Fprint(w, `{"error":{"type":"server_error","message":"The service is busy. Wait a minute and send again."}}`)
+			return
+		}
+		_, _ = fmt.Fprint(w, nativeSuccessBody("responses", "wire-model", "OK"))
+	}))
+	defer upstream.Close()
+
+	parsedUpstream, _ := url.Parse(upstream.URL)
+	route := config.Route{
+		ChannelID:            "busy-e2e",
+		Host:                 parsedUpstream.Host,
+		OriginBase:           upstream.URL,
+		APIBackend:           "responses",
+		APIBackendConfigured: true,
+		WireModel:            "wire-model",
+		APIKey:               "test-key",
+		AuthScheme:           "bearer",
+		IncomingAuthScheme:   "bearer",
+	}
+	server := New(log.New(io.Discard, "", 0))
+	server.SetRoutes([]config.Route{route})
+	startPathTestServer(t, server)
+
+	grokHome := filepath.Join(t.TempDir(), "grok-home")
+	if err := os.MkdirAll(grokHome, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	configText := fmt.Sprintf(`[models]
+default = "busy-e2e"
+
+[model.busy-e2e]
+model = "busy-e2e"
+base_url = "http://%s/c/busy-e2e"
+api_key = "test-key"
+api_backend = "responses"
+reasoning_efforts = ["none", "low", "high", "max"]
+reasoning_effort = "none"
+`, server.PathAddr)
+	if err := os.WriteFile(filepath.Join(grokHome, "config.toml"), []byte(configText), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, grokPath,
+		"-p", "Reply exactly OK", "-m", "busy-e2e", "--output-format", "json",
+		"--no-subagents", "--disable-web-search", "--max-turns", "1",
+		"--permission-mode", "bypassPermissions", "--verbatim")
+	command.Dir = t.TempDir()
+	command.Env = append(os.Environ(),
+		"GROK_HOME="+grokHome,
+		"HOME="+grokHome,
+		"USERPROFILE="+grokHome,
+	)
+	output, err := command.CombinedOutput()
+	if ctx.Err() != nil {
+		t.Fatalf("Grok Build process timed out: %v\n%s", ctx.Err(), output)
+	}
+	if err != nil {
+		t.Fatalf("Grok Build process failed: %v\n%s", err, output)
+	}
+	if got := calls.Load(); got < 3 {
+		t.Fatalf("upstream calls=%d, want at least 3 (two busy + one success)", got)
+	}
+	if !strings.Contains(string(output), "OK") || strings.Contains(string(output), "Wait a minute") {
+		t.Fatalf("unexpected Grok Build output: %s", output)
+	}
 }
 
 // This test launches the installed Grok Build executable with an isolated home

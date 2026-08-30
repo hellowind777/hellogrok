@@ -4,6 +4,18 @@ All notable changes to this project are documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.20] — 2026-08-30
+
+### Added
+
+- Per-channel absorb layer for transient upstream soft failures. While the upstream response headers have not been sent, retryable failures (busy/overloaded `503`, `429`, retryable `5xx`, response-header timeouts) are retried inside the proxy with exponential backoff (2s–30s, honoring an upstream `Retry-After` up to 60s) for up to 90 seconds by default (`absorb_retry_max_secs`, `absorb_retry_backoff_cap_secs`). Grok Build's native 15-attempt retry budget stays untouched during the window; only when the window is exhausted does the failure pass through, still retryable. Transport errors are not absorbed so Grok Build's first-retry HTTP/1.1 client rebuild keeps working. `UP absorb` log lines record each wait.
+- Synthesized 30-second `Retry-After` on retryable busy/overloaded `5xx` passthroughs that carried none, pacing Grok Build's own retries. Upstream `Retry-After` headers are preserved.
+- Opt-in dead-channel breaker (`dead_channel_fail_fast`, default off; `dead_channel_fail_threshold`, default 6). Only dial-level failures (connection refused, DNS, TLS handshake) count, because those can never succeed on retry; after the streak the proxy answers a non-retryable `503 proxy_circuit_open` with `X-Should-Retry: false`, with one probe allowed after a 5-minute cooldown and any upstream response closing the breaker.
+
+### Changed
+
+- The circuit breaker no longer fast-fails soft failures. Busy `503`, `429`, timeouts, transport resets, and error-body read failures pass through as retryable (or are absorbed first), so Grok Build keeps its complete native retry budget. `X-Should-Retry: false` is reserved for deterministic failures whose retries cannot succeed (authentication, permission, billing, quota, invalid request/model).
+
 ## [0.1.19] — 2026-08-29
 
 ### Fixed
@@ -289,7 +301,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - CC Switch compatibility detection and conflict warnings.
 - Builds for Windows, Linux, and macOS on amd64 and arm64.
 
-[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.19...HEAD
+[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.20...HEAD
+[0.1.20]: https://github.com/hellowind777/hellogrok/compare/v0.1.19...v0.1.20
 [0.1.19]: https://github.com/hellowind777/hellogrok/compare/v0.1.18...v0.1.19
 [0.1.18]: https://github.com/hellowind777/hellogrok/compare/v0.1.17...v0.1.18
 [0.1.17]: https://github.com/hellowind777/hellogrok/compare/v0.1.16...v0.1.17

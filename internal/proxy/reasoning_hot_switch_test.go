@@ -286,6 +286,8 @@ func TestOpaqueHistoryDoesNotRetryUnrelatedErrors(t *testing.T) {
 	defer up.Close()
 	s := New(log.New(io.Discard, "", 0))
 	route := facadeRoute("target", "responses", "target", "", up.URL+"/v1")
+	route.AbsorbRetryMaxSecs = 0
+	route.AbsorbRetryMaxConfigured = true
 	s.SetRoutes([]config.Route{route})
 	startPathTestServer(t, s)
 	_, status := postFacade(t, s, route.ChannelID, opaqueHistory("unknown-signature"), "")

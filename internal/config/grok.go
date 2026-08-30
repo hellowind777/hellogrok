@@ -54,15 +54,29 @@ type Model struct {
 	// Grok Build's stream-level timer does not cover.
 	InferenceIdleTimeoutSecs       uint64
 	InferenceIdleTimeoutConfigured bool
-	AuthScheme                     string
-	IncomingAuthScheme             string
-	APIKey                         string
-	EnvKey                         string // single name or first of array (resolved later)
-	EnvKeys                        []string
-	AuthProvider                   string
-	DynamicAuth                    bool
-	ExtraHeaders                   map[string]string
-	EnvHTTPHeaders                 map[string]string
+	// AbsorbRetryMaxSecs is the per-channel soft-failure wait window. An
+	// explicit 0 disables proxy-side absorb retries; the configured flag
+	// distinguishes that from the 90-second default.
+	AbsorbRetryMaxSecs       uint64
+	AbsorbRetryMaxConfigured bool
+	// AbsorbRetryBackoffCapSecs caps each absorb-layer backoff step.
+	AbsorbRetryBackoffCapSecs uint64
+	// DeadChannelFailFast opts the channel into fast-failing after
+	// consecutive dial-level failures instead of burning Grok Build's retry
+	// budget on an unreachable channel.
+	DeadChannelFailFast bool
+	// DeadChannelFailThreshold consecutive dial-level failures open the
+	// dead-channel breaker.
+	DeadChannelFailThreshold uint64
+	AuthScheme               string
+	IncomingAuthScheme       string
+	APIKey                   string
+	EnvKey                   string // single name or first of array (resolved later)
+	EnvKeys                  []string
+	AuthProvider             string
+	DynamicAuth              bool
+	ExtraHeaders             map[string]string
+	EnvHTTPHeaders           map[string]string
 }
 
 // ChatSearchDialect identifies the provider extension or protocol bridge used
@@ -134,6 +148,11 @@ type Route struct {
 	AutoCompactThresholdConfigured bool
 	InferenceIdleTimeoutSecs       uint64
 	InferenceIdleTimeoutConfigured bool
+	AbsorbRetryMaxSecs             uint64
+	AbsorbRetryMaxConfigured       bool
+	AbsorbRetryBackoffCapSecs      uint64
+	DeadChannelFailFast            bool
+	DeadChannelFailThreshold       uint64
 }
 
 // IsOfficialDeepSeekRoute identifies DeepSeek's first-party API independently
@@ -264,6 +283,22 @@ func LoadModels(path string) ([]Model, error) {
 		if err != nil {
 			return nil, fmt.Errorf("[model.%s].inference_idle_timeout_secs %w", id, err)
 		}
+		absorbRetryMaxSecs, absorbRetryMaxConfigured, err := inheritedUint64(m, provider, "absorb_retry_max_secs")
+		if err != nil {
+			return nil, fmt.Errorf("[model.%s].absorb_retry_max_secs %w", id, err)
+		}
+		absorbRetryBackoffCapSecs, _, err := inheritedUint64(m, provider, "absorb_retry_backoff_cap_secs")
+		if err != nil {
+			return nil, fmt.Errorf("[model.%s].absorb_retry_backoff_cap_secs %w", id, err)
+		}
+		deadChannelFailFast, err := inheritedBool(m, provider, "dead_channel_fail_fast")
+		if err != nil {
+			return nil, fmt.Errorf("[model.%s].dead_channel_fail_fast %w", id, err)
+		}
+		deadChannelFailThreshold, _, err := inheritedUint64(m, provider, "dead_channel_fail_threshold")
+		if err != nil {
+			return nil, fmt.Errorf("[model.%s].dead_channel_fail_threshold %w", id, err)
+		}
 
 		modelEnvKeys := envKeyList(m["env_key"])
 		modelAPIKey := strings.TrimSpace(str(m["api_key"]))
@@ -340,6 +375,11 @@ func LoadModels(path string) ([]Model, error) {
 			AutoCompactThresholdConfigured:  autoCompactThresholdConfigured,
 			InferenceIdleTimeoutSecs:        inferenceIdleTimeoutSecs,
 			InferenceIdleTimeoutConfigured:  inferenceIdleTimeoutConfigured,
+			AbsorbRetryMaxSecs:              absorbRetryMaxSecs,
+			AbsorbRetryMaxConfigured:        absorbRetryMaxConfigured,
+			AbsorbRetryBackoffCapSecs:       absorbRetryBackoffCapSecs,
+			DeadChannelFailFast:             deadChannelFailFast,
+			DeadChannelFailThreshold:        deadChannelFailThreshold,
 			AuthScheme:                      upstreamAuthScheme,
 			IncomingAuthScheme:              modelAuthScheme,
 			APIKey:                          apiKey,
@@ -792,6 +832,11 @@ func BuildRoutes(models []Model) ([]Route, error) {
 			AutoCompactThresholdConfigured:  m.AutoCompactThresholdConfigured,
 			InferenceIdleTimeoutSecs:        m.InferenceIdleTimeoutSecs,
 			InferenceIdleTimeoutConfigured:  m.InferenceIdleTimeoutConfigured,
+			AbsorbRetryMaxSecs:              m.AbsorbRetryMaxSecs,
+			AbsorbRetryMaxConfigured:        m.AbsorbRetryMaxConfigured,
+			AbsorbRetryBackoffCapSecs:       m.AbsorbRetryBackoffCapSecs,
+			DeadChannelFailFast:             m.DeadChannelFailFast,
+			DeadChannelFailThreshold:        m.DeadChannelFailThreshold,
 		}
 		out = append(out, route)
 	}

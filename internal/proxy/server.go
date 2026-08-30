@@ -49,6 +49,10 @@ type Server struct {
 	bodyIdleTimeout         time.Duration
 	deepSeekBodyIdleTimeout time.Duration
 	breakers                *breakerStore
+	// absorbNow and absorbSleep are the absorb layer's timing primitives;
+	// tests replace them to control the wait window without sleeping.
+	absorbNow   func() time.Time
+	absorbSleep func(context.Context, time.Duration) bool
 
 	probedMu         sync.Mutex
 	probed           map[string]bool
@@ -100,6 +104,8 @@ func newServer(logger *log.Logger, reasoningPath string) *Server {
 		bodyIdleTimeout:         defaultUpstreamBodyIdleTimeout,
 		deepSeekBodyIdleTimeout: defaultDeepSeekBodyIdleTimeout,
 		breakers:                newBreakerStore(),
+		absorbNow:               time.Now,
+		absorbSleep:             sleepWithContext,
 		requestCtx:              requestCtx,
 		requestCancel:           requestCancel,
 		probed:                  map[string]bool{},

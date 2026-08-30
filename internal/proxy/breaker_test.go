@@ -1,10 +1,12 @@
 package proxy
 
 import (
+	"context"
 	"io"
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -20,6 +22,14 @@ func upstream502Handler() http.HandlerFunc {
 		w.Header().Set("Content-Type", "text/plain; charset=UTF-8")
 		w.WriteHeader(http.StatusBadGateway)
 		_, _ = io.WriteString(w, "error code: 502")
+	}
+}
+
+func upstreamBusyHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = io.WriteString(w, `{"error":{"type":"server_error","message":"The service is busy. Wait a minute and send again."}}`)
 	}
 }
 
@@ -50,185 +60,140 @@ func newBreakerTestServer(t *testing.T, handler http.Handler) (*Server, *int64) 
 	return server, &calls
 }
 
-func TestBreakerOpensAfterThresholdRetryableFailures(t *testing.T) {
-	server, calls := newBreakerTestServer(t, upstream502Handler())
-
-	for i := 0; i < circuitOpenThreshold; i++ {
-		_, status, header := postFacadeResponse(t, server, "breaker-channel", []byte(breakerProbeBody), "")
-		if status != http.StatusBadGateway {
-			t.Fatalf("attempt %d: status=%d, want 502", i+1, status)
-		}
-		if header.Get("X-Should-Retry") != "true" {
-			t.Fatalf("attempt %d: retryable upstream failure must stay retryable", i+1)
-		}
+// setRoute replaces the test channel's route with a modified copy.
+func setBreakerTestRoute(t *testing.T, server *Server, modify func(*config.Route)) {
+	t.Helper()
+	route, ok := server.lookupChannel("breaker-channel")
+	if !ok {
+		t.Fatal("missing breaker-channel route")
 	}
-	if got := atomic.LoadInt64(calls); got != circuitOpenThreshold {
-		t.Fatalf("upstream calls=%d, want %d", got, circuitOpenThreshold)
-	}
-
-	data, status, header := postFacadeResponse(t, server, "breaker-channel", []byte(breakerProbeBody), "")
-	if status != http.StatusServiceUnavailable {
-		t.Fatalf("fast-fail status=%d, want 503", status)
-	}
-	if header.Get("X-Should-Retry") != "false" {
-		t.Fatalf("fast-fail must be non-retryable, got %q", header.Get("X-Should-Retry"))
-	}
-	if !containsJSONType(data, "proxy_circuit_open") {
-		t.Fatalf("fast-fail body missing proxy_circuit_open: %s", data)
-	}
-	if got := atomic.LoadInt64(calls); got != circuitOpenThreshold {
-		t.Fatalf("open breaker must not hit upstream: calls=%d", got)
-	}
+	modify(&route)
+	server.SetRoutes([]config.Route{route})
 }
 
-func TestBreakerSuccessResetsStreak(t *testing.T) {
-	var upstreamCalls int64
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if atomic.AddInt64(&upstreamCalls, 1)%4 == 0 {
-			upstreamOKHandler().ServeHTTP(w, r)
-			return
-		}
-		upstream502Handler().ServeHTTP(w, r)
-	})
-	server, calls := newBreakerTestServer(t, handler)
-
-	for i := 0; i < 12; i++ {
-		_, status, _ := postFacadeResponse(t, server, "breaker-channel", []byte(breakerProbeBody), "")
-		want := http.StatusBadGateway
-		if (i+1)%4 == 0 {
-			want = http.StatusOK
-		}
-		if status != want {
-			t.Fatalf("attempt %d: status=%d, want %d", i+1, status, want)
-		}
+// stubAbsorbClock makes the absorb layer and dead-channel breaker use a
+// virtual clock: sleeps advance the clock instantly instead of waiting.
+func stubAbsorbClock(server *Server) *time.Time {
+	clock := time.Now()
+	server.absorbNow = func() time.Time { return clock }
+	server.absorbSleep = func(ctx context.Context, d time.Duration) bool {
+		clock = clock.Add(d)
+		return ctx.Err() == nil
 	}
-	if got := atomic.LoadInt64(calls); got != 12 {
-		t.Fatalf("breaker must never fast-fail a recovering channel: calls=%d", got)
-	}
+	server.breakers.now = func() time.Time { return clock }
+	return &clock
 }
 
-func TestBreakerProbeRecoversAfterCooldown(t *testing.T) {
-	fail := atomic.Bool{}
-	fail.Store(true)
+// deadUpstreamURL returns a URL that refuses connections.
+func deadUpstreamURL(t *testing.T) string {
+	t.Helper()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	url := upstream.URL
+	upstream.Close()
+	return url
+}
+
+// pointRouteAtDeadUpstream rewires the test route to a URL that refuses
+// connections.
+func pointRouteAtDeadUpstream(t *testing.T, route *config.Route) {
+	t.Helper()
+	parsed, err := url.Parse(deadUpstreamURL(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	route.OriginBase = parsed.String()
+	route.Host = parsed.Host
+}
+
+func TestAbsorbRetryRecoversBeforeClientSeesFailure(t *testing.T) {
+	failures := atomic.Int64{}
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if fail.Load() {
-			upstream502Handler().ServeHTTP(w, r)
+		if failures.Add(1) <= 2 {
+			upstreamBusyHandler().ServeHTTP(w, r)
 			return
 		}
 		upstreamOKHandler().ServeHTTP(w, r)
 	})
-	server, _ := newBreakerTestServer(t, handler)
-	clock := time.Now()
-	server.breakers.now = func() time.Time { return clock }
+	server, calls := newBreakerTestServer(t, handler)
+	stubAbsorbClock(server)
 
-	for i := 0; i < circuitOpenThreshold; i++ {
-		postFacade(t, server, "breaker-channel", []byte(breakerProbeBody), "")
+	_, status, _ := postFacadeResponse(t, server, "breaker-channel", []byte(breakerProbeBody), "")
+	if status != http.StatusOK {
+		t.Fatalf("absorbed busy failures must surface success, status=%d", status)
 	}
+	if got := atomic.LoadInt64(calls); got != 3 {
+		t.Fatalf("upstream calls=%d, want 3 (two absorbed retries)", got)
+	}
+}
 
-	// Within the cooldown the breaker keeps fast-failing.
+func TestAbsorbBudgetExhaustedPassesThroughRetryable(t *testing.T) {
+	server, calls := newBreakerTestServer(t, upstreamBusyHandler())
+	setBreakerTestRoute(t, server, func(route *config.Route) {
+		route.AbsorbRetryMaxSecs = 5
+		route.AbsorbRetryMaxConfigured = true
+	})
+	stubAbsorbClock(server)
+
+	_, status, header := postFacadeResponse(t, server, "breaker-channel", []byte(breakerProbeBody), "")
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("budget-exhausted status=%d, want 503", status)
+	}
+	if header.Get("X-Should-Retry") != "true" {
+		t.Fatalf("budget-exhausted failure must stay retryable for Grok Build, got %q", header.Get("X-Should-Retry"))
+	}
+	if got := header.Get("Retry-After"); got != "30" {
+		t.Fatalf("passthrough must pace Grok Build with a synthesized Retry-After, got %q", got)
+	}
+	if got := atomic.LoadInt64(calls); got != 3 {
+		t.Fatalf("upstream calls=%d, want 3 (2s+3s of absorbed waits inside the 5s budget)", got)
+	}
+}
+
+func TestAbsorbDisabledByExplicitZero(t *testing.T) {
+	server, calls := newBreakerTestServer(t, upstreamBusyHandler())
+	setBreakerTestRoute(t, server, func(route *config.Route) {
+		route.AbsorbRetryMaxSecs = 0
+		route.AbsorbRetryMaxConfigured = true
+	})
+
+	_, status, header := postFacadeResponse(t, server, "breaker-channel", []byte(breakerProbeBody), "")
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("disabled absorb must pass the failure through, status=%d", status)
+	}
+	if header.Get("X-Should-Retry") != "true" {
+		t.Fatalf("passthrough must stay retryable, got %q", header.Get("X-Should-Retry"))
+	}
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Fatalf("upstream calls=%d, want 1 (no proxy-side retry)", got)
+	}
+}
+
+func TestAbsorbHonorsUpstreamRetryAfter(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "2")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = io.WriteString(w, `{"error":{"type":"server_error","message":"busy"}}`)
+	})
+	server, calls := newBreakerTestServer(t, handler)
+	setBreakerTestRoute(t, server, func(route *config.Route) {
+		route.AbsorbRetryMaxSecs = 5
+		route.AbsorbRetryMaxConfigured = true
+	})
+	stubAbsorbClock(server)
+
 	_, status, _ := postFacadeResponse(t, server, "breaker-channel", []byte(breakerProbeBody), "")
 	if status != http.StatusServiceUnavailable {
-		t.Fatalf("in-cooldown status=%d, want 503", status)
+		t.Fatalf("status=%d, want 503 after budget", status)
 	}
-
-	// After the cooldown the first request becomes a probe; it still fails,
-	// so the cooldown re-arms and the next request fast-fails again.
-	clock = clock.Add(circuitOpenCooldown + time.Second)
-	_, status, _ = postFacadeResponse(t, server, "breaker-channel", []byte(breakerProbeBody), "")
-	if status != http.StatusBadGateway {
-		t.Fatalf("failed probe status=%d, want 502", status)
-	}
-	_, status, _ = postFacadeResponse(t, server, "breaker-channel", []byte(breakerProbeBody), "")
-	if status != http.StatusServiceUnavailable {
-		t.Fatalf("re-armed fast-fail status=%d, want 503", status)
-	}
-
-	// Upstream recovers; the next probe succeeds and closes the breaker.
-	clock = clock.Add(circuitOpenCooldown + time.Second)
-	fail.Store(false)
-	_, status, _ = postFacadeResponse(t, server, "breaker-channel", []byte(breakerProbeBody), "")
-	if status != http.StatusOK {
-		t.Fatalf("recovering probe status=%d, want 200", status)
-	}
-	_, status, _ = postFacadeResponse(t, server, "breaker-channel", []byte(breakerProbeBody), "")
-	if status != http.StatusOK {
-		t.Fatalf("post-recovery status=%d, want 200", status)
+	// Retry-After 2s paces the absorbed waits (2+2+1s inside the 5s budget);
+	// exponential backoff would only fit three attempts.
+	if got := atomic.LoadInt64(calls); got != 4 {
+		t.Fatalf("upstream calls=%d, want 4 (Retry-After pacing)", got)
 	}
 }
 
-func TestBreakerPerChannelIsolation(t *testing.T) {
-	var secondCalls int64
-	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt64(&secondCalls, 1)
-		upstream502Handler().ServeHTTP(w, r)
-	}))
-	t.Cleanup(second.Close)
-
-	server, _ := newBreakerTestServer(t, upstream502Handler())
-	firstRoute, ok := server.lookupChannel("breaker-channel")
-	if !ok {
-		t.Fatal("missing first route")
-	}
-	server.SetRoutes([]config.Route{
-		firstRoute,
-		facadeRoute("other-channel", "responses", "wire", "key2", second.URL),
-	})
-
-	for i := 0; i < circuitOpenThreshold; i++ {
-		postFacade(t, server, "breaker-channel", []byte(breakerProbeBody), "")
-	}
-	if _, status, _ := postFacadeResponse(t, server, "breaker-channel", []byte(breakerProbeBody), ""); status != http.StatusServiceUnavailable {
-		t.Fatalf("first channel must fast-fail, status=%d", status)
-	}
-	if _, status, _ := postFacadeResponse(t, server, "other-channel", []byte(breakerProbeBody), ""); status != http.StatusBadGateway {
-		t.Fatalf("second channel must stay unaffected, status=%d", status)
-	}
-	if got := atomic.LoadInt64(&secondCalls); got != 1 {
-		t.Fatalf("second channel upstream calls=%d, want 1", got)
-	}
-}
-
-func TestBreakerIgnoresNonRetryableFailures(t *testing.T) {
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		_, _ = io.WriteString(w, `{"error":{"type":"invalid_request_error","code":"invalid_model","message":"invalid model"}}`)
-	})
-	server, calls := newBreakerTestServer(t, handler)
-
-	for i := 0; i < circuitOpenThreshold+3; i++ {
-		_, status, header := postFacadeResponse(t, server, "breaker-channel", []byte(breakerProbeBody), "")
-		if status != http.StatusBadRequest {
-			t.Fatalf("attempt %d: status=%d, want 400", i+1, status)
-		}
-		if header.Get("X-Should-Retry") != "false" {
-			t.Fatalf("attempt %d: structured invalid model must be non-retryable", i+1)
-		}
-	}
-	if got := atomic.LoadInt64(calls); got != circuitOpenThreshold+3 {
-		t.Fatalf("non-retryable failures must keep forwarding: calls=%d", got)
-	}
-}
-
-func TestBreakerRateLimitResetsStreak(t *testing.T) {
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusTooManyRequests)
-		_, _ = io.WriteString(w, `{"error":{"type":"rate_limit_error","message":"rate limited"}}`)
-	})
-	server, calls := newBreakerTestServer(t, handler)
-
-	for i := 0; i < 12; i++ {
-		if _, status, _ := postFacadeResponse(t, server, "breaker-channel", []byte(breakerProbeBody), ""); status != http.StatusTooManyRequests {
-			t.Fatalf("attempt %d: status=%d, want 429", i+1, status)
-		}
-	}
-	if got := atomic.LoadInt64(calls); got != 12 {
-		t.Fatalf("429s prove the channel is responsive and must not open the breaker: calls=%d", got)
-	}
-}
-
-func TestBreakerTransportErrorsCount(t *testing.T) {
+func TestTransportErrorPassesThroughWithoutAbsorb(t *testing.T) {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hijacker, ok := w.(http.Hijacker)
 		if !ok {
@@ -241,23 +206,168 @@ func TestBreakerTransportErrorsCount(t *testing.T) {
 	})
 	server, calls := newBreakerTestServer(t, handler)
 
-	for i := 0; i < circuitOpenThreshold; i++ {
-		_, status, _ := postFacadeResponse(t, server, "breaker-channel", []byte(breakerProbeBody), "")
+	_, status, header := postFacadeResponse(t, server, "breaker-channel", []byte(breakerProbeBody), "")
+	if status != http.StatusBadGateway {
+		t.Fatalf("transport failure status=%d, want 502", status)
+	}
+	if header.Get("X-Should-Retry") != "true" {
+		t.Fatalf("transport failure must stay retryable, got %q", header.Get("X-Should-Retry"))
+	}
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Fatalf("transport errors must not be absorbed: calls=%d, want 1", got)
+	}
+}
+
+func TestDeterministicErrorSkipsAbsorb(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"error":{"type":"invalid_request_error","code":"invalid_model","message":"invalid model"}}`)
+	})
+	server, calls := newBreakerTestServer(t, handler)
+
+	_, status, header := postFacadeResponse(t, server, "breaker-channel", []byte(breakerProbeBody), "")
+	if status != http.StatusBadRequest {
+		t.Fatalf("status=%d, want 400", status)
+	}
+	if header.Get("X-Should-Retry") != "false" {
+		t.Fatalf("deterministic failures must be non-retryable, got %q", header.Get("X-Should-Retry"))
+	}
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Fatalf("deterministic failures must not be absorbed: calls=%d, want 1", got)
+	}
+}
+
+func TestDeadChannelFailFastOptIn(t *testing.T) {
+	server, _ := newBreakerTestServer(t, upstream502Handler())
+	setBreakerTestRoute(t, server, func(route *config.Route) {
+		pointRouteAtDeadUpstream(t, route)
+		route.DeadChannelFailFast = true
+	})
+	stubAbsorbClock(server)
+
+	for i := 0; i < defaultDeadChannelFailThreshold; i++ {
+		_, status, header := postFacadeResponse(t, server, "breaker-channel", []byte(breakerProbeBody), "")
 		if status != http.StatusBadGateway {
+			t.Fatalf("attempt %d: status=%d, want 502", i+1, status)
+		}
+		if header.Get("X-Should-Retry") != "true" {
+			t.Fatalf("attempt %d: dial failure must stay retryable, got %q", i+1, header.Get("X-Should-Retry"))
+		}
+	}
+
+	data, status, header := postFacadeResponse(t, server, "breaker-channel", []byte(breakerProbeBody), "")
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("fast-fail status=%d, want 503", status)
+	}
+	if header.Get("X-Should-Retry") != "false" {
+		t.Fatalf("fast-fail must be non-retryable, got %q", header.Get("X-Should-Retry"))
+	}
+	if !containsJSONType(data, "proxy_circuit_open") {
+		t.Fatalf("fast-fail body missing proxy_circuit_open: %s", data)
+	}
+}
+
+func TestDeadChannelBreakerIgnoresSoftFailures(t *testing.T) {
+	server, calls := newBreakerTestServer(t, upstreamBusyHandler())
+	setBreakerTestRoute(t, server, func(route *config.Route) {
+		route.DeadChannelFailFast = true
+		route.AbsorbRetryMaxSecs = 0
+		route.AbsorbRetryMaxConfigured = true
+	})
+
+	for i := 0; i < 12; i++ {
+		data, status, header := postFacadeResponse(t, server, "breaker-channel", []byte(breakerProbeBody), "")
+		if status != http.StatusServiceUnavailable {
+			t.Fatalf("attempt %d: status=%d, want 503", i+1, status)
+		}
+		if header.Get("X-Should-Retry") != "true" {
+			t.Fatalf("attempt %d: soft failure must stay retryable, got %q", i+1, header.Get("X-Should-Retry"))
+		}
+		if containsJSONType(data, "proxy_circuit_open") {
+			t.Fatalf("attempt %d: soft failures must never open the dead-channel breaker", i+1)
+		}
+	}
+	if got := atomic.LoadInt64(calls); got != 12 {
+		t.Fatalf("upstream calls=%d, want 12", got)
+	}
+}
+
+func TestDeadChannelThresholdFromConfig(t *testing.T) {
+	server, _ := newBreakerTestServer(t, upstream502Handler())
+	setBreakerTestRoute(t, server, func(route *config.Route) {
+		pointRouteAtDeadUpstream(t, route)
+		route.DeadChannelFailFast = true
+		route.DeadChannelFailThreshold = 2
+	})
+	stubAbsorbClock(server)
+
+	for i := 0; i < 2; i++ {
+		if _, status, _ := postFacadeResponse(t, server, "breaker-channel", []byte(breakerProbeBody), ""); status != http.StatusBadGateway {
 			t.Fatalf("attempt %d: status=%d, want 502", i+1, status)
 		}
 	}
 	if _, status, _ := postFacadeResponse(t, server, "breaker-channel", []byte(breakerProbeBody), ""); status != http.StatusServiceUnavailable {
-		t.Fatalf("transport errors must open the breaker, status=%d", status)
-	}
-	if got := atomic.LoadInt64(calls); got != circuitOpenThreshold {
-		t.Fatalf("open breaker must not hit upstream: calls=%d", got)
+		t.Fatalf("configured threshold must fast-fail, status=%d", status)
 	}
 }
 
-func TestBreakerResetOnEnable(t *testing.T) {
-	server, calls := newBreakerTestServer(t, upstream502Handler())
-	for i := 0; i < circuitOpenThreshold; i++ {
+func TestDeadChannelBreakerProbeRecoversAfterCooldown(t *testing.T) {
+	server, _ := newBreakerTestServer(t, upstream502Handler())
+	setBreakerTestRoute(t, server, func(route *config.Route) {
+		pointRouteAtDeadUpstream(t, route)
+		route.DeadChannelFailFast = true
+		route.DeadChannelFailThreshold = 2
+	})
+	clock := stubAbsorbClock(server)
+
+	for i := 0; i < 2; i++ {
+		postFacade(t, server, "breaker-channel", []byte(breakerProbeBody), "")
+	}
+	if _, status, _ := postFacadeResponse(t, server, "breaker-channel", []byte(breakerProbeBody), ""); status != http.StatusServiceUnavailable {
+		t.Fatalf("in-cooldown status=%d, want 503", status)
+	}
+
+	// After the cooldown the first request becomes a probe; it still fails,
+	// so the cooldown re-arms and the next request fast-fails again.
+	*clock = clock.Add(deadChannelCooldown + time.Second)
+	if _, status, _ := postFacadeResponse(t, server, "breaker-channel", []byte(breakerProbeBody), ""); status != http.StatusBadGateway {
+		t.Fatalf("failed probe status=%d, want 502", status)
+	}
+	if _, status, _ := postFacadeResponse(t, server, "breaker-channel", []byte(breakerProbeBody), ""); status != http.StatusServiceUnavailable {
+		t.Fatalf("re-armed fast-fail status=%d, want 503", status)
+	}
+
+	// The channel recovers; the next probe succeeds and closes the breaker.
+	*clock = clock.Add(deadChannelCooldown + time.Second)
+	live := httptest.NewServer(upstreamOKHandler())
+	defer live.Close()
+	parsedLive, err := url.Parse(live.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setBreakerTestRoute(t, server, func(route *config.Route) {
+		route.OriginBase = parsedLive.String()
+		route.Host = parsedLive.Host
+	})
+	if _, status, _ := postFacadeResponse(t, server, "breaker-channel", []byte(breakerProbeBody), ""); status != http.StatusOK {
+		t.Fatalf("recovering probe status=%d, want 200", status)
+	}
+	if _, status, _ := postFacadeResponse(t, server, "breaker-channel", []byte(breakerProbeBody), ""); status != http.StatusOK {
+		t.Fatalf("post-recovery status=%d, want 200", status)
+	}
+}
+
+func TestDeadChannelBreakerResetsOnEnable(t *testing.T) {
+	server, _ := newBreakerTestServer(t, upstream502Handler())
+	setBreakerTestRoute(t, server, func(route *config.Route) {
+		pointRouteAtDeadUpstream(t, route)
+		route.DeadChannelFailFast = true
+		route.DeadChannelFailThreshold = 2
+	})
+	stubAbsorbClock(server)
+
+	for i := 0; i < 2; i++ {
 		postFacade(t, server, "breaker-channel", []byte(breakerProbeBody), "")
 	}
 	if _, status, _ := postFacadeResponse(t, server, "breaker-channel", []byte(breakerProbeBody), ""); status != http.StatusServiceUnavailable {
@@ -267,9 +377,6 @@ func TestBreakerResetOnEnable(t *testing.T) {
 	server.Enable()
 	if _, status, _ := postFacadeResponse(t, server, "breaker-channel", []byte(breakerProbeBody), ""); status != http.StatusBadGateway {
 		t.Fatalf("Enable must reset breakers, status=%d", status)
-	}
-	if got := atomic.LoadInt64(calls); got != circuitOpenThreshold+1 {
-		t.Fatalf("upstream calls=%d, want %d", got, circuitOpenThreshold+1)
 	}
 }
 

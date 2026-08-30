@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -70,9 +71,9 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 		writeJSONError(w, http.StatusUnauthorized, "custom channel has no channel-owned credential")
 		return
 	}
-	if !s.breakers.allow(route.ChannelID) {
-		s.log.Printf("UP breaker fast-fail channel=%s: upstream circuit open", route.ChannelID)
-		writeTypedJSONError(w, http.StatusServiceUnavailable, circuitOpenErrorMessage, "proxy_circuit_open", false)
+	if !s.breakers.allow(route.ChannelID, deadChannelBreakerParams(route.DeadChannelFailFast, route.DeadChannelFailThreshold)) {
+		s.log.Printf("UP breaker fast-fail channel=%s: channel unreachable", route.ChannelID)
+		writeTypedJSONError(w, http.StatusServiceUnavailable, deadChannelErrorMessage, "proxy_circuit_open", false)
 		return
 	}
 
@@ -102,6 +103,9 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 
 	started := time.Now()
 	upstreamClient, responseHeaderTimeout, bodyIdleTimeout := s.upstreamForRoute(route)
+	absorb := newAbsorbState(route)
+	absorb.now = s.absorbNow
+	absorb.sleep = s.absorbSleep
 	upstreamContext, cancelUpstream := context.WithCancel(incoming.Context())
 	stopLifecycleCancel := context.AfterFunc(s.upstreamLifecycleContext(), cancelUpstream)
 	defer func() {
@@ -142,13 +146,25 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 		if err != nil {
 			detail := safeUpstreamError(err)
 			s.log.Printf("UP channel=%s request failed: %s", route.ChannelID, detail)
-			s.logBreakerTransition(route.ChannelID, s.breakers.recordFailure(route.ChannelID))
 			if isUpstreamTimeout(err) {
+				if absorb.wait(upstreamContext, 0) {
+					s.logAbsorbWait(route.ChannelID, absorb, "response header timeout", 0)
+					continue
+				}
+				if upstreamContext.Err() != nil {
+					return
+				}
 				writeRetryableJSONError(w, http.StatusGatewayTimeout, "upstream timed out before returning response headers")
 				return
 			}
+			if isHardUpstreamError(err) {
+				s.logBreakerTransition(route.ChannelID, s.breakers.recordFailure(route.ChannelID, deadChannelBreakerParams(route.DeadChannelFailFast, route.DeadChannelFailThreshold)))
+			}
 			writeRetryableJSONError(w, http.StatusBadGateway, "upstream: "+detail)
 			return
+		}
+		if s.breakers.recordSuccess(route.ChannelID) {
+			s.log.Printf("UP breaker channel=%s closed after upstream response", route.ChannelID)
 		}
 		s.log.Printf("UP channel=%s status=%d ct=%s %s", route.ChannelID, response.StatusCode, response.Header.Get("Content-Type"), time.Since(started).Round(time.Millisecond))
 		if response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices {
@@ -173,12 +189,10 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 		_ = response.Body.Close()
 		if readErr != nil {
 			if errors.Is(readErr, errUpstreamBodyIdleTimeout) {
-				s.logBreakerTransition(route.ChannelID, s.breakers.recordFailure(route.ChannelID))
 				writeRetryableJSONError(w, http.StatusGatewayTimeout, "upstream timed out waiting for error response body data")
 			} else if errors.Is(readErr, errBodyTooLarge) {
 				writeJSONError(w, http.StatusBadGateway, "upstream error body exceeds 64 MiB")
 			} else {
-				s.logBreakerTransition(route.ChannelID, s.breakers.recordFailure(route.ChannelID))
 				writeRetryableJSONError(w, http.StatusBadGateway, "read upstream error response: "+readErr.Error())
 			}
 			return
@@ -238,31 +252,37 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 			}
 		}
 
+		// Decide the retry disposition on the upstream header first: the
+		// absorb layer may swallow this failure, in which case nothing has
+		// been written to the client yet and the loop re-sends the request.
+		retryable := setRetryDisposition(response.Header, response.StatusCode, data)
+		if reasoningRejected {
+			response.Header.Set("X-Should-Retry", "false")
+			retryable = false
+		}
+		if retryable && absorb.wait(upstreamContext, retryAfterSeconds(response.Header)) {
+			s.logAbsorbWait(route.ChannelID, absorb, "retryable upstream error", response.StatusCode)
+			continue
+		}
+		if upstreamContext.Err() != nil {
+			return
+		}
 		mergeGrokModelHeaders(w.Header(), response.Header)
 		if !positiveModelHeader(w.Header().Get(grokContextWindowHeader), 64) && discoveredContextWindow > 0 {
 			w.Header().Set(grokContextWindowHeader, fmt.Sprintf("%d", discoveredContextWindow))
 		}
 		copySafeResponseHeaders(w.Header(), response.Header)
-		retryable := setRetryDisposition(w.Header(), response.StatusCode, data)
 		if reasoningRejected {
 			w.Header().Set("X-Should-Retry", "false")
-			retryable = false
 		}
-		if response.StatusCode >= http.StatusInternalServerError {
-			if retryable {
-				s.logBreakerTransition(route.ChannelID, s.breakers.recordFailure(route.ChannelID))
-			}
-		} else if s.breakers.recordSuccess(route.ChannelID) {
-			s.log.Printf("UP breaker channel=%s closed after upstream response", route.ChannelID)
+		if retryable && response.StatusCode >= http.StatusInternalServerError && retryAfterSeconds(w.Header()) == 0 {
+			w.Header().Set("Retry-After", strconv.Itoa(synthesizedRetryAfterSeconds))
 		}
 		w.WriteHeader(response.StatusCode)
 		_, _ = w.Write(data)
 		return
 	}
 	defer response.Body.Close()
-	if s.breakers.recordSuccess(route.ChannelID) {
-		s.log.Printf("UP breaker channel=%s closed after upstream response", route.ChannelID)
-	}
 	mergeGrokModelHeaders(w.Header(), response.Header)
 	if !positiveModelHeader(w.Header().Get(grokContextWindowHeader), 64) && discoveredContextWindow > 0 {
 		w.Header().Set(grokContextWindowHeader, fmt.Sprintf("%d", discoveredContextWindow))
@@ -459,7 +479,7 @@ func requestKindLabel(kind facadeRequestKind) string {
 func setRetryDisposition(header http.Header, status int, body []byte) bool {
 	if upstreamHint := strings.TrimSpace(header.Get("X-Should-Retry")); upstreamHint != "" {
 		// An explicit upstream override wins; report its effective value so
-		// breaker accounting matches what Grok Build will actually retry.
+		// the absorb layer only swallows failures Grok Build would retry.
 		return !strings.EqualFold(upstreamHint, "false")
 	}
 	retry := status == http.StatusTooManyRequests || status == http.StatusInternalServerError ||
@@ -474,11 +494,16 @@ func setRetryDisposition(header http.Header, status int, body []byte) bool {
 func (s *Server) logBreakerTransition(channel string, transition breakerTransition) {
 	switch transition {
 	case breakerOpened:
-		s.log.Printf("UP breaker channel=%s opened after %d consecutive retryable upstream failures",
-			channel, circuitOpenThreshold)
+		s.log.Printf("UP breaker channel=%s opened after consecutive dial-level failures", channel)
 	case breakerProbeFailed:
 		s.log.Printf("UP breaker channel=%s probe failed; cooldown re-armed", channel)
 	}
+}
+
+func (s *Server) logAbsorbWait(channel string, absorb *absorbState, reason string, status int) {
+	s.log.Printf("UP absorb channel=%s attempt=%d reason=%s status=%d wait=%s elapsed=%s",
+		channel, absorb.attempt, reason, status,
+		absorb.lastWait.Round(time.Millisecond), absorb.elapsed().Round(time.Millisecond))
 }
 
 func classifyStructuredRetry(body []byte) (bool, bool) {

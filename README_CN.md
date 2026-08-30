@@ -6,7 +6,7 @@
 
 跨平台 Grok Build 本地代理，让自定义模型渠道兼容常见 API 格式、Build 原生 Web 工具、独立鉴权和自动配置恢复。
 
-[![Version](https://img.shields.io/badge/version-0.1.19-2f6feb.svg)](./internal/appinfo/appinfo.go)
+[![Version](https://img.shields.io/badge/version-0.1.20-2f6feb.svg)](./internal/appinfo/appinfo.go)
 [![Go](https://img.shields.io/badge/Go-1.26.6-00ADD8.svg)](./go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#平台支持)
@@ -57,7 +57,9 @@ hellogrok 为这些自定义渠道提供统一的本地兼容层。运行时准�
 - 转发前校验各协议的工具历史：Responses 调用必须有匹配的 `function_call_output`，Messages 的 `tool_use` 必须由紧邻的下一条 user 消息中的 `tool_result` 完整配对，Chat 工具调用必须有匹配的 tool 消息。确定性错误返回不可重试的 `400`，不会进入 Grok Build 重试循环。
 - 在私有 `keepalive`、`keep-alive`、`keep_alive`、`heartbeat`、`ping` 帧到达 Grok Build 前将其转换为标准 SSE 注释，不占用 Responses 事件序号；收到各协议的终止事件后立即关闭上游流。
 - 普通渠道的上游响应头等待及所有响应正文的两次读取间隔最多为 601 秒，比 Grok Build shell 默认的 600 秒多一秒；`api.deepseek.com` 官方路由使用 660 秒，以覆盖服务商记录的最长十分钟排队。请求没有总时限，非流式排队空行或规范化心跳等任意上游字节都会刷新空闲时限。
-- 为每个渠道维护独立的上游失败熔断器。同一渠道连续 4 次可重试上游失败（5xx、传输错误或错误正文读取失败）后，代理不再把请求转给上游，而是立即返回不可重试的 `503 proxy_circuit_open`（`X-Should-Retry: false`），让 Grok Build 立刻结束本轮，而不是空烧最多 15 次的重试预算。熔断后每 90 秒放行一次探测请求：成功则自动合闸，失败则重新计时；任何非 5xx 上游响应（含 429 限流）都会清零失败计数，响应头发送后的流式失败不受影响。
+- 在 Grok Build 看到之前吸收上游瞬态软故障。上游响应头尚未发出时，可重试失败（busy/过载 `503`、`429`、可重试 `5xx` 或响应头超时）会在代理内以指数退避（2s 至 30s，尊重上游 `Retry-After`，上限 60s）自动重试，默认最多等待 90 秒。窗口期内 Grok Build 自己的 15 次重试预算完全不动：只有窗口耗尽后客户端才会看到失败，且该失败仍以可重试形式透传，客户端原生预算分毫不少。传输错误不做吸收，因为 Grok Build 首次重试时的 HTTP/1.1 客户端重建比代理内重放更擅长处理；响应头发送后的流式失败不受影响。`absorb_retry_max_secs = 0` 可按渠道关闭该窗口。
+- 对软故障永不缩短 Grok Build 的原生重试预算。只有重试必然无果的确定性错误（鉴权、权限、账单、额度、无效请求或模型）才收到 `X-Should-Retry: false`，让 Grok Build 直接显示供应商的真实解释，而不是用反复重试掩盖。可重试的 busy/过载 `503` 透传时若上游未带 `Retry-After`，代理会补充 30 秒的 `Retry-After`，让 Grok Build 的重试节奏更合理。
+- 按渠道提供可选的死渠道熔断器（`dead_channel_fail_fast = true`，默认关闭）。只有拨号级失败——连接被拒、DNS 失败、TLS 握手失败——才会计数，因为这类失败重试永远不可能成功；busy `503`、`429`、超时和传输重置一律不计数。连续 6 次拨号级失败（可用 `dead_channel_fail_threshold` 调整）后，代理返回不可重试的 `503 proxy_circuit_open`（`X-Should-Retry: false`）。熔断后每 5 分钟放行一次探测请求：上游返回任何状态的响应都会自动合闸，探测失败则重新计时。
 - 在规范化前记录原始上游响应声明的模型，支持终止帧优先、大小写不敏感的不一致判断和多帧冲突标记，不改变路由或响应数据。
 - Messages 的 `thinking` 起始块缺少空 `signature` 时补齐该字段，同时保留供应商随后发送的真实 `signature_delta`，使 Messages 兼容中转可被 Grok Build 的严格原生解码器消费。
 - 在供应商边界保留每个渠道配置的上游 URL 路径和上游模型标识。
@@ -165,6 +167,10 @@ supports_backend_search = false
 | `max_completion_tokens` | 否 | 模型元数据 | 最大生成 token 额度。显式配置优先；缺失时，hellogrok 根据实际发出的请求和可信上游元数据计算预算，但不会把请求中观察到的值写回为模型输出上限。 |
 | `auto_compact_threshold_percent` | 否 | 模型值，其次 `[session]`，最后 `85` | Grok Build 相对于 `context_window` 的首选压缩触发百分比。安全时保持原值；需要为最大输出和安全余量预留空间时，按模型临时降低。有效范围为 `0` 到 `100`。 |
 | `inference_idle_timeout_secs` | 否 | Grok Build/供应商策略 | 等待上游响应头或正文数据时允许的最长空闲间隔。模型值优先于全局 `[models]` 值；DeepSeek 官方端点未显式设置时使用 660 秒。 |
+| `absorb_retry_max_secs` | 否 | `90` | 代理侧重试上游瞬态软故障（busy/过载 `503`、`429`、可重试 `5xx`、响应头超时）的总等待窗口。窗口期内 Grok Build 的重试预算不受影响。显式 `0` 可关闭该渠道的吸收层。 |
+| `absorb_retry_backoff_cap_secs` | 否 | `30` | 吸收层单次退避上限。错误响应上的上游 `Retry-After` 仍会主导等待节奏，上限 60 秒。 |
+| `dead_channel_fail_fast` | 否 | `false` | 渠道真正不可达时的可选快速失败：连续拨号级失败（连接被拒、DNS、TLS 握手）后，代理返回不可重试的 `503 proxy_circuit_open`，不再空烧 Grok Build 重试预算。软故障永不计数。 |
+| `dead_channel_fail_threshold` | 否 | `6` | 触发可选死渠道熔断所需的连续拨号级失败次数。 |
 
 模型设置可以直接写在 `[model.<id>]` 下，也可以从引用的 `[model_providers.<id>]` 继承；模型级设置优先。若模型和 provider 都没有设置 `api_backend`，hellogrok 会让该字段在 Grok Build 的活动配置中继续缺省，并跟随 Grok Build 当前模型目录解析后实际发来的协议；模型目录也不认识该模型时，才使用 Grok Build 的 `chat_completions` 回退。解析后的 Responses 请求若实际携带 hosted-search 工具，代理会把请求事实作为能力信号，因此未来目录新增模型不需要 hellogrok 增加模型 ID。
 
@@ -459,18 +465,19 @@ Responses 供应商继续使用 Responses。Messages 供应商接收 Messages �
 
 执行 `hellogrok routes` 并查看“状态与日志”，确认渠道 URL、后端、凭据来源、模型标识和服务商状态。上游故障、限流、不支持的载荷或被中转丢弃的搜索工具需要由服务商或中转解决。
 
-hellogrok 会保留上游状态和错误正文。结构化鉴权、权限、账单、余额或额度不足、无效请求和无效模型错误会收到 `X-Should-Retry: false`，让 Grok Build 显示原始供应商说明，而不是通过重复重试掩盖错误。结构化限流、超时、过载和临时不可用错误仍可重试。如果中转只返回通用 `503`，hellogrok 无法推断账号余额不足；中转必须提供账单错误代码或消息。
+hellogrok 会保留上游状态和错误正文。结构化鉴权、权限、账单、余额或额度不足、无效请求和无效模型错误会收到 `X-Should-Retry: false`，让 Grok Build 显示原始供应商说明，而不是通过重复重试掩盖错误——这些错误是确定性的，重试永远不可能成功。结构化限流、超时、过载和临时不可用错误仍可重试，代理会先在自己的吸收窗口内重试它们（日志中的 `UP absorb` 行），客户端根本不会看到。如果中转只返回通用 `503`，hellogrok 无法推断账号余额不足；中转必须提供账单错误代码或消息。
 
 ### 一直显示正在重试
 
-Grok Build 对可重试状态码（429、5xx）最多重试 15 次，单轮最长约 5.5 分钟。当中转渠道的源站持续宕机（例如 Cloudflare `502 The origin web server returned an invalid or incomplete response`）时，每一轮都会把这 15 次重试全部烧完，界面会长时间停在“重试中”，看起来像渠道彻底不可用。
+Grok Build 对可重试状态码（429、5xx）最多重试 15 次，单轮最长约 5.5 分钟。供应商瞬时过载（busy `503`）会先被 hellogrok 的吸收窗口隐藏，透传时还会用补充的 `Retry-After` 调整重试节奏，因此短时故障通常根本不会出现在界面上。当上游持续故障的时间超过吸收窗口时，客户端保留完整重试预算、界面停留在“重试中”阶段——这正是原生预期行为。
 
-从当前版本起，hellogrok 为每个渠道维护独立熔断器：同一渠道连续 4 次可重试上游失败后，代理不再把请求转给上游，而是立即返回不可重试的 `503 proxy_circuit_open`（`X-Should-Retry: false`），让 Grok Build 立刻结束本轮并显示错误，而不是空烧重试预算。熔断后每 90 秒放行一次探测请求：上游恢复则自动合闸继续使用；探测仍失败则重新计时。任何非 5xx 上游响应（含 429 限流）都会清零失败计数，不触发熔断。
+对于真正不可达的渠道（连接被拒、DNS、TLS 握手），重试永远不可能成功。可以对该渠道设置 `dead_channel_fail_fast = true` 启用死渠道熔断：连续 6 次拨号级失败（可用 `dead_channel_fail_threshold` 调整）后，代理返回 `503 proxy_circuit_open`（`X-Should-Retry: false`），本轮在几秒内结束而不是空烧预算。熔断后每 5 分钟放行一次探测请求；上游返回任何状态的响应都会自动合闸，探测失败则重新计时。busy `503`、`429`、超时和传输重置永不计数。
 
 看到 `proxy_circuit_open` 时：
 
-- 渠道只是暂时不可用时，等 90 秒再发消息即可自动恢复，无需重启代理或重新选择模型。
-- 连续看到该错误说明该中转源站长期故障，请切换到其它渠道（`/model`），或在代理日志中确认 `UP breaker` 记录的中转状态。
+- 渠道在网络层面不可达，而不是单纯繁忙。检查中转自身状态和网络路径；代理日志中的 `UP breaker` 行记录了拨号级失败。
+- 网络恢复后约 5 分钟再发送一次即可：探测会自动合闸，无需重启代理或重新选择模型。
+- 连续看到该错误说明该渠道长期不可达，请切换到其它渠道（`/model`），直到中转修复。
 
 502 也可能表示上游返回了结构不完整的成功响应。hellogrok 会在转发前校验 Responses、Messages 或 Chat Completions 的最小响应结构，日志会指出缺失或类型错误的字段。
 
@@ -496,7 +503,7 @@ Grok Build 对可重试状态码（429、5xx）最多重试 15 次，单轮最�
 
 流结束日志会包含 `heartbeats=<数量>`。若仍出现同一错误且该计数始终为零，请用 `hellogrok routes` 确认 Grok Build 确实经过当前代理；此时服务商很可能使用了其他私有事件名，应根据不含凭据的流抓取结果诊断，而不是添加模型专用绕过逻辑。
 
-普通渠道最多等待上游响应头 601 秒，任意响应正文（包括非流式 JSON 和错误正文）的两次读取之间也最多等待 601 秒，比 Grok Build shell 默认的 600 秒多一秒，以便由 Grok Build 原生负责超时分类。`api.deepseek.com` 官方路由使用 660 秒，因为 DeepSeek 最长可排队十分钟。非流式排队空行或流式心跳都属于有效数据，会刷新空闲时限。响应头返回前或读取非流式正文时超时会得到可重试的 `504`；若 `200` 流已经开始，则输出接收协议兼容的 `proxy_stream_error` 并关闭上游。代理不设置请求总时限，因此持续有数据的长响应不会被终止。日志中的 `response_model` 会同时显示上游声明模型和配置模型：`mismatch=true` 表示中转静默替换了模型，`conflict=true` 表示不同响应帧声明了不同模型。
+普通渠道最多等待上游响应头 601 秒，任意响应正文（包括非流式 JSON 和错误正文）的两次读取之间也最多等待 601 秒，比 Grok Build shell 默认的 600 秒多一秒，以便由 Grok Build 原生负责超时分类。`api.deepseek.com` 官方路由使用 660 秒，因为 DeepSeek 最长可排队十分钟。非流式排队空行或流式心跳都属于有效数据，会刷新空闲时限。响应头超时属于软故障：代理会先在吸收窗口内重试，窗口耗尽后才返回可重试的 `504`；读取非流式正文时超时会立即返回可重试的 `504`；若 `200` 流已经开始，则输出接收协议兼容的 `proxy_stream_error` 并关闭上游。代理不设置请求总时限，因此持续有数据的长响应不会被终止。日志中的 `response_model` 会同时显示上游声明模型和配置模型：`mismatch=true` 表示中转静默替换了模型，`conflict=true` 表示不同响应帧声明了不同模型。
 
 ### 自动压缩一直不触发
 

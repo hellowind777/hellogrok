@@ -710,6 +710,73 @@ base_url = "https://remote.example/v1"
 	}
 }
 
+func TestLoadModelsAbsorbAndDeadChannelSettings(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	raw := `[model_providers.tiered]
+base_url = "https://tiered.example/v1"
+absorb_retry_max_secs = 45
+dead_channel_fail_fast = true
+dead_channel_fail_threshold = 3
+
+[model.inherited]
+model_provider = "tiered"
+
+[model.override]
+model_provider = "tiered"
+absorb_retry_max_secs = 0
+absorb_retry_backoff_cap_secs = 10
+dead_channel_fail_fast = false
+
+[model.defaults]
+base_url = "https://defaults.example/v1"
+`
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	models, err := LoadModels(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byModel := map[string]Model{}
+	for _, model := range models {
+		byModel[model.ID] = model
+	}
+	if got := byModel["inherited"]; !got.AbsorbRetryMaxConfigured || got.AbsorbRetryMaxSecs != 45 ||
+		got.AbsorbRetryBackoffCapSecs != 0 ||
+		!got.DeadChannelFailFast || got.DeadChannelFailThreshold != 3 {
+		t.Fatalf("provider settings were not inherited: %+v", got)
+	}
+	if got := byModel["override"]; !got.AbsorbRetryMaxConfigured || got.AbsorbRetryMaxSecs != 0 ||
+		got.AbsorbRetryBackoffCapSecs != 10 ||
+		got.DeadChannelFailFast || got.DeadChannelFailThreshold != 3 {
+		t.Fatalf("model override or provider fallback resolved incorrectly: %+v", got)
+	}
+	if got := byModel["defaults"]; got.AbsorbRetryMaxConfigured || got.AbsorbRetryMaxSecs != 0 ||
+		got.AbsorbRetryBackoffCapSecs != 0 ||
+		got.DeadChannelFailFast || got.DeadChannelFailThreshold != 0 {
+		t.Fatalf("unconfigured settings must stay zero: %+v", got)
+	}
+
+	routes, err := BuildRoutes(models)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byRoute := map[string]Route{}
+	for _, route := range routes {
+		byRoute[route.ChannelID] = route
+	}
+	for _, id := range []string{"inherited", "override", "defaults"} {
+		model, route := byModel[id], byRoute[id]
+		if route.AbsorbRetryMaxSecs != model.AbsorbRetryMaxSecs ||
+			route.AbsorbRetryMaxConfigured != model.AbsorbRetryMaxConfigured ||
+			route.AbsorbRetryBackoffCapSecs != model.AbsorbRetryBackoffCapSecs ||
+			route.DeadChannelFailFast != model.DeadChannelFailFast ||
+			route.DeadChannelFailThreshold != model.DeadChannelFailThreshold {
+			t.Fatalf("route %q lost absorb/dead-channel provenance: model=%+v route=%+v", id, model, route)
+		}
+	}
+}
+
 func TestLoadModelsAcceptsZeroInferenceIdleTimeoutLikeGrokBuild(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.toml")
 	raw := "[models]\ninference_idle_timeout_secs = 0\n\n[model.zero]\nbase_url = \"https://example.test/v1\"\n"

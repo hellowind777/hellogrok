@@ -778,6 +778,8 @@ func TestFacadeAdvertisesConfiguredOrProviderModelLimitsOnEveryResponsePath(t *t
 			defer upstream.Close()
 
 			route := facadeRoute("deepseek-model-limits", "responses", "deepseek-v4-pro", "key", upstream.URL)
+			route.AbsorbRetryMaxSecs = 0
+			route.AbsorbRetryMaxConfigured = true
 			if test.official {
 				route.Host = "api.deepseek.com"
 				route.ChatSearchDialect = config.ChatSearchDialectResponses
@@ -1222,27 +1224,62 @@ func TestDeepSeekNativeChatStreamResourceFailureBecomesStructuredError(t *testin
 }
 
 func TestUpstreamResponseHeaderTimeoutReturnsRetryableGatewayTimeout(t *testing.T) {
-	release := make(chan struct{})
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-		<-release
-	}))
-	defer func() {
-		close(release)
-		upstream.Close()
-	}()
-
-	route := facadeRoute("header-timeout", "responses", "wire", "key", upstream.URL)
-	s := New(log.New(io.Discard, "", 0))
-	s.transport.ResponseHeaderTimeout = 100 * time.Millisecond
-	s.SetRoutes([]config.Route{route})
-	startPathTestServer(t, s)
-	started := time.Now()
-	data, status, header := postFacadeResponse(t, s, route.ChannelID, nativeRequestBody("responses", false), "")
-	if status != http.StatusGatewayTimeout || header.Get("X-Should-Retry") != "true" || !bytes.Contains(data, []byte("timed out")) {
-		t.Fatalf("status=%d retry=%q body=%s", status, header.Get("X-Should-Retry"), data)
+	tests := []struct {
+		name          string
+		absorbMaxSecs uint64
+		configured    bool
+		stubClock     bool
+		wantCalls     int32
+	}{
+		{
+			name:          "immediate passthrough with absorb disabled",
+			absorbMaxSecs: 0,
+			configured:    true,
+			wantCalls:     1,
+		},
+		{
+			name:          "absorbed until budget exhausted",
+			absorbMaxSecs: 2,
+			configured:    true,
+			stubClock:     true,
+			wantCalls:     2,
+		},
 	}
-	if elapsed := time.Since(started); elapsed >= time.Second {
-		t.Fatalf("response-header timeout returned too late: %s", elapsed)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var attempts atomic.Int32
+			release := make(chan struct{})
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				attempts.Add(1)
+				<-release
+			}))
+			defer func() {
+				close(release)
+				upstream.Close()
+			}()
+
+			route := facadeRoute("header-timeout", "responses", "wire", "key", upstream.URL)
+			route.AbsorbRetryMaxSecs = test.absorbMaxSecs
+			route.AbsorbRetryMaxConfigured = test.configured
+			s := New(log.New(io.Discard, "", 0))
+			if test.stubClock {
+				stubAbsorbClock(s)
+			}
+			s.transport.ResponseHeaderTimeout = 100 * time.Millisecond
+			s.SetRoutes([]config.Route{route})
+			startPathTestServer(t, s)
+			started := time.Now()
+			data, status, header := postFacadeResponse(t, s, route.ChannelID, nativeRequestBody("responses", false), "")
+			if status != http.StatusGatewayTimeout || header.Get("X-Should-Retry") != "true" || !bytes.Contains(data, []byte("timed out")) {
+				t.Fatalf("status=%d retry=%q body=%s", status, header.Get("X-Should-Retry"), data)
+			}
+			if elapsed := time.Since(started); elapsed >= time.Second {
+				t.Fatalf("response-header timeout returned too late: %s", elapsed)
+			}
+			if got := attempts.Load(); got != test.wantCalls {
+				t.Fatalf("upstream attempts=%d, want %d", got, test.wantCalls)
+			}
+		})
 	}
 }
 
@@ -1599,6 +1636,8 @@ func TestRetryDispositionPreservesUpstreamAndClassifiesDefaults(t *testing.T) {
 			}))
 			defer upstream.Close()
 			route := facadeRoute("retry", "responses", "wire", "key", upstream.URL)
+			route.AbsorbRetryMaxSecs = 0
+			route.AbsorbRetryMaxConfigured = true
 			s := New(log.New(io.Discard, "", 0))
 			s.SetRoutes([]config.Route{route})
 			startPathTestServer(t, s)
