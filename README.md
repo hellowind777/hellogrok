@@ -6,7 +6,7 @@
 
 A cross-platform local proxy that makes Grok Build custom model channels work with common API formats, native Web tools, isolated authentication, and automatic configuration recovery.
 
-[![Version](https://img.shields.io/badge/version-0.1.20-2f6feb.svg)](./internal/appinfo/appinfo.go)
+[![Version](https://img.shields.io/badge/version-0.1.21-2f6feb.svg)](./internal/appinfo/appinfo.go)
 [![Go](https://img.shields.io/badge/Go-1.26.6-00ADD8.svg)](./go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#platform-support)
@@ -66,6 +66,7 @@ It is intended for users who maintain multiple third-party model channels and wa
 - Prepares every explicit custom channel before use, avoiding first-request failures after `/model` switching.
 - Preserves portable conversation history during model hot switching while withholding only encrypted reasoning known to belong to a different channel, protocol, wire model, or upstream endpoint.
 - Preserves arbitrary Grok Build local function tools, including shell, file, patch, task, and MCP functions, through Responses, Messages, and Chat Completions bridges. Third-party channels never receive xAI-only `x_search`; provider-hosted tools still require real upstream support.
+- Carries Grok Build's stable conversation identity through the proxy as an internal `SessionIdentity`. OpenCode Go channels automatically receive the upstream-required `x-opencode-session` projected from `x-grok-conv-id`, `x-grok-session-id`, or `metadata.session_id`, without adding configuration or generating per-request IDs. Existing non-empty provider headers remain authoritative, and non-OpenCode Go channels are not modified.
 
 ### Native Web tools
 

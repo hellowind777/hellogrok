@@ -47,6 +47,8 @@ sessions*.json
 /*.db
 /*.sqlite
 /*.sqlite3
+*.db-*
+*.sqlite-*
 *.dmp
 *.har
 *.mht

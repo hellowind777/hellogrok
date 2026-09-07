@@ -4,6 +4,17 @@ All notable changes to this project are documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.21] — 2026-09-07
+
+### Added
+
+- Internal `SessionIdentity` normalization for Grok Build requests. Stable conversation identity can come from an existing upstream session header, Grok Build conversation/session headers, standard session headers, or `metadata.session_id`.
+- OpenCode Go upstream projection: custom routes under `opencode.ai/zen/go` now receive `x-opencode-session` when the incoming request supplies a stable identity. Existing non-empty values remain authoritative, and requests without a stable identity are not assigned a random per-request ID.
+
+### Fixed
+
+- OpenCode Go custom channels no longer lose Grok Build's conversation affinity when hellogrok rebuilds the upstream request for protocol conversion.
+
 ## [0.1.20] — 2026-08-30
 
 ### Added
@@ -301,7 +312,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - CC Switch compatibility detection and conflict warnings.
 - Builds for Windows, Linux, and macOS on amd64 and arm64.
 
-[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.20...HEAD
+[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.21...HEAD
+[0.1.21]: https://github.com/hellowind777/hellogrok/compare/v0.1.20...v0.1.21
 [0.1.20]: https://github.com/hellowind777/hellogrok/compare/v0.1.19...v0.1.20
 [0.1.19]: https://github.com/hellowind777/hellogrok/compare/v0.1.18...v0.1.19
 [0.1.18]: https://github.com/hellowind777/hellogrok/compare/v0.1.17...v0.1.18

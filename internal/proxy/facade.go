@@ -130,6 +130,7 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 			req.Header.Set("User-Agent", appinfo.Name+"/"+appinfo.Version)
 		}
 		applyRouteHeaders(req.Header, route, request.Protocol, incoming.Header)
+		projectUpstreamSessionHeaders(req.Header, route, incoming.Header, request.Body)
 		if request.Protocol == wireMessages && req.Header.Get("Anthropic-Version") == "" {
 			req.Header.Set("Anthropic-Version", "2023-06-01")
 		}

@@ -6,7 +6,7 @@
 
 跨平台 Grok Build 本地代理，让自定义模型渠道兼容常见 API 格式、Build 原生 Web 工具、独立鉴权和自动配置恢复。
 
-[![Version](https://img.shields.io/badge/version-0.1.20-2f6feb.svg)](./internal/appinfo/appinfo.go)
+[![Version](https://img.shields.io/badge/version-0.1.21-2f6feb.svg)](./internal/appinfo/appinfo.go)
 [![Go](https://img.shields.io/badge/Go-1.26.6-00ADD8.svg)](./go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#平台支持)
@@ -66,6 +66,7 @@ hellogrok 为这些自定义渠道提供统一的本地兼容层。运行时准�
 - 使用前准备所有显式自定义渠道，避免通过 `/model` 切换后首次请求失败。
 - 热切换模型时保留可移植的会话历史，只排除已知属于不同渠道、协议、线上模型或上游端点的加密推理。
 - 在 Responses、Messages 与 Chat Completions 桥接中保留 Grok Build 的任意本地函数工具，包括 Shell、文件、补丁、Task 和 MCP 函数。第三方渠道不会收到 xAI 专属的 `x_search`；供应商 hosted 工具仍须由上游真实支持。
+- 通过内部 `SessionIdentity` 传递 Grok Build 的稳定对话身份。OpenCode Go 渠道会自动把 `x-grok-conv-id`、`x-grok-session-id` 或 `metadata.session_id` 投影为上游要求的 `x-opencode-session`，无需增加配置，也不会为每个请求生成随机 ID。已有的非空供应商头保持优先，非 OpenCode Go 渠道不会被修改。
 
 ### 原生 Web 工具
 
