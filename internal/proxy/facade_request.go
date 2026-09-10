@@ -279,6 +279,11 @@ func adaptFacadeRequestWithReasoning(
 	root["model"] = route.WireModel
 	request.Protocol = native
 	request.Reasoning = filterReasoningRequest(root, native, route, provenance, filterMode)
+	if native == wireChatCompletions {
+		if err := normalizeChatToolHistory(root["messages"]); err != nil {
+			return facadeRequest{}, err
+		}
+	}
 	request.SearchQuery = lastUserTextForProtocol(root, native)
 	if err := validateNativeToolHistory(root, native); err != nil {
 		return facadeRequest{}, err
@@ -751,6 +756,9 @@ func responsesToChatRequest(root map[string]any, route config.Route) (map[string
 		if effort := stringValue(reasoning["effort"]); effort != "" {
 			out["reasoning_effort"] = effort
 		}
+	}
+	if err := normalizeChatToolHistory(out["messages"]); err != nil {
+		return nil, fmt.Errorf("converted Chat Completions request: %w", err)
 	}
 	if err := validateChatToolHistory(out["messages"]); err != nil {
 		return nil, fmt.Errorf("converted Chat Completions request: %w", err)

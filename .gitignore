@@ -81,6 +81,8 @@ sessions*.json
 /window.json
 /instance.lock
 /channel-smoke/
+/isolated-homes/
+/grok-home/
 /hot-switch-smoke/
 /hot-switch-restart/
 /.hellogrok-*

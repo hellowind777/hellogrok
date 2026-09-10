@@ -896,8 +896,11 @@ func (s *chatStreamState) appendToolCall(raw map[string]any) error {
 		call = &chatToolStream{wireIndex: index, outputIndex: -1}
 		s.tools[index] = call
 	}
-	if id := stringValue(raw["id"]); id != "" {
+	if id := stringValue(raw["id"]); id != "" && call.callID == "" {
 		call.callID = id
+	}
+	if call.callID == "" {
+		call.callID = compatID("call")
 	}
 	function, _ := raw["function"].(map[string]any)
 	if name := stringValue(function["name"]); name != "" {
@@ -1134,6 +1137,7 @@ func (s *Server) streamNativeSSE(w http.ResponseWriter, response *http.Response,
 	frames := 0
 	chatStreamID := compatID("chatcmpl")
 	chatCreatedAt := time.Now().Unix()
+	chatIDs := chatCallIDs{}
 	messagesSearchFilter := newMessagesHostedSearchStreamFilter(request)
 	evidence := newSearchEvidence()
 	writeHeartbeat := func() error {
@@ -1182,6 +1186,9 @@ func (s *Server) streamNativeSSE(w http.ResponseWriter, response *http.Response,
 		}
 		if request.Protocol == wireChatCompletions {
 			normalizeNativeChatRequiredFields(root, route, true, chatStreamID, chatCreatedAt)
+			if err := chatIDs.normalize(root, true); err != nil {
+				return err
+			}
 			normalizeNativeChatUsage(root, liveContextWindow(route, response.Header))
 		}
 		setDownstreamResponseModel(root, responseModelForRoute(route))
@@ -1490,6 +1497,11 @@ func writeChatSSEFallback(w http.ResponseWriter, response map[string]any) error 
 	for _, raw := range choices {
 		choice, _ := raw.(map[string]any)
 		choice["delta"] = valueOr(choice["message"], map[string]any{})
+		delta, _ := choice["delta"].(map[string]any)
+		for index, rawCall := range anySlice(delta["tool_calls"]) {
+			call, _ := rawCall.(map[string]any)
+			call["index"] = index
+		}
 		delete(choice, "message")
 	}
 	payload, err := json.Marshal(chunk)

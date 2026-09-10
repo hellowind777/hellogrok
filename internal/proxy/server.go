@@ -508,6 +508,7 @@ func (s *Server) streamResponsesSSE(w http.ResponseWriter, response *http.Respon
 	var deferredSearchDone []deferredFrame
 	var streamedText strings.Builder
 	var streamedURLs []string
+	itemIDs := responseIDs{}
 
 	writePayloadFrame := func(lines []string, payload string) error {
 		insertedData := false
@@ -590,6 +591,13 @@ func (s *Server) streamResponsesSSE(w http.ResponseWriter, response *http.Respon
 		}
 		modelObserver.observe(rawEvent, false)
 		evidence.observeJSON(restored)
+		if err := itemIDs.normalize(rawEvent); err != nil {
+			return err
+		}
+		restored, err = json.Marshal(rawEvent)
+		if err != nil {
+			return err
+		}
 		patchedData := patch.PatchSSEDataLineWithSequence("data: "+string(restored), options, events)
 		patchedPayload := strings.TrimSpace(strings.TrimPrefix(patchedData, "data:"))
 		event, err := decodeJSONMap([]byte(patchedPayload))

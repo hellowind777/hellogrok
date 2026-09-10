@@ -6,7 +6,7 @@
 
 A cross-platform local proxy that makes Grok Build custom model channels work with common API formats, native Web tools, isolated authentication, and automatic configuration recovery.
 
-[![Version](https://img.shields.io/badge/version-0.1.21-2f6feb.svg)](./internal/appinfo/appinfo.go)
+[![Version](https://img.shields.io/badge/version-0.1.22-2f6feb.svg)](./internal/appinfo/appinfo.go)
 [![Go](https://img.shields.io/badge/Go-1.26.6-00ADD8.svg)](./go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#platform-support)
@@ -66,7 +66,9 @@ It is intended for users who maintain multiple third-party model channels and wa
 - Prepares every explicit custom channel before use, avoiding first-request failures after `/model` switching.
 - Preserves portable conversation history during model hot switching while withholding only encrypted reasoning known to belong to a different channel, protocol, wire model, or upstream endpoint.
 - Preserves arbitrary Grok Build local function tools, including shell, file, patch, task, and MCP functions, through Responses, Messages, and Chat Completions bridges. Third-party channels never receive xAI-only `x_search`; provider-hosted tools still require real upstream support.
-- Carries Grok Build's stable conversation identity through the proxy as an internal `SessionIdentity`. OpenCode Go channels automatically receive the upstream-required `x-opencode-session` projected from `x-grok-conv-id`, `x-grok-session-id`, or `metadata.session_id`, without adding configuration or generating per-request IDs. Existing non-empty provider headers remain authoritative, and non-OpenCode Go channels are not modified.
+- Normalizes missing local tool-call IDs before delivery in native Chat and Messages responses. Responses streams retain output-item and function-call identities across events. Chat JSON-to-SSE fallback assigns independent indexes to parallel tool calls. Existing Chat history is repaired only when one missing call ID has one unambiguous matching result; ambiguous histories remain errors.
+- Projects conversation identity from the original request into `x-opencode-session` for official OpenCode Go and Zen routes across all three protocols, including search conversion and retries. Explicit channel headers take precedence. If the client supplies no identity, an isolated operation ID allows forwarding and remains fixed for internal retries; it does not establish conversation affinity across separate requests. This limitation is logged without the identity value.
+- Preserves an explicitly configured OpenCode `User-Agent`, then the incoming client header. When neither exists, reads the installed `grok --version` once and renders Grok Build's `grok-shell` identifier. Failure to identify the installed client is reported rather than inventing a version. Other providers are unchanged.
 
 ### Native Web tools
 
@@ -486,6 +488,8 @@ Prefer `[model."full.ID"]` when a channel ID contains dots. TOML interprets an u
 
 ### `tool_use` IDs have no immediately following `tool_result`
 
+Missing Chat or Messages response IDs are normalized before Grok Build receives them. Responses stream identities are associated by `output_index`; conflicting identities are rejected. If an older Chat session already contains missing IDs, only uniquely associated call/result pairs can be repaired. Start a new session when the history is ambiguous. Repair does not reconstruct missing tool names, arguments, or results.
+
 This provider error means the Messages conversation history is structurally invalid: every assistant message containing one or more `tool_use` blocks must be followed immediately by one user message whose leading `tool_result` blocks resolve that entire batch. hellogrok validates native history and also groups parallel Responses calls/results into one adjacent Messages assistant/user pair before the provider call. Missing results still return a non-retryable `400`; they are never invented because that would corrupt tool state.
 
 ### Messages reports `serialization error: missing field signature`
@@ -493,6 +497,8 @@ This provider error means the Messages conversation history is structurally inva
 Restart the proxy with the current build. Some Messages-compatible relays omit the required empty `signature` from a streamed `thinking` block start and provide the real opaque value later through `signature_delta`. Grok Build's native Messages decoder rejects that incomplete start before it can consume the delta. hellogrok completes only the missing protocol field and preserves the real delta unchanged for subsequent turns. If the relay never sends a real signature at all, verified hidden reasoning cannot be reconstructed downstream and the provider must fix its Messages response.
 
 ### Output arrives all at once
+
+For slow responses, distinguish upstream response-header time from stream completion in the proxy log. `UP absorb` records retry waits; reasoning effort, prompt size, tool loops, and provider queueing can also increase latency. A short request is not a reliable benchmark for a long tool-enabled conversation.
 
 For a streaming request, hellogrok sends `stream=true` to the selected provider API. Non-capable channels keep native SSE. Capable Messages and Chat channels are translated incrementally into Responses events so Grok Build can consume reasoning, text, function calls, `web_search_call`, sources, and terminal status. If the log reports a buffered fallback, the upstream returned one complete JSON response and true streaming was unavailable for that request.
 
@@ -574,6 +580,16 @@ Open the provider manager (for example, CC Switch) and disable its Grok Build ta
 
 ## Development
 
+Optional installed-client and live-provider checks are separate from ordinary tests. The live probe uses the selected configured channel, an isolated file, and read-only tool availability; it may incur provider charges. Replace the example channel with your own model-table ID. These checks do not establish universal provider compatibility.
+
+```powershell
+$env:HELLOGROK_GROK_E2E = "1"
+go test ./internal/proxy -run TestGrokBuildProcess -count=1 -timeout 5m
+$env:HELLOGROK_LIVE_CONFIG = Join-Path $HOME ".grok/config.toml"
+$env:HELLOGROK_LIVE_CHANNEL = "my-channel"
+go test ./internal/proxy -run '^TestLiveProviderReadTool$' -count=1 -timeout 4m
+```
+
 Run the local quality checks:
 
 ```bash
@@ -594,6 +610,9 @@ Windows users with configured live channels can run the integration smoke tests:
 CI runs tests and default builds on Windows, Linux, Intel macOS, and Apple Silicon macOS. It also builds the optional tray target natively on Linux and macOS. Tagged releases produce amd64 and arm64 artifacts for all three operating systems.
 
 ## Limitations
+
+- OpenCode requests without a client conversation identity use operation-scoped IDs, not reconstructed parent/subagent identities. Cross-request routing and cache affinity cannot be guaranteed in this case. Explicit static session headers should not be shared across unrelated conversations.
+- The Windows status/log window title displays the running application version. Restart both the proxy and its window after upgrading; downloading a release does not replace a running process.
 
 - hellogrok cannot create provider-side search capability. A hosted-search channel must actually support search and return its results.
 - Responses-to-Messages/Chat conversation conversion is enabled only for capability-enabled channels (explicit `supports_backend_search = true`, a selected default search model, the first-party DeepSeek endpoint default, or a hosted-search request resolved from Grok Build's remote model catalog), plus Grok Build's fixed non-streaming WebSearchClient request. Other cross-protocol requests are rejected.

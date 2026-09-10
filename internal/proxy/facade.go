@@ -55,6 +55,14 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	providerHeaders, err := openCodeRequestHeaders(route, incoming.Header, body)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if isOpenCodeRoute(route) && !extractSessionIdentity(incoming.Header, body).stable && strings.TrimSpace(headerValue(route.ExtraHeaders, "x-opencode-session")) == "" {
+		s.log.Printf("UP channel=%s session identity scope=operation: client supplied no conversation identity; cross-request routing continuity unavailable", route.ChannelID)
+	}
 	if completion := completionLimitFromRequest(request.Body, request.Protocol); completion > 0 {
 		s.observeCapacity(route.ChannelID, capacity.Observation{
 			MaxCompletionTokens: completion,
@@ -130,7 +138,9 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 			req.Header.Set("User-Agent", appinfo.Name+"/"+appinfo.Version)
 		}
 		applyRouteHeaders(req.Header, route, request.Protocol, incoming.Header)
-		projectUpstreamSessionHeaders(req.Header, route, incoming.Header, request.Body)
+		for name, values := range providerHeaders {
+			req.Header[name] = append([]string(nil), values...)
+		}
 		if request.Protocol == wireMessages && req.Header.Get("Anthropic-Version") == "" {
 			req.Header.Set("Anthropic-Version", "2023-06-01")
 		}
@@ -669,10 +679,16 @@ func (s *Server) normalizeNativeJSON(
 	if request.Protocol == wireMessages && request.HostedWebSearch {
 		stripMessagesHostedSearchBlocks(root)
 	}
+	if request.Protocol == wireMessages {
+		normalizeMessagesToolIDs(root)
+	}
 	if request.Protocol == wireChatCompletions {
 		window := liveContextWindow(route, header)
 		hadUsage := root["usage"] != nil
 		normalizeNativeChatRequiredFields(root, route, false, compatID("chatcmpl"), time.Now().Unix())
+		if err := (chatCallIDs{}).normalize(root, false); err != nil {
+			return nil, nil, err
+		}
 		normalizeNativeChatUsage(root, window)
 		if hadUsage && root["usage"] == nil && window > 0 {
 			s.log.Printf("UP channel=%s usage discarded: live context exceeds window window=%d",

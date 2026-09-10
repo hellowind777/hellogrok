@@ -4,6 +4,20 @@ All notable changes to this project are documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.22] — 2026-09-10
+
+### Fixed
+
+- Normalize missing Chat and Messages local tool-call IDs before delivery; repair only unambiguous missing-ID pairs in existing Chat history.
+- Preserve Responses output-item and function-call identities across stream events and reject conflicts. Assign tool indexes when converting buffered Chat responses to SSE.
+- Extend OpenCode session projection to Go and Zen across all three protocols. Extract identity before conversion and reuse headers for retries; unidentified requests receive isolated operation IDs instead of being blocked locally. Cross-request affinity remains unavailable without client identity.
+- Preserve configured or incoming OpenCode User-Agent headers; when absent, derive Grok Build identification from the installed executable instead of advertising hellogrok.
+
+### Added
+
+- Display the running application version in the Windows status/log window title.
+- Add opt-in live-provider read-tool verification and regression coverage for tool identity, parallel fallback calls, and OpenCode request headers.
+
 ## [0.1.21] — 2026-09-07
 
 ### Added
@@ -312,7 +326,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - CC Switch compatibility detection and conflict warnings.
 - Builds for Windows, Linux, and macOS on amd64 and arm64.
 
-[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.21...HEAD
+[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.22...HEAD
+[0.1.22]: https://github.com/hellowind777/hellogrok/compare/v0.1.21...v0.1.22
 [0.1.21]: https://github.com/hellowind777/hellogrok/compare/v0.1.20...v0.1.21
 [0.1.20]: https://github.com/hellowind777/hellogrok/compare/v0.1.19...v0.1.20
 [0.1.19]: https://github.com/hellowind777/hellogrok/compare/v0.1.18...v0.1.19

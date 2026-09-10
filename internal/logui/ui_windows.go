@@ -332,7 +332,7 @@ func buildWindow(
 		getRetention: getRetention, setRetention: setRetention,
 		retentionDays: prefs.DefaultLogRetentionUsageDays,
 	}
-	title, _ := syscall.UTF16PtrFromString("hellogrok — 状态与日志（关闭不影响代理）")
+	title, _ := syscall.UTF16PtrFromString("hellogrok " + appinfo.Version + " — 状态与日志（关闭不影响代理）")
 	x, y, w, h := loadGeometry()
 	hwnd, _, callErr := pCreateWindowExW.Call(
 		0,

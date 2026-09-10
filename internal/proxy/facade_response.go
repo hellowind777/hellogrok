@@ -41,6 +41,7 @@ func canonicalFromMessages(data []byte, hosted bool, query string) (canonicalRes
 	if err != nil {
 		return canonicalResult{}, err
 	}
+	normalizeMessagesToolIDs(root)
 	validationRoot := root
 	if hosted || root["usage"] == nil {
 		validationRoot = cloneMap(root)
@@ -482,6 +483,10 @@ func validateMessagesUsage(usage map[string]any, requireInput bool) error {
 // consumer intentionally models those start fields as required.
 func normalizeMessagesStreamRequiredFields(root map[string]any) {
 	switch stringValue(root["type"]) {
+	case "message_start":
+		if message, _ := root["message"].(map[string]any); message != nil {
+			normalizeMessagesToolIDs(message)
+		}
 	case "content_block_start":
 		if block, _ := root["content_block"].(map[string]any); block != nil {
 			normalizeMessagesStreamBlock(block)
@@ -507,6 +512,9 @@ func normalizeMessagesStreamBlock(block map[string]any) {
 	case "text":
 		setMissingString(block, "text")
 	case "tool_use":
+		if stringValue(block["id"]) == "" {
+			block["id"] = compatID("toolu")
+		}
 		if input, exists := block["input"]; !exists || input == nil {
 			block["input"] = map[string]any{}
 		}

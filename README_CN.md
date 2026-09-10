@@ -6,7 +6,7 @@
 
 跨平台 Grok Build 本地代理，让自定义模型渠道兼容常见 API 格式、Build 原生 Web 工具、独立鉴权和自动配置恢复。
 
-[![Version](https://img.shields.io/badge/version-0.1.21-2f6feb.svg)](./internal/appinfo/appinfo.go)
+[![Version](https://img.shields.io/badge/version-0.1.22-2f6feb.svg)](./internal/appinfo/appinfo.go)
 [![Go](https://img.shields.io/badge/Go-1.26.6-00ADD8.svg)](./go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#平台支持)
@@ -66,7 +66,9 @@ hellogrok 为这些自定义渠道提供统一的本地兼容层。运行时准�
 - 使用前准备所有显式自定义渠道，避免通过 `/model` 切换后首次请求失败。
 - 热切换模型时保留可移植的会话历史，只排除已知属于不同渠道、协议、线上模型或上游端点的加密推理。
 - 在 Responses、Messages 与 Chat Completions 桥接中保留 Grok Build 的任意本地函数工具，包括 Shell、文件、补丁、Task 和 MCP 函数。第三方渠道不会收到 xAI 专属的 `x_search`；供应商 hosted 工具仍须由上游真实支持。
-- 通过内部 `SessionIdentity` 传递 Grok Build 的稳定对话身份。OpenCode Go 渠道会自动把 `x-grok-conv-id`、`x-grok-session-id` 或 `metadata.session_id` 投影为上游要求的 `x-opencode-session`，无需增加配置，也不会为每个请求生成随机 ID。已有的非空供应商头保持优先，非 OpenCode Go 渠道不会被修改。
+- 在原生 Chat 和 Messages 响应交给客户端前补齐缺失的本地工具调用 ID；Responses 流在不同事件间保持输出项和函数调用身份一致；Chat JSON 转 SSE 时为并行工具调用分配独立索引。已有 Chat 历史仅在一个缺失调用 ID 能与唯一结果关联时修复，有歧义的历史仍会报错。
+- 从原始请求提取对话身份，为官方 OpenCode Go 和 Zen 路由补齐 `x-opencode-session`，覆盖三种协议、搜索转换及内部重试。显式渠道头优先；客户端未提供身份时，使用独立操作 ID 继续转发，并在内部重试中复用。操作 ID 不代表不同请求属于同一对话；日志会记录这一限制，但不记录身份值。
+- OpenCode 的 `User-Agent` 优先使用显式配置，其次保留入站客户端头；两者均缺失时，读取一次本机 `grok --version`，生成 Grok Build 的 `grok-shell` 标识。无法识别本机客户端时明确报错，不编造版本号。其他供应商保持不变。
 
 ### 原生 Web 工具
 
@@ -486,6 +488,8 @@ Grok Build 对可重试状态码（429、5xx）最多重试 15 次，单轮最�
 
 ### `tool_use` ID 后没有紧邻的 `tool_result`
 
+Chat 或 Messages 响应中缺失的 ID 会在交给 Grok Build 前补齐；Responses 流通过 `output_index` 关联身份，存在冲突时拒绝响应。旧 Chat 会话若已含缺失 ID，只能修复能唯一关联的调用与结果；历史有歧义时请新建会话。修复不会重建缺失的工具名称、参数或结果。
+
 这个供应商错误表示 Messages 会话历史结构无效：只要 assistant 消息含一个或多个 `tool_use`，紧邻的下一条 user 消息就必须用开头的 `tool_result` 块完整解析这一批调用。hellogrok 会校验原生历史，并在 Responses 转 Messages 时把并行调用及结果分别合并为紧邻的一条 assistant/user 消息后再请求供应商。真正缺失的结果仍返回不可重试的 `400`，不会伪造工具状态。
 
 ### Messages 提示 `serialization error: missing field signature`
@@ -493,6 +497,8 @@ Grok Build 对可重试状态码（429、5xx）最多重试 15 次，单轮最�
 请使用当前构建重新启动代理。部分 Messages 兼容中转会在流式 `thinking` 起始块中省略必需的空 `signature`，随后才通过 `signature_delta` 发送真实不透明值；Grok Build 的原生 Messages 解码器会在读取增量前拒绝这个不完整起始块。hellogrok 只补齐缺失的协议字段，并原样保留真实增量供后续轮次使用。若中转始终不发送真实签名，下游无法重建可验证的隐藏推理，只能由供应商修复 Messages 响应。
 
 ### 输出最后一次性出现
+
+响应较慢时，应区分代理日志中的上游响应头等待时间和流结束时间。`UP absorb` 记录内部重试等待；推理强度、提示词大小、工具循环和供应商排队也会增加耗时。短请求不能作为长上下文工具会话的可靠性能基准。
 
 对于流式请求，hellogrok 会向选定的供应商 API 发送 `stream=true`。未启用能力的渠道保持原生 SSE；启用能力的 Messages 和 Chat 渠道会被增量转换成 Responses 事件，使 Grok Build 能消费推理、文本、函数调用、`web_search_call`、来源和终止状态。日志若提示缓冲回退，说明上游只返回了一次性完整 JSON，本次请求无法实现真正流式。
 
@@ -574,6 +580,16 @@ hellogrok 会在停止时逐字段合并代理受管配置，因此修改 `suppo
 
 ## 开发与测试
 
+真实 Grok Build 进程测试及真实渠道测试默认不随常规测试运行。真实渠道探针使用指定渠道、隔离文件和只读工具，可能产生供应商费用；请将示例渠道替换为自己的模型表 ID。这些检查不代表所有供应商都已兼容。
+
+```powershell
+$env:HELLOGROK_GROK_E2E = "1"
+go test ./internal/proxy -run TestGrokBuildProcess -count=1 -timeout 5m
+$env:HELLOGROK_LIVE_CONFIG = Join-Path $HOME ".grok/config.toml"
+$env:HELLOGROK_LIVE_CHANNEL = "my-channel"
+go test ./internal/proxy -run '^TestLiveProviderReadTool$' -count=1 -timeout 4m
+```
+
 执行本地质量检查：
 
 ```bash
@@ -594,6 +610,9 @@ Windows 用户配置真实渠道后，可以运行集成冒烟测试：
 CI 会在 Windows、Linux、Intel macOS 和 Apple Silicon macOS 上运行测试与默认构建，并在 Linux 和 macOS 原生构建可选托盘目标。标签发布会生成三个操作系统的 amd64 与 arm64 产物。
 
 ## 使用限制
+
+- OpenCode 请求未携带客户端对话身份时使用操作级 ID，不会重建父会话或子代理身份，因此无法保证跨请求路由和缓存连续性。不要让无关对话共用显式配置的固定会话头。
+- Windows 状态与日志窗口标题显示正在运行的应用版本。升级后需要重启代理及其窗口；下载新版本不会替换已运行的进程。
 
 - hellogrok 无法创造服务商侧的搜索能力；hosted search 渠道必须真实支持搜索并返回结果。
 - Responses 到 Messages/Chat 的普通会话转换只对已启用能力的渠道开放（显式 `supports_backend_search = true`、被选中的默认搜索模型、DeepSeek 官方端点默认值，或 Grok Build 远程模型目录解析出的 hosted-search 请求），另加 Grok Build 固定的非流式 WebSearchClient 请求；其他跨协议请求会被拒绝。

@@ -1,14 +1,20 @@
-# Release Notes — v0.1.21
+# Release Notes — v0.1.22
 
-## Preserve Grok Build session identity for OpenCode Go
+## Tool-call compatibility
 
-OpenCode Go now requires `x-opencode-session` for request routing. Grok Build sends stable conversation identity under its own headers, so a custom channel could continue working in a direct client while failing when the same channel was proxied by hellogrok.
+- Fill missing local tool-call IDs in Chat and Messages responses before Grok Build receives them.
+- Keep Responses output-item and function-call identities consistent across stream events; reject conflicting identities.
+- Assign separate indexes to parallel tool calls when an upstream JSON response must be delivered as Chat SSE.
+- Repair existing Chat history only when a missing call ID can be associated with exactly one result. Ambiguous history still requires a new session.
 
-hellogrok now normalizes the incoming conversation identity internally and projects it at the upstream boundary for OpenCode Go channels:
+## OpenCode Go and Zen
 
-- Uses an existing non-empty `x-opencode-session` first.
-- Falls back to `x-grok-conv-id`, `x-grok-session-id`, `x-session-id`, `session_id`, or `metadata.session_id`.
-- Does not add configuration fields or generate a new per-request UUID.
-- Limits the projection to `opencode.ai/zen/go` routes; other providers, including official xAI and DeepSeek routes, are unchanged.
+- Preserve identity from the original request across Responses, Messages, Chat, search conversion, and internal retries.
+- Extend `x-opencode-session` projection to official Go and Zen routes. Requests without client identity receive an isolated operation ID instead of a local missing-identity rejection; retries reuse it. This does not restore conversation routing or cache affinity across separate requests.
+- Prefer explicitly configured User-Agent headers, then the incoming client identity. If both are absent, use Grok Build identification derived from the installed `grok --version`.
 
-Restart hellogrok after upgrading, then reselect the affected custom model in Grok Build if its active model entry was already loaded before the upgrade.
+## Windows
+
+The status/log window title now includes the running hellogrok version.
+
+Restart hellogrok after upgrading. Provider-hosted search and other provider capabilities still require upstream support; these fixes do not guarantee every third-party model supports every Grok Build tool.
