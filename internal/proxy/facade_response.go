@@ -136,11 +136,13 @@ func canonicalFromMessages(data []byte, hosted bool, query string) (canonicalRes
 	return result, nil
 }
 
-func canonicalFromChat(data []byte, hosted bool, query string) (canonicalResult, error) {
+func canonicalFromChat(data []byte, hosted bool, query string, advertised []advertisedTool) (canonicalResult, error) {
 	root, err := decodeJSONMap(data)
 	if err != nil {
 		return canonicalResult{}, err
 	}
+	prepareGrokBuildToolWire(root, wireChatCompletions)
+	adaptGrokBuildToolIdentity(root, wireChatCompletions, advertised)
 	if err := validateChatEnvelope(root); err != nil {
 		return canonicalResult{}, err
 	}
@@ -166,6 +168,7 @@ func canonicalFromChat(data []byte, hosted bool, query string) (canonicalResult,
 	}
 	for _, raw := range anySlice(message["tool_calls"]) {
 		call, _ := raw.(map[string]any)
+		liftChatToolCallObject(call)
 		fn, _ := call["function"].(map[string]any)
 		args := stringValue(fn["arguments"])
 		if args == "" && fn["arguments"] != nil {

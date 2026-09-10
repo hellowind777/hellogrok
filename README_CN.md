@@ -6,8 +6,9 @@
 
 跨平台 Grok Build 本地代理，让自定义模型渠道兼容常见 API 格式、Build 原生 Web 工具、独立鉴权和自动配置恢复。
 
-[![Version](https://img.shields.io/badge/version-0.1.22-2f6feb.svg)](./internal/appinfo/appinfo.go)
+[![Version](https://img.shields.io/badge/version-0.1.23-2f6feb.svg)](./internal/appinfo/appinfo.go)
 [![Go](https://img.shields.io/badge/Go-1.26.6-00ADD8.svg)](./go.mod)
+[![CI](https://github.com/hellowind777/hellogrok/actions/workflows/ci.yml/badge.svg)](https://github.com/hellowind777/hellogrok/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#平台支持)
 [![LINUX DO](https://img.shields.io/badge/LINUX_DO-链接认可-0A84FF?logo=linux&logoColor=white)](https://linux.do)
@@ -36,11 +37,11 @@
 
 ## 为什么需要 hellogrok
 
-Grok Build 可以接入自定义模型端点，但不同服务商实际提供的协议、响应格式、鉴权方式和 Web 搜索能力并不一致。一个能够通过 `curl` 返回文本的渠道，在正常 Grok Build 对话中仍可能失败、无法使用原生 Web 工具，或者收到错误的登录凭据。
+Grok Build 可以接入自定义模型端点，但不同服务商实际提供的协议、响应格式、鉴权方式、工具调用名称和 Web 搜索能力并不一致。一个能够通过 `curl` 返回文本的渠道，在正常 Grok Build 对话中仍可能失败、无法使用原生 Web 工具、把 `List` 当成 `list_dir` 来调，或者收到错误的登录凭据。中转站上的 grok-4.5/4.6 被改成 Chat Completions 或 Responses 时，也会碰到同一类问题。
 
-hellogrok 为这些自定义渠道提供统一的本地兼容层。运行时准备 Grok 必需配置，让每个渠道固定使用自己的端点和凭据，支持 Grok Build 原生 Web 工作流，并在停止时恢复原始配置。
+hellogrok 为这些自定义渠道提供统一的本地兼容层。运行时准备 Grok 必需配置，让每个渠道固定使用自己的端点和凭据，在 Responses、Messages 和 Chat Completions 上对齐 Grok Build 的本地工具、子代理、客户端搜索和 MCP 分发，并在停止时恢复原始配置。
 
-它适合需要维护多个第三方模型渠道，并希望直接在 Grok Build 中切换模型，而不想每次手动修改 URL 或工具设置的用户。
+它适合需要维护多个第三方模型渠道——包括 Kimi、DeepSeek、GLM 以及中转后的官方 Grok 模型——并希望直接在 Grok Build 中切换模型，而不想每次手动修改 URL 或工具设置的用户。
 
 ## 功能
 
@@ -65,10 +66,19 @@ hellogrok 为这些自定义渠道提供统一的本地兼容层。运行时准�
 - 在供应商边界保留每个渠道配置的上游 URL 路径和上游模型标识。
 - 使用前准备所有显式自定义渠道，避免通过 `/model` 切换后首次请求失败。
 - 热切换模型时保留可移植的会话历史，只排除已知属于不同渠道、协议、线上模型或上游端点的加密推理。
-- 在 Responses、Messages 与 Chat Completions 桥接中保留 Grok Build 的任意本地函数工具，包括 Shell、文件、补丁、Task 和 MCP 函数。第三方渠道不会收到 xAI 专属的 `x_search`；供应商 hosted 工具仍须由上游真实支持。
 - 在原生 Chat 和 Messages 响应交给客户端前补齐缺失的本地工具调用 ID；Responses 流在不同事件间保持输出项和函数调用身份一致；Chat JSON 转 SSE 时为并行工具调用分配独立索引。已有 Chat 历史仅在一个缺失调用 ID 能与唯一结果关联时修复，有歧义的历史仍会报错。
 - 从原始请求提取对话身份，为官方 OpenCode Go 和 Zen 路由补齐 `x-opencode-session`，覆盖三种协议、搜索转换及内部重试。显式渠道头优先；客户端未提供身份时，使用独立操作 ID 继续转发，并在内部重试中复用。操作 ID 不代表不同请求属于同一对话；日志会记录这一限制，但不记录身份值。
 - OpenCode 的 `User-Agent` 优先使用显式配置，其次保留入站客户端头；两者均缺失时，读取一次本机 `grok --version`，生成 Grok Build 的 `grok-shell` 标识。无法识别本机客户端时明确报错，不编造版本号。其他供应商保持不变。
+
+### Grok Build 本地工具
+
+Grok Build 在本地执行文件、终端、grep、子代理、客户端 `web_search`、MCP（先 `search_tool` 再 `use_tool`）和 Skill。hellogrok 通过 Responses、Messages 和 Chat Completions 转发这些声明，包括中转后的 grok-4.5/4.6 渠道。第三方渠道不会收到 xAI 专属的 `x_search`；供应商 hosted 工具仍须由上游真实支持。
+
+- 编码会话还会在 Grok Build 的 `list_dir`、`read_file`、`run_terminal_command`、`spawn_subagent` 旁声明 Claude/Codex 名称（`LS`、`Read`、`Bash`、`Task`、`Grep`、`Write`、`ToolSearch` 等）。
+- 入站调用会改写成已声明的 `client_name` 与参数键。Chat 顶层 `name`/`arguments`、旧版 `function_call`、对象形式参数、按参数形状回收的空名称，以及常见 XML/正文 JSON 调用，都会在 Grok Build 分发前规范化。
+- 直接 MCP 名（`server__tool`、`mcp__server__tool`）在声明了 `use_tool` 时会包成该元工具。Write 整文件写入会落到 `write` 或 `search_replace`。Glob 模式会落到 `glob`、`grep` 或 `rg --files`。缺失的必填 `description` 和 `subagent_type` 会补齐。
+- 中转 grok-4.5/4.6 发出的 Grok Build 原名原样通过。历史里的 tool 结果消息会补上对应 `name`，避免思考模型在下一轮拒绝请求。
+- hellogrok 不会凭空创造当前请求未声明的工具。模型若不发出 tool call，仍然不会执行工具。
 
 ### 原生 Web 工具
 
@@ -486,6 +496,12 @@ Grok Build 对可重试状态码（429、5xx）最多重试 15 次，单轮最�
 
 渠道 ID 含点号时优先使用 `[model."完整.ID"]`。未引用的 `[model.foo.bar]` 会被 TOML 解析成嵌套表，Grok Build 原本只看到 `foo`；hellogrok 启用后会临时规范化并验证该表头。`name` 中的点号或连字符不会参与鉴权。
 
+### Agent tried calling a tool that doesn't exist
+
+Grok Build 按精确 `client_name` 分发（是 `list_dir`，不是 `List`）。第三方或中转模型可能发出 Claude/Codex 名称、Chat 顶层 `name`、空的 `function.name`、正文里的 XML，或直接 MCP 名。当前 hellogrok 会把这些调用改写成该请求已声明的工具，并补修历史里的 `name`。
+
+升级后请重启两个 hellogrok 可执行文件，然后 **新开一轮会话**。旧对话里可能已经存下未映射的 `List` 或空名称；修好实时响应不会改写升级前写入的历史。若日志出现 `tool identity adapted List->list_dir`（或 `->use_tool`）而 TUI 仍提示工具不存在，说明模型调用了未声明的名称——hellogrok 不会凭空创造。
+
 ### `tool_use` ID 后没有紧邻的 `tool_result`
 
 Chat 或 Messages 响应中缺失的 ID 会在交给 Grok Build 前补齐；Responses 流通过 `output_index` 关联身份，存在冲突时拒绝响应。旧 Chat 会话若已含缺失 ID，只能修复能唯一关联的调用与结果；历史有歧义时请新建会话。修复不会重建缺失的工具名称、参数或结果。
@@ -616,7 +632,7 @@ CI 会在 Windows、Linux、Intel macOS 和 Apple Silicon macOS 上运行测试�
 
 - hellogrok 无法创造服务商侧的搜索能力；hosted search 渠道必须真实支持搜索并返回结果。
 - Responses 到 Messages/Chat 的普通会话转换只对已启用能力的渠道开放（显式 `supports_backend_search = true`、被选中的默认搜索模型、DeepSeek 官方端点默认值，或 Grok Build 远程模型目录解析出的 hosted-search 请求），另加 Grok Build 固定的非流式 WebSearchClient 请求；其他跨协议请求会被拒绝。
-- 中转如果主动删除工具声明、工具调用、引用或结果事件，下游无法完整恢复。
+- 中转如果主动删除工具声明、工具调用、引用或结果事件，下游无法完整恢复。hellogrok 只映射已声明的 Grok Build 工具和已知别名；不会发明未声明工具，也不会强迫从不发 tool call 的模型去用工具。
 - 供应商若无视 `stream=true`，等完整 JSON 已经返回后无法再变成真正流式；hellogrok 会记录并使用缓冲兼容回退。
 - 服务商加密的隐藏推理只属于其来源签名域。跨域切换会保留可见会话与工具历史，但会主动排除不兼容的私有推理。
 - 超出受支持 Responses、Chat Completions 和 Messages 格式的服务商私有扩展可能需要单独适配。

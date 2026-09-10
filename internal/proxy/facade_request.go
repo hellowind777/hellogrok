@@ -30,6 +30,7 @@ type facadeRequest struct {
 	ProxyAddedWebSearch  bool
 	ClientSearchPrepared bool
 	ClientSearchAlias    string
+	AdvertisedTools      []advertisedTool
 	Reasoning            reasoningFilterStats
 	ReasoningRecovery    bool
 }
@@ -240,6 +241,10 @@ func adaptFacadeRequestWithReasoning(
 		if preparedSearch {
 			request.Kind = clientSearchRequest
 		}
+		request.AdvertisedTools = collectAdvertisedFunctionTools(root, incoming)
+		prepareGrokBuildToolWire(root, incoming)
+		adaptGrokBuildToolIdentity(root, incoming, request.AdvertisedTools)
+		projectGrokToolAliases(root, incoming)
 		searchEligible := request.HostedWebSearch && toolChoiceAllowsHostedSearch(root["tool_choice"])
 		if !searchEligible {
 			request.Protocol = native
@@ -284,11 +289,15 @@ func adaptFacadeRequestWithReasoning(
 			return facadeRequest{}, err
 		}
 	}
+	request.AdvertisedTools = collectAdvertisedFunctionTools(root, native)
+	prepareGrokBuildToolWire(root, native)
+	adaptGrokBuildToolIdentity(root, native, request.AdvertisedTools)
 	request.SearchQuery = lastUserTextForProtocol(root, native)
 	if err := validateNativeToolHistory(root, native); err != nil {
 		return facadeRequest{}, err
 	}
 	describeClientWebTools(root)
+	projectGrokToolAliases(root, native)
 	request.ClientSearchAlias = chooseClientWebSearchWireAlias(root)
 	if !aliasClientWebSearchOnWire(root, request.ClientSearchAlias, native) {
 		request.ClientSearchAlias = ""

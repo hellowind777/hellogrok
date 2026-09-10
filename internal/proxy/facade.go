@@ -449,7 +449,7 @@ func (s *Server) writeTranslatedResponse(
 	case wireMessages:
 		result, err = canonicalFromMessages(data, request.HostedWebSearch, request.SearchQuery)
 	case wireChatCompletions:
-		result, err = canonicalFromChat(data, request.HostedWebSearch, request.SearchQuery)
+		result, err = canonicalFromChat(data, request.HostedWebSearch, request.SearchQuery, request.AdvertisedTools)
 	default:
 		err = fmt.Errorf("unsupported translated protocol %q", request.Protocol)
 	}
@@ -686,6 +686,7 @@ func (s *Server) normalizeNativeJSON(
 		window := liveContextWindow(route, header)
 		hadUsage := root["usage"] != nil
 		normalizeNativeChatRequiredFields(root, route, false, compatID("chatcmpl"), time.Now().Unix())
+		prepareGrokBuildToolWire(root, request.Protocol)
 		if err := (chatCallIDs{}).normalize(root, false); err != nil {
 			return nil, nil, err
 		}
@@ -695,11 +696,17 @@ func (s *Server) normalizeNativeJSON(
 				route.ChannelID, window)
 		}
 	}
+	if request.Protocol == wireMessages {
+		prepareGrokBuildToolWire(root, request.Protocol)
+	}
 	setDownstreamResponseModel(root, responseModelForRoute(route))
 	if err := validate(root); err != nil {
 		return nil, nil, err
 	}
 	restoreClientWebSearchAlias(root, request.ClientSearchAlias, request.Protocol)
+	if notes := adaptGrokBuildToolIdentity(root, request.Protocol, request.AdvertisedTools); len(notes) > 0 {
+		s.log.Printf("UP channel=%s tool identity adapted %s", route.ChannelID, strings.Join(notes, ","))
+	}
 	s.captureReasoningProvenance(route, root)
 	normalized, err := json.Marshal(root)
 	s.logSearchEvidence(route.ChannelID, request, evidence)
@@ -722,7 +729,7 @@ func (s *Server) writeClientSearchResponse(
 		if request.Protocol == wireMessages {
 			result, err = canonicalFromMessages(data, true, request.SearchQuery)
 		} else {
-			result, err = canonicalFromChat(data, true, request.SearchQuery)
+			result, err = canonicalFromChat(data, true, request.SearchQuery, request.AdvertisedTools)
 		}
 		if err == nil {
 			hadUsage := result.UsagePresent

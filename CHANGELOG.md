@@ -4,6 +4,15 @@ All notable changes to this project are documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.23] — 2026-09-11
+
+### Fixed
+
+- Align Grok Build's local capability surface for every custom channel, including relayed grok-4.5/4.6 endpoints that arrive as Responses, Messages, or Chat Completions. Tool-call names and wire shapes are resolved back to the function tools declared on the current request: empty or top-level Chat names, legacy `function_call`, object-valued arguments, Claude/Codex/display aliases, argument-shape recovery, and common XML/JSON-in-content calls.
+- Project Claude/Codex aliases (`LS`, `Read`, `Bash`, `Task`, …) onto coding-session tool lists so models can discover Grok Build tools under names they already know, then map those calls back to `list_dir`, `read_file`, `run_terminal_command`, `spawn_subagent`, and the rest before dispatch.
+- Wrap direct MCP names (`server__tool`, `mcp__server__tool`) as `use_tool` when that meta-tool is declared. Convert Write-style full-file payloads to `write` or `search_replace`, Glob-style patterns to `glob`/`grep`/`rg --files`, and fill required `description` / `subagent_type` fields that Grok Build schemas reject when omitted.
+- Repair request history and tool-result `name` fields so a mismatched alias call cannot poison the next thinking-model turn into a retryable stream error. Exact Grok Build names from relayed grok-4.5/4.6 sessions are left unchanged.
+
 ## [0.1.22] — 2026-09-10
 
 ### Fixed
@@ -326,7 +335,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - CC Switch compatibility detection and conflict warnings.
 - Builds for Windows, Linux, and macOS on amd64 and arm64.
 
-[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.22...HEAD
+[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.23...HEAD
+[0.1.23]: https://github.com/hellowind777/hellogrok/compare/v0.1.22...v0.1.23
 [0.1.22]: https://github.com/hellowind777/hellogrok/compare/v0.1.21...v0.1.22
 [0.1.21]: https://github.com/hellowind777/hellogrok/compare/v0.1.20...v0.1.21
 [0.1.20]: https://github.com/hellowind777/hellogrok/compare/v0.1.19...v0.1.20

@@ -412,7 +412,7 @@ func TestSearchSourcesCoverResponsesAndChatMetadataVariants(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			body := []byte(`{"id":"chat_1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"answer",` +
 				test.metadata + `},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
-			result, err := canonicalFromChat(body, true, "current news")
+			result, err := canonicalFromChat(body, true, "current news", nil)
 			if err != nil {
 				t.Fatal(err)
 			}

@@ -827,6 +827,7 @@ func (s *chatStreamState) handle(payload []byte) error {
 			if call == nil {
 				continue
 			}
+			liftChatToolCallObject(call)
 			if err := s.appendToolCall(call); err != nil {
 				return err
 			}
@@ -924,9 +925,15 @@ func (s *chatStreamState) appendToolCall(raw map[string]any) error {
 
 func (s *chatStreamState) startToolCall(call *chatToolStream) error {
 	name := restoreStreamToolName(call.name.String(), s.request.ClientSearchAlias)
-	if strings.TrimSpace(name) == "" {
+	resolved, rewritten, _ := adaptResolvedCall(name, call.arguments.String(), s.request.AdvertisedTools)
+	if strings.TrimSpace(resolved) == "" {
 		return fmt.Errorf("Chat Completions tool call %d has no function name", call.wireIndex)
 	}
+	if rewritten != call.arguments.String() {
+		call.arguments.Reset()
+		call.arguments.WriteString(rewritten)
+	}
+	name = resolved
 	item := functionCallItem(call.callID, name, "")
 	item["status"] = "in_progress"
 	call.item, call.outputIndex, call.started = item, s.appendItem(item), true
@@ -1186,6 +1193,7 @@ func (s *Server) streamNativeSSE(w http.ResponseWriter, response *http.Response,
 		}
 		if request.Protocol == wireChatCompletions {
 			normalizeNativeChatRequiredFields(root, route, true, chatStreamID, chatCreatedAt)
+			prepareGrokBuildToolWire(root, request.Protocol)
 			if err := chatIDs.normalize(root, true); err != nil {
 				return err
 			}
@@ -1193,6 +1201,9 @@ func (s *Server) streamNativeSSE(w http.ResponseWriter, response *http.Response,
 		}
 		setDownstreamResponseModel(root, responseModelForRoute(route))
 		restoreClientWebSearchAlias(root, request.ClientSearchAlias, request.Protocol)
+		if notes := adaptGrokBuildToolIdentity(root, request.Protocol, request.AdvertisedTools); len(notes) > 0 {
+			s.log.Printf("UP channel=%s tool identity adapted %s", route.ChannelID, strings.Join(notes, ","))
+		}
 		s.captureReasoningProvenance(route, root)
 		encoded, err := json.Marshal(root)
 		if err != nil {

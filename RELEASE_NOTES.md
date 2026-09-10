@@ -1,20 +1,10 @@
-# Release Notes — v0.1.22
+# Release Notes — v0.1.23
 
-## Tool-call compatibility
+## Grok Build local capability alignment
 
-- Fill missing local tool-call IDs in Chat and Messages responses before Grok Build receives them.
-- Keep Responses output-item and function-call identities consistent across stream events; reject conflicting identities.
-- Assign separate indexes to parallel tool calls when an upstream JSON response must be delivered as Chat SSE.
-- Repair existing Chat history only when a missing call ID can be associated with exactly one result. Ambiguous history still requires a new session.
+- Every custom channel — Kimi, DeepSeek, GLM, and relayed grok-4.5/4.6 in Responses, Messages, or Chat Completions — now shares Grok Build's local tool surface: files, shell, grep, subagents, client web search, MCP via `search_tool`/`use_tool`, and skills.
+- Coding sessions also advertise Claude/Codex names (`LS`, `Read`, `Bash`, `Task`, …). Calls come back as `list_dir`, `read_file`, `run_terminal_command`, `spawn_subagent`.
+- Direct MCP names (`server__tool`, `mcp__server__tool`) become `use_tool`. Write-style full-file payloads, Glob patterns, and missing required `description` / `subagent_type` fields are filled so Grok Build can parse them.
+- Exact Grok Build names from relayed grok-4.5/4.6 are left unchanged. History tool-result messages receive the matching `name` so thinking models do not reject the next turn.
 
-## OpenCode Go and Zen
-
-- Preserve identity from the original request across Responses, Messages, Chat, search conversion, and internal retries.
-- Extend `x-opencode-session` projection to official Go and Zen routes. Requests without client identity receive an isolated operation ID instead of a local missing-identity rejection; retries reuse it. This does not restore conversation routing or cache affinity across separate requests.
-- Prefer explicitly configured User-Agent headers, then the incoming client identity. If both are absent, use Grok Build identification derived from the installed `grok --version`.
-
-## Windows
-
-The status/log window title now includes the running hellogrok version.
-
-Restart hellogrok after upgrading. Provider-hosted search and other provider capabilities still require upstream support; these fixes do not guarantee every third-party model supports every Grok Build tool.
+Restart hellogrok after upgrading. This does not invent tools that were not declared, and xAI-only hosted tools such as `x_search` stay excluded.

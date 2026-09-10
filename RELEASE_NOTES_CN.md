@@ -1,20 +1,10 @@
-# 发布说明 — v0.1.22
+# 发布说明 — v0.1.23
 
-## 工具调用兼容
+## Grok Build 本地能力面对齐
 
-- 在 Chat 和 Messages 响应交给 Grok Build 前补齐缺失的本地工具调用 ID。
-- 保持 Responses 流中输出项和函数调用的跨事件身份一致，拒绝冲突身份。
-- 上游返回 JSON、客户端需要 Chat SSE 时，为并行工具调用分配独立索引。
-- 已有 Chat 历史仅在缺失调用 ID 可与唯一结果关联时修复；有歧义的历史仍需新建会话。
+- 每个自定义渠道——Kimi、DeepSeek、GLM，以及被中转成 Responses、Messages 或 Chat Completions 的 grok-4.5/4.6——现在共用 Grok Build 的本地工具面：文件、终端、grep、子代理、客户端网页搜索、MCP（`search_tool`/`use_tool`）和 Skill。
+- 编码会话还会声明 Claude/Codex 名称（`LS`、`Read`、`Bash`、`Task` 等）。调用会收回 `list_dir`、`read_file`、`run_terminal_command`、`spawn_subagent`。
+- 直接 MCP 名（`server__tool`、`mcp__server__tool`）会包成 `use_tool`。Write 整文件写入、Glob 模式，以及缺失的必填 `description` / `subagent_type` 会补齐，让 Grok Build 能解析。
+- 中转 grok-4.5/4.6 发出的 Grok Build 原名保持不变。历史里的 tool 结果消息会补上对应 `name`，避免思考模型在下一轮拒绝请求。
 
-## OpenCode Go 与 Zen
-
-- 从原始请求保留身份，覆盖 Responses、Messages、Chat、搜索转换及内部重试。
-- 将 `x-opencode-session` 适配扩展到官方 Go 和 Zen 路由。客户端未提供身份时，使用独立操作 ID 继续转发，不再因缺少身份被本地拒绝；内部重试复用同一 ID。这不会恢复不同请求间的对话路由或缓存连续性。
-- User-Agent 优先保留显式配置，其次使用入站客户端标识；两者均缺失时，从本机 `grok --version` 生成 Grok Build 标识。
-
-## Windows
-
-状态与日志窗口标题现在包含正在运行的 hellogrok 版本号。
-
-升级后请重启 hellogrok。供应商侧搜索及其他能力仍需上游真实支持；这些修复不代表所有第三方模型都支持 Grok Build 的每一种工具。
+升级后请重启 hellogrok。未在当前请求中声明的工具不会被凭空创造；`x_search` 等 xAI 专属 hosted 工具仍排除。

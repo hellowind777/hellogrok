@@ -6,8 +6,9 @@
 
 A cross-platform local proxy that makes Grok Build custom model channels work with common API formats, native Web tools, isolated authentication, and automatic configuration recovery.
 
-[![Version](https://img.shields.io/badge/version-0.1.22-2f6feb.svg)](./internal/appinfo/appinfo.go)
+[![Version](https://img.shields.io/badge/version-0.1.23-2f6feb.svg)](./internal/appinfo/appinfo.go)
 [![Go](https://img.shields.io/badge/Go-1.26.6-00ADD8.svg)](./go.mod)
+[![CI](https://github.com/hellowind777/hellogrok/actions/workflows/ci.yml/badge.svg)](https://github.com/hellowind777/hellogrok/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#platform-support)
 [![LINUX DO](https://img.shields.io/badge/LINUX_DO-recognized-0A84FF?logo=linux&logoColor=white)](https://linux.do)
@@ -36,11 +37,11 @@ A cross-platform local proxy that makes Grok Build custom model channels work wi
 
 ## Why hellogrok
 
-Grok Build can use custom model endpoints, but real-world providers do not all expose the same protocol, response shape, authentication method, or Web-search behavior. A channel that works with `curl` can still fail in a normal Grok Build conversation, lose native Web tools, or receive the wrong login credential.
+Grok Build can use custom model endpoints, but real-world providers do not all expose the same protocol, response shape, authentication method, tool-call names, or Web-search behavior. A channel that works with `curl` can still fail in a normal Grok Build conversation, lose native Web tools, call `List` instead of `list_dir`, or receive the wrong login credential. Relayed grok-4.5/4.6 endpoints have the same problem when the relay rewrites the API as Chat Completions or Responses.
 
-hellogrok provides one local compatibility layer for those custom channels. It prepares the required Grok configuration while running, keeps each channel tied to its own endpoint and credentials, supports Grok Build's native Web workflows, and restores the original configuration when stopped.
+hellogrok provides one local compatibility layer for those custom channels. It prepares the required Grok configuration while running, keeps each channel tied to its own endpoint and credentials, aligns Grok Build's local tools, subagents, client search, and MCP dispatch across Responses, Messages, and Chat Completions, and restores the original configuration when stopped.
 
-It is intended for users who maintain multiple third-party model channels and want to switch between them from Grok Build without manually rewriting URLs or changing tool configuration for every session.
+It is intended for users who maintain multiple third-party model channels — including Kimi, DeepSeek, GLM, and relayed official Grok models — and want to switch between them from Grok Build without manually rewriting URLs or changing tool configuration for every session.
 
 ## Features
 
@@ -65,10 +66,19 @@ It is intended for users who maintain multiple third-party model channels and wa
 - Preserves each configured upstream URL path and wire-model identifier at the provider boundary.
 - Prepares every explicit custom channel before use, avoiding first-request failures after `/model` switching.
 - Preserves portable conversation history during model hot switching while withholding only encrypted reasoning known to belong to a different channel, protocol, wire model, or upstream endpoint.
-- Preserves arbitrary Grok Build local function tools, including shell, file, patch, task, and MCP functions, through Responses, Messages, and Chat Completions bridges. Third-party channels never receive xAI-only `x_search`; provider-hosted tools still require real upstream support.
 - Normalizes missing local tool-call IDs before delivery in native Chat and Messages responses. Responses streams retain output-item and function-call identities across events. Chat JSON-to-SSE fallback assigns independent indexes to parallel tool calls. Existing Chat history is repaired only when one missing call ID has one unambiguous matching result; ambiguous histories remain errors.
 - Projects conversation identity from the original request into `x-opencode-session` for official OpenCode Go and Zen routes across all three protocols, including search conversion and retries. Explicit channel headers take precedence. If the client supplies no identity, an isolated operation ID allows forwarding and remains fixed for internal retries; it does not establish conversation affinity across separate requests. This limitation is logged without the identity value.
 - Preserves an explicitly configured OpenCode `User-Agent`, then the incoming client header. When neither exists, reads the installed `grok --version` once and renders Grok Build's `grok-shell` identifier. Failure to identify the installed client is reported rather than inventing a version. Other providers are unchanged.
+
+### Grok Build local tools
+
+Grok Build executes files, shell, grep, subagents, client `web_search`, MCP (`search_tool` then `use_tool`), and skills locally. hellogrok forwards those declarations through Responses, Messages, and Chat Completions, including relayed grok-4.5/4.6 channels. Third-party channels never receive xAI-only `x_search`; provider-hosted tools still require real upstream support.
+
+- Coding sessions also advertise Claude/Codex names (`LS`, `Read`, `Bash`, `Task`, `Grep`, `Write`, `ToolSearch`, …) next to Grok Build's `list_dir`, `read_file`, `run_terminal_command`, and `spawn_subagent`.
+- Inbound calls are rewritten to the declared `client_name` and parameter keys. Top-level Chat `name`/`arguments`, legacy `function_call`, object-valued arguments, empty names recovered from argument shape, and common XML/JSON-in-content calls are normalized before Grok Build dispatches.
+- Direct MCP names (`server__tool`, `mcp__server__tool`) become `use_tool` when that meta-tool is declared. Write-style full-file payloads become `write` or `search_replace`. Glob patterns become `glob`, `grep`, or `rg --files`. Missing required `description` and `subagent_type` fields are filled.
+- Exact Grok Build names from relayed grok-4.5/4.6 pass through unchanged. History tool-result messages receive the matching `name` so thinking models do not reject the next turn.
+- hellogrok never invents a tool that was not declared on the current request. A model that never emits a tool call still will not run tools.
 
 ### Native Web tools
 
@@ -486,6 +496,12 @@ When you see `proxy_circuit_open`:
 
 Prefer `[model."full.ID"]` when a channel ID contains dots. TOML interprets an unquoted `[model.foo.bar]` as nested tables, so Grok Build originally sees only `foo`; hellogrok temporarily normalizes and validates that header while enabled. Dots or dashes in `name` do not participate in authentication.
 
+### Agent tried calling a tool that doesn't exist
+
+Grok Build dispatches by exact `client_name` (`list_dir`, not `List`). A third-party or relayed model may emit Claude/Codex names, a top-level Chat `name`, an empty `function.name`, XML in the message body, or a direct MCP name. Current hellogrok rewrites those calls to the tools declared on that request and repairs history `name` fields.
+
+Restart both hellogrok executables after upgrading, then start a **new** session. An older conversation can already contain an unmapped `List` or empty name; repairing the live response does not rewrite stored history from before the upgrade. If the log shows `tool identity adapted List->list_dir` (or `->use_tool`) and the TUI still reports a missing tool, the model called a name that was not declared — hellogrok will not invent it.
+
 ### `tool_use` IDs have no immediately following `tool_result`
 
 Missing Chat or Messages response IDs are normalized before Grok Build receives them. Responses stream identities are associated by `output_index`; conflicting identities are rejected. If an older Chat session already contains missing IDs, only uniquely associated call/result pairs can be repaired. Start a new session when the history is ambiguous. Repair does not reconstruct missing tool names, arguments, or results.
@@ -616,7 +632,7 @@ CI runs tests and default builds on Windows, Linux, Intel macOS, and Apple Silic
 
 - hellogrok cannot create provider-side search capability. A hosted-search channel must actually support search and return its results.
 - Responses-to-Messages/Chat conversation conversion is enabled only for capability-enabled channels (explicit `supports_backend_search = true`, a selected default search model, the first-party DeepSeek endpoint default, or a hosted-search request resolved from Grok Build's remote model catalog), plus Grok Build's fixed non-streaming WebSearchClient request. Other cross-protocol requests are rejected.
-- A relay that removes tool declarations, tool calls, citations, or result events cannot be fully repaired downstream.
+- A relay that removes tool declarations, tool calls, citations, or result events cannot be fully repaired downstream. hellogrok maps declared Grok Build tools and well-known aliases; it does not invent undeclared tools or force a model that never emits a tool call.
 - A provider that ignores `stream=true` cannot be made truly streaming after its complete JSON response has already arrived; hellogrok logs and uses a buffered compatibility fallback.
 - Provider-encrypted hidden reasoning is scoped to its emitting signature domain. Cross-domain switching preserves visible conversation and tool history but intentionally omits incompatible private reasoning.
 - Provider-specific API extensions outside the supported Responses, Chat Completions, and Messages formats may require additional adaptation.

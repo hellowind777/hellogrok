@@ -48,7 +48,7 @@ func TestTranslatedUsageAbsenceDoesNotInventZero(t *testing.T) {
 		`{"id":"chat_1","object":"chat.completion","model":"wire","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{}}`,
 	}
 	for _, body := range chatBodies {
-		result, err := canonicalFromChat([]byte(body), false, "")
+		result, err := canonicalFromChat([]byte(body), false, "", nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -88,7 +88,7 @@ func TestMessagesUsageIncludesCacheCreationAndReadTokens(t *testing.T) {
 
 func TestChatUsagePreservesProviderTotalCacheAndReasoning(t *testing.T) {
 	body := []byte(`{"id":"chat_1","object":"chat.completion","model":"wire","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":50,"completion_tokens":20,"total_tokens":123,"prompt_cache_hit_tokens":10,"prompt_cache_miss_tokens":40,"completion_tokens_details":{"reasoning_tokens":7}}}`)
-	result, err := canonicalFromChat(body, false, "")
+	result, err := canonicalFromChat(body, false, "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
