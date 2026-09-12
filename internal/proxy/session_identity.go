@@ -114,15 +114,64 @@ var installedGrokUserAgent = sync.OnceValues(func() (string, error) {
 	if len(fields) < 2 || fields[0] != "grok" {
 		return "", fmt.Errorf("unrecognized Grok Build version output; configure User-Agent explicitly")
 	}
-	arch := runtime.GOARCH
-	if arch == "amd64" {
-		arch = "x86_64"
-	} else if arch == "arm64" {
-		arch = "aarch64"
-	}
-	osName := runtime.GOOS
-	if osName == "darwin" {
-		osName = "macos"
-	}
-	return fmt.Sprintf("grok-shell/%s (%s; %s)", fields[1], osName, arch), nil
+	return fmt.Sprintf("grok-shell/%s (%s; %s)", fields[1], grokShellOS(), grokShellArch()), nil
 })
+
+const grokShellClientIdentifier = "grok-shell"
+
+func grokShellOS() string {
+	if runtime.GOOS == "darwin" {
+		return "macos"
+	}
+	return runtime.GOOS
+}
+
+func grokShellArch() string {
+	switch runtime.GOARCH {
+	case "amd64":
+		return "x86_64"
+	case "arm64":
+		return "aarch64"
+	default:
+		return runtime.GOARCH
+	}
+}
+
+func isGrokShellUserAgent(ua string) bool {
+	ua = strings.ToLower(strings.TrimSpace(ua))
+	return strings.HasPrefix(ua, "grok-shell/") || strings.HasPrefix(ua, "grok-shell ")
+}
+
+func fallbackGrokShellUserAgent() string {
+	return fmt.Sprintf("grok-shell (%s; %s)", grokShellOS(), grokShellArch())
+}
+
+// applyGrokBuildClientHeaders presents every upstream call as Grok Build so
+// relays can classify the client. Incoming grok-shell identity is kept;
+// hellogrok's own product string is never forwarded.
+func applyGrokBuildClientHeaders(header http.Header, incoming http.Header) {
+	if header == nil {
+		return
+	}
+	if !isGrokShellUserAgent(header.Get("User-Agent")) {
+		if ua := strings.TrimSpace(incoming.Get("User-Agent")); isGrokShellUserAgent(ua) {
+			header.Set("User-Agent", ua)
+		} else if ua, err := installedGrokUserAgent(); err == nil {
+			header.Set("User-Agent", ua)
+		} else {
+			header.Set("User-Agent", fallbackGrokShellUserAgent())
+		}
+	}
+	if strings.TrimSpace(header.Get("X-Grok-Client-Identifier")) == "" {
+		if id := strings.TrimSpace(incoming.Get("X-Grok-Client-Identifier")); id != "" {
+			header.Set("X-Grok-Client-Identifier", id)
+		} else {
+			header.Set("X-Grok-Client-Identifier", grokShellClientIdentifier)
+		}
+	}
+	if strings.TrimSpace(header.Get("X-Grok-Client-Version")) == "" {
+		if version := strings.TrimSpace(incoming.Get("X-Grok-Client-Version")); version != "" {
+			header.Set("X-Grok-Client-Version", version)
+		}
+	}
+}

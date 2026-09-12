@@ -3,6 +3,7 @@ package proxy
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"strings"
 	"unicode"
 )
@@ -48,24 +49,6 @@ var grokToolAliasIndex = buildGrokToolAliasIndex(map[string][]string{
 	"lsp":                            {"lsp"},
 	"write":                          {"writefile", "createfile"},
 })
-
-// grokToolAliasProjection is cloned onto the upstream tools list so models
-// trained on Claude/Codex/OpenCode names can see those names in declarations.
-var grokToolAliasProjection = map[string][]string{
-	"list_dir":             {"LS", "List"},
-	"read_file":            {"Read"},
-	"write":                {"Write"},
-	"search_replace":       {"Edit", "MultiEdit"},
-	"run_terminal_command": {"Bash", "Shell"},
-	"grep":                 {"Grep"},
-	"glob":                 {"Glob"},
-	"web_search":           {"WebSearch"},
-	"web_fetch":            {"WebFetch"},
-	"todo_write":           {"TodoWrite"},
-	"spawn_subagent":       {"Task", "Agent"},
-	"search_tool":          {"ToolSearch"},
-	"skill":                {"Skill"},
-}
 
 var grokParamAliasIndex = map[string][]string{
 	"target_directory": {"path", "directory", "dir", "targetdir", "target_dir", "folder"},
@@ -488,7 +471,28 @@ func shellQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", `'"'"'`) + "'"
 }
 
+func jsonObjectComplete(arguments string) bool {
+	trimmed := strings.TrimSpace(arguments)
+	if trimmed == "" {
+		return false
+	}
+	dec := json.NewDecoder(strings.NewReader(trimmed))
+	dec.UseNumber()
+	var obj map[string]any
+	if err := dec.Decode(&obj); err != nil || obj == nil {
+		return false
+	}
+	var extra json.RawMessage
+	if err := dec.Decode(&extra); err != io.EOF {
+		return false
+	}
+	return true
+}
+
 func canonicalizeToolArguments(toolName, arguments string, advertised []advertisedTool) (string, bool) {
+	if strings.TrimSpace(arguments) != "" && !jsonObjectComplete(arguments) {
+		return arguments, false
+	}
 	obj := parseToolArguments(arguments)
 	if obj == nil {
 		obj = map[string]any{}
@@ -597,6 +601,9 @@ func adaptResolvedCall(emitted, arguments string, advertised []advertisedTool) (
 	} else if name != "" && name != emitted {
 		notes = append(notes, emitted+"->"+name)
 	}
+	if strings.TrimSpace(args) != "" && !jsonObjectComplete(args) {
+		return name, args, notes
+	}
 	if tool, ok := advertisedToolNamed(advertised, name); ok {
 		if rewritten, changed := rewriteAdvertisedArguments(args, tool); changed {
 			args = rewritten
@@ -623,94 +630,6 @@ func cloneJSONMap(value map[string]any) map[string]any {
 		return nil
 	}
 	return out
-}
-
-func joinToolDescription(description, note string) string {
-	description = strings.TrimSpace(description)
-	if description == "" {
-		return note
-	}
-	return description + "\n\n" + note
-}
-
-func cloneFunctionToolAs(tool map[string]any, original, alias string, protocol wireProtocol) map[string]any {
-	cloned := cloneJSONMap(tool)
-	if cloned == nil {
-		return nil
-	}
-	note := fmt.Sprintf("Same as `%s`. You may call either name.", original)
-	switch protocol {
-	case wireChatCompletions:
-		function, _ := cloned["function"].(map[string]any)
-		if function == nil {
-			return nil
-		}
-		function["name"] = alias
-		function["description"] = joinToolDescription(stringValue(function["description"]), note)
-		cloned["type"] = "function"
-	case wireMessages:
-		cloned["name"] = alias
-		cloned["description"] = joinToolDescription(stringValue(cloned["description"]), note)
-	default:
-		cloned["name"] = alias
-		cloned["description"] = joinToolDescription(stringValue(cloned["description"]), note)
-		if stringValue(cloned["type"]) == "" {
-			cloned["type"] = "function"
-		}
-	}
-	return cloned
-}
-
-func projectGrokToolAliases(root map[string]any, protocol wireProtocol) int {
-	tools := anySlice(root["tools"])
-	if len(tools) == 0 {
-		return 0
-	}
-	core := false
-	for _, raw := range tools {
-		tool, _ := raw.(map[string]any)
-		switch compactToolName(functionToolName(tool)) {
-		case "listdir", "readfile", "runterminalcommand", "grep", "searchreplace", "spawnsubagent":
-			core = true
-		}
-	}
-	if !core {
-		return 0
-	}
-	used := map[string]struct{}{}
-	byName := map[string]map[string]any{}
-	for _, raw := range tools {
-		tool, _ := raw.(map[string]any)
-		name := strings.TrimSpace(functionToolName(tool))
-		if name == "" {
-			continue
-		}
-		used[strings.ToLower(name)] = struct{}{}
-		byName[name] = tool
-	}
-	var extra []any
-	for grokName, aliases := range grokToolAliasProjection {
-		source, ok := byName[grokName]
-		if !ok {
-			continue
-		}
-		for _, alias := range aliases {
-			if _, exists := used[strings.ToLower(alias)]; exists {
-				continue
-			}
-			cloned := cloneFunctionToolAs(source, grokName, alias, protocol)
-			if cloned == nil {
-				continue
-			}
-			extra = append(extra, cloned)
-			used[strings.ToLower(alias)] = struct{}{}
-		}
-	}
-	if len(extra) == 0 {
-		return 0
-	}
-	root["tools"] = append(append([]any{}, tools...), extra...)
-	return len(extra)
 }
 
 func prepareGrokBuildToolWire(root map[string]any, protocol wireProtocol) {
@@ -786,6 +705,7 @@ func liftChatMessageToolCalls(value any) {
 	if message == nil {
 		return
 	}
+	wrapToolCallsArray(message)
 	if len(anySlice(message["tool_calls"])) == 0 {
 		if call, _ := message["function_call"].(map[string]any); call != nil {
 			wrapped := cloneMap(call)
@@ -824,6 +744,13 @@ func liftChatToolCallObject(call map[string]any) {
 	}
 	if function["arguments"] == nil {
 		if args, ok := call["arguments"]; ok {
+			function["arguments"] = args
+		} else if args, ok := call["args"]; ok {
+			function["arguments"] = args
+		} else if args, ok := function["args"]; ok {
+			function["arguments"] = args
+			delete(function, "args")
+		} else if args, ok := call["input"]; ok {
 			function["arguments"] = args
 		}
 	}
@@ -982,18 +909,16 @@ func extractToolCallsFromText(content string) ([]any, string, bool) {
 	var calls []any
 	rest := content
 	for {
-		start := indexFold(rest, "<tool_call>")
-		end := indexFold(rest, "</tool_call>")
-		if start < 0 || end < 0 || end <= start {
-			break
-		}
-		inner := rest[start+len("<tool_call>") : end]
-		call, ok := parseExtractedToolCall(inner)
+		span, ok := nextToolCallMarkup(rest)
 		if !ok {
 			break
 		}
+		call, parsed := parseExtractedToolCall(span.inner, span.open)
+		if !parsed {
+			break
+		}
 		calls = append(calls, call)
-		rest = strings.TrimSpace(rest[:start] + rest[end+len("</tool_call>"):])
+		rest = strings.TrimSpace(rest[:span.start] + rest[span.end:])
 	}
 	if len(calls) == 0 {
 		return nil, content, false
@@ -1001,7 +926,81 @@ func extractToolCallsFromText(content string) ([]any, string, bool) {
 	return calls, rest, true
 }
 
-func parseExtractedToolCall(inner string) (map[string]any, bool) {
+type toolCallMarkup struct {
+	start, end int
+	inner      string
+	open       string
+}
+
+func nextToolCallMarkup(src string) (toolCallMarkup, bool) {
+	best := toolCallMarkup{start: -1}
+	consider := func(span toolCallMarkup, ok bool) {
+		if !ok {
+			return
+		}
+		if best.start < 0 || span.start < best.start {
+			best = span
+		}
+	}
+	consider(taggedXMLBlock(src, "tool_call"))
+	consider(taggedXMLBlock(src, "tool_calls"))
+	consider(taggedXMLBlock(src, "function_call"))
+	consider(taggedXMLBlock(src, "invoke"))
+	if idx := indexFold(src, "```tool_call"); idx >= 0 {
+		from := idx + len("```tool_call")
+		relEnd := strings.Index(src[from:], "```")
+		if relEnd >= 0 {
+			consider(toolCallMarkup{
+				start: idx,
+				end:   from + relEnd + 3,
+				inner: src[from : from+relEnd],
+				open:  "```tool_call",
+			}, true)
+		}
+	}
+	if best.start < 0 {
+		return toolCallMarkup{}, false
+	}
+	return best, true
+}
+
+func taggedXMLBlock(src, tag string) (toolCallMarkup, bool) {
+	openPrefix := "<" + tag
+	idx := indexFold(src, openPrefix)
+	if idx < 0 {
+		return toolCallMarkup{}, false
+	}
+	after := idx + len(openPrefix)
+	if after > len(src) {
+		return toolCallMarkup{}, false
+	}
+	if after < len(src) {
+		switch src[after] {
+		case '>', ' ', '\t', '\n', '\r', '/':
+		default:
+			return toolCallMarkup{}, false
+		}
+	}
+	gt := strings.IndexByte(src[idx:], '>')
+	if gt < 0 {
+		return toolCallMarkup{}, false
+	}
+	open := src[idx : idx+gt+1]
+	close := "</" + tag + ">"
+	from := idx + len(open)
+	relEnd := indexFold(src[from:], close)
+	if relEnd < 0 {
+		return toolCallMarkup{}, false
+	}
+	return toolCallMarkup{
+		start: idx,
+		end:   from + relEnd + len(close),
+		inner: src[from : from+relEnd],
+		open:  open,
+	}, true
+}
+
+func parseExtractedToolCall(inner, open string) (map[string]any, bool) {
 	inner = strings.TrimSpace(inner)
 	if inner == "" {
 		return nil, false
@@ -1011,13 +1010,16 @@ func parseExtractedToolCall(inner string) (map[string]any, bool) {
 		if json.Unmarshal([]byte(inner), &obj) != nil {
 			return nil, false
 		}
-		name := firstString(obj, "name", "function")
+		name := firstString(obj, "name", "function", "tool")
 		args := obj["arguments"]
 		if args == nil {
 			args = obj["parameters"]
 		}
 		if args == nil {
 			args = obj["input"]
+		}
+		if args == nil {
+			args = obj["args"]
 		}
 		if name == "" {
 			return nil, false
@@ -1035,6 +1037,12 @@ func parseExtractedToolCall(inner string) (map[string]any, bool) {
 	name := xmlAttrValue(inner, "function")
 	if name == "" {
 		name = xmlTagValue(inner, "function")
+	}
+	if name == "" {
+		name = xmlNamedAttr(open, "name")
+	}
+	if name == "" {
+		name = xmlNamedAttr(inner, "name")
 	}
 	if name == "" {
 		return nil, false
@@ -1074,6 +1082,33 @@ func xmlAttrValue(src, tag string) string {
 	return strings.Trim(rest[:end], `"'`)
 }
 
+func xmlNamedAttr(src, key string) string {
+	needle := key + "="
+	idx := indexFold(src, needle)
+	if idx < 0 {
+		return ""
+	}
+	rest := strings.TrimSpace(src[idx+len(needle):])
+	if rest == "" {
+		return ""
+	}
+	switch rest[0] {
+	case '"', '\'':
+		quote := rest[0]
+		end := strings.IndexByte(rest[1:], quote)
+		if end < 0 {
+			return ""
+		}
+		return rest[1 : 1+end]
+	default:
+		end := strings.IndexAny(rest, " \t\r\n>/")
+		if end < 0 {
+			return strings.Trim(rest, `"'`)
+		}
+		return strings.Trim(rest[:end], `"'`)
+	}
+}
+
 func xmlTagValue(src, tag string) string {
 	open := "<" + tag + ">"
 	close := "</" + tag + ">"
@@ -1086,6 +1121,13 @@ func xmlTagValue(src, tag string) string {
 }
 
 func nextXMLParameter(src string) (string, string, string, bool) {
+	if key, value, next, ok := nextXMLParameterEq(src); ok {
+		return key, value, next, true
+	}
+	return nextXMLParameterNamed(src)
+}
+
+func nextXMLParameterEq(src string) (string, string, string, bool) {
 	const open = "<parameter="
 	start := indexFold(src, open)
 	if start < 0 {
@@ -1097,6 +1139,34 @@ func nextXMLParameter(src string) (string, string, string, bool) {
 		return "", "", src, false
 	}
 	key := strings.Trim(strings.TrimSpace(rest[:gt]), `"'`)
+	body := rest[gt+1:]
+	close := indexFold(body, "</parameter>")
+	if close < 0 {
+		return "", "", src, false
+	}
+	value := strings.TrimSpace(body[:close])
+	return key, value, body[close+len("</parameter>"):], key != ""
+}
+
+func nextXMLParameterNamed(src string) (string, string, string, bool) {
+	const open = "<parameter"
+	start := indexFold(src, open)
+	if start < 0 {
+		return "", "", src, false
+	}
+	rest := src[start+len(open):]
+	if rest != "" {
+		switch rest[0] {
+		case ' ', '\t', '\n', '\r':
+		default:
+			return "", "", src, false
+		}
+	}
+	gt := strings.IndexByte(rest, '>')
+	if gt < 0 {
+		return "", "", src, false
+	}
+	key := xmlNamedAttr(rest[:gt], "name")
 	body := rest[gt+1:]
 	close := indexFold(body, "</parameter>")
 	if close < 0 {

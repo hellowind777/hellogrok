@@ -1,10 +1,13 @@
-# 发布说明 — v0.1.23
+# 发布说明 — v0.1.24
 
-## Grok Build 本地能力面对齐
+## 原生 Chat 对齐 Grok Build
 
-- 每个自定义渠道——Kimi、DeepSeek、GLM，以及被中转成 Responses、Messages 或 Chat Completions 的 grok-4.5/4.6——现在共用 Grok Build 的本地工具面：文件、终端、grep、子代理、客户端网页搜索、MCP（`search_tool`/`use_tool`）和 Skill。
-- 编码会话还会声明 Claude/Codex 名称（`LS`、`Read`、`Bash`、`Task` 等）。调用会收回 `list_dir`、`read_file`、`run_terminal_command`、`spawn_subagent`。
-- 直接 MCP 名（`server__tool`、`mcp__server__tool`）会包成 `use_tool`。Write 整文件写入、Glob 模式，以及缺失的必填 `description` / `subagent_type` 会补齐，让 Grok Build 能解析。
-- 中转 grok-4.5/4.6 发出的 Grok Build 原名保持不变。历史里的 tool 结果消息会补上对应 `name`，避免思考模型在下一轮拒绝请求。
+- 普通 Chat / Messages 渠道继续走 Grok Build 的第一方映射器。Responses 投影只用于托管搜索和 WebSearchClient。
+- 原生 Chat SSE 在 last-write-wins 之前重组工具调用：后续空 `"name"` 不再抹掉已知工具，不完整的参数 JSON 不再按帧改写。
+- 空的或厂商私有的 `finish_reason` 会删除或映射为 `stop` / `length` / `tool_calls` / `content_filter` / `function_call`。
+- 思考只作为前缀兄弟。答案后的 CoT、正文里的 `<think>`，以及 `reply only:` / `任务已全部完成` 这类协议自语会剥掉。推理增量保留 BPE 词首空格。
+- Chat 历史保留同轮工具循环的 `reasoning_content`，跨轮明文 CoT 会剥掉（DeepSeek / MiMo 除外），不注入思考占位符。加密或带签名的块原样通过。
+- 发给上游的工具表只留 Grok Build 的 `client_name`。Claude/Codex 别名只在回来的调用上改写。
+- 每个上游请求都按 `grok-shell` 出示。流式 Chat 保留 `include_usage`；带工具的 GLM Chat 在缺省时设置 `tool_stream=true`。
 
-升级后请重启 hellogrok。未在当前请求中声明的工具不会被凭空创造；`x_search` 等 xAI 专属 hosted 工具仍排除。
+升级后请重启 hellogrok 并新开 session。已存盘的气泡不会改写。未在当前请求中声明的工具不会被凭空创造。

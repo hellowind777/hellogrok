@@ -214,7 +214,7 @@ func TestNativeToolHistoryCachePrefixStabilityMatrix(t *testing.T) {
 				if !reflect.DeepEqual(firstRoot["tools"], secondRoot["tools"]) {
 					t.Fatalf("tool definitions changed after replay:\nfirst=%s\nsecond=%s", first.Body, second.Body)
 				}
-				assertReasoningToolHistory(t, firstRoot, protocol.protocol)
+				assertReasoningToolHistory(t, firstRoot, protocol.protocol, replayChatReasoningHistory(route))
 			})
 		}
 	}
@@ -260,7 +260,7 @@ func TestBridgedToolHistoryCachePrefixStabilityMatrix(t *testing.T) {
 					!reflect.DeepEqual(secondRoot["tools"], thirdRoot["tools"]) {
 					t.Fatalf("bridged tool definitions changed after replay:\nfirst=%s\nsecond=%s\nthird=%s", first.Body, second.Body, third.Body)
 				}
-				assertReasoningToolHistory(t, firstRoot, first.Protocol)
+				assertReasoningToolHistory(t, firstRoot, first.Protocol, replayChatReasoningHistory(route))
 			})
 		}
 	}
@@ -583,7 +583,7 @@ func withoutCacheControls(value any) any {
 	}
 }
 
-func assertReasoningToolHistory(t *testing.T, root map[string]any, protocol wireProtocol) {
+func assertReasoningToolHistory(t *testing.T, root map[string]any, protocol wireProtocol, replayReasoning bool) {
 	t.Helper()
 	switch protocol {
 	case wireResponses:
@@ -649,8 +649,13 @@ func assertReasoningToolHistory(t *testing.T, root map[string]any, protocol wire
 			t.Fatalf("Chat reasoning/tool batch is incomplete: %#v", messages)
 		}
 		assistant, _ := messages[assistantIndex].(map[string]any)
-		if !strings.Contains(stringValue(assistant["reasoning_content"]), "plan both lookups") {
-			t.Fatalf("Chat reasoning_content changed: %#v", assistant)
+		got := stringValue(assistant["reasoning_content"])
+		if replayReasoning {
+			if !strings.Contains(got, "plan both lookups") {
+				t.Fatalf("Chat reasoning_content replay lost: %#v", assistant)
+			}
+		} else if got != "" {
+			t.Fatalf("Chat history must not replay reasoning_content to generic vendors: %#v", assistant)
 		}
 		calls := anySlice(assistant["tool_calls"])
 		if stringValue(calls[0].(map[string]any)["id"]) != "call_a" ||

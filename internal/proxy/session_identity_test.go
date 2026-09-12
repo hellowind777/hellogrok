@@ -13,6 +13,36 @@ import (
 	"github.com/hellowind777/hellogrok/internal/config"
 )
 
+func TestGrokBuildClientHeadersReplaceHelloGrokUserAgent(t *testing.T) {
+	header := http.Header{"User-Agent": []string{"hellogrok/0.1.23"}}
+	incoming := http.Header{
+		"User-Agent":                 []string{"grok-shell/1.2.3 (windows; x86_64)"},
+		"X-Grok-Client-Identifier":   []string{"grok-shell"},
+		"X-Grok-Client-Version":      []string{"1.2.3"},
+	}
+	applyGrokBuildClientHeaders(header, incoming)
+	if header.Get("User-Agent") != "grok-shell/1.2.3 (windows; x86_64)" {
+		t.Fatalf("ua=%q", header.Get("User-Agent"))
+	}
+	if header.Get("X-Grok-Client-Identifier") != "grok-shell" {
+		t.Fatalf("id=%q", header.Get("X-Grok-Client-Identifier"))
+	}
+	if header.Get("X-Grok-Client-Version") != "1.2.3" {
+		t.Fatalf("version=%q", header.Get("X-Grok-Client-Version"))
+	}
+}
+
+func TestGrokBuildClientHeadersSynthesizeIdentityWithoutIncoming(t *testing.T) {
+	header := http.Header{}
+	applyGrokBuildClientHeaders(header, http.Header{})
+	if !isGrokShellUserAgent(header.Get("User-Agent")) {
+		t.Fatalf("ua=%q", header.Get("User-Agent"))
+	}
+	if header.Get("X-Grok-Client-Identifier") != grokShellClientIdentifier {
+		t.Fatalf("id=%q", header.Get("X-Grok-Client-Identifier"))
+	}
+}
+
 func TestOpenCodeHeadersSurviveProtocolConversion(t *testing.T) {
 	for _, backend := range []string{"responses", "messages", "chat_completions"} {
 		t.Run(backend, func(t *testing.T) {

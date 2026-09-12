@@ -15,7 +15,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hellowind777/hellogrok/internal/appinfo"
 	"github.com/hellowind777/hellogrok/internal/capacity"
 	"github.com/hellowind777/hellogrok/internal/config"
 	"github.com/hellowind777/hellogrok/internal/patch"
@@ -134,9 +133,7 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 		} else {
 			req.Header.Set("Accept", "application/json")
 		}
-		if req.Header.Get("User-Agent") == "" {
-			req.Header.Set("User-Agent", appinfo.Name+"/"+appinfo.Version)
-		}
+		applyGrokBuildClientHeaders(req.Header, incoming.Header)
 		applyRouteHeaders(req.Header, route, request.Protocol, incoming.Header)
 		for name, values := range providerHeaders {
 			req.Header[name] = append([]string(nil), values...)
@@ -646,6 +643,7 @@ func (s *Server) normalizeResponsesJSON(data []byte, route config.Route, request
 	}
 	setDownstreamResponseModel(root, responseModelForRoute(route))
 	backfillResponseSearchSources(root, request.HostedWebSearch, request.SearchQuery)
+	alignResponsesOutputThoughts(root)
 	if err := validateResponsesEnvelope(root); err != nil {
 		return nil, nil, err
 	}
@@ -698,6 +696,9 @@ func (s *Server) normalizeNativeJSON(
 	}
 	if request.Protocol == wireMessages {
 		prepareGrokBuildToolWire(root, request.Protocol)
+		if content := anySlice(root["content"]); len(content) > 0 {
+			root["content"] = alignMessagesContentThoughts(content)
+		}
 	}
 	setDownstreamResponseModel(root, responseModelForRoute(route))
 	if err := validate(root); err != nil {

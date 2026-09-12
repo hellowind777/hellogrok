@@ -63,6 +63,7 @@ func canonicalFromMessages(data []byte, hosted bool, query string) (canonicalRes
 	var textParts []string
 	var annotations []any
 	var evidenceURLs []string
+	var thoughts thoughtGate
 	flushText := func() {
 		if len(textParts) == 0 {
 			return
@@ -79,7 +80,7 @@ func canonicalFromMessages(data []byte, hosted bool, query string) (canonicalRes
 		}
 		switch typ {
 		case "thinking":
-			if text := stringValue(block["thinking"]); text != "" {
+			if text, ok := thoughts.accept(stringValue(block["thinking"])); ok {
 				result.Output = append(result.Output, reasoningItem(text, stringValue(block["signature"])))
 			}
 		case "redacted_thinking":
@@ -109,7 +110,19 @@ func canonicalFromMessages(data []byte, hosted bool, query string) (canonicalRes
 			args, _ := json.Marshal(valueOr(block["input"], map[string]any{}))
 			result.Output = append(result.Output, functionCallItem(firstString(block, "id"), stringValue(block["name"]), string(args)))
 		case "text":
-			textParts = append(textParts, stringValue(block["text"]))
+			body := stringValue(block["text"])
+			if thought, rest, ok := splitLeadingThinkBlock(body); ok {
+				if text, keep := thoughts.accept(thought); keep {
+					flushText()
+					result.Output = append(result.Output, reasoningItem(text, ""))
+				}
+				body = rest
+			}
+			if strings.TrimSpace(body) == "" {
+				continue
+			}
+			thoughts.noteText(body)
+			textParts = append(textParts, body)
 			annotations = append(annotations, citationsToAnnotations(block["citations"])...)
 			evidenceURLs = mergeUniqueStrings(evidenceURLs, urlsFromJSON(block["citations"])...)
 		}
@@ -159,7 +172,8 @@ func canonicalFromChat(data []byte, hosted bool, query string, advertised []adve
 	if message == nil {
 		return result, fmt.Errorf("chat completions response has no message")
 	}
-	if reasoning := firstString(message, "reasoning_content", "reasoning"); reasoning != "" {
+	liftChatWireDialect(message)
+	if reasoning := sanitizeThought(chatThoughtText(message)); reasoning != "" {
 		result.Output = append(result.Output, reasoningItem(reasoning, ""))
 	}
 	urls := collectCitationURLs(root, choice, message)
@@ -939,6 +953,7 @@ func normalizeNativeChatRequiredFields(
 			if value, present := choice["index"]; !present || value == nil {
 				choice["index"] = index
 			}
+			normalizeChatFinishReason(choice)
 			if stream {
 				continue
 			}
@@ -952,6 +967,7 @@ func normalizeNativeChatRequiredFields(
 			if value, present := message["tool_calls"]; present && value == nil {
 				message["tool_calls"] = []any{}
 			}
+			sanitizeChatMessageReasoning(message)
 		}
 	}
 }
@@ -1157,10 +1173,62 @@ func validateChatFinishReason(value any) error {
 	if value == nil {
 		return nil
 	}
-	if _, ok := value.(string); !ok {
+	text, ok := value.(string)
+	if !ok {
 		return fmt.Errorf("finish_reason must be a string")
 	}
+	if strings.TrimSpace(text) == "" {
+		return nil
+	}
 	return nil
+}
+
+// grokChatFinishReasons is Grok Build's Chat Completions FinishReason enum.
+// Empty strings and provider-specific values must not reach the client.
+var grokChatFinishReasons = map[string]string{
+	"stop":                          "stop",
+	"length":                        "length",
+	"tool_calls":                    "tool_calls",
+	"content_filter":                "content_filter",
+	"function_call":                 "function_call",
+	"sensitive":                     "content_filter",
+	"network_error":                 "stop",
+	"model_context_window_exceeded": "length",
+	"insufficient_system_resource":  "stop",
+}
+
+func normalizeChatFinishReason(choice map[string]any) {
+	if choice == nil {
+		return
+	}
+	raw, present := choice["finish_reason"]
+	if !present {
+		return
+	}
+	if raw == nil {
+		delete(choice, "finish_reason")
+		return
+	}
+	reason := strings.ToLower(strings.TrimSpace(stringValue(raw)))
+	if reason == "" {
+		delete(choice, "finish_reason")
+		return
+	}
+	if mapped, ok := grokChatFinishReasons[reason]; ok {
+		choice["finish_reason"] = mapped
+		return
+	}
+	choice["finish_reason"] = "stop"
+}
+
+func normalizeChatFinishReasons(root map[string]any) {
+	if root == nil {
+		return
+	}
+	for _, raw := range anySlice(root["choices"]) {
+		choice, _ := raw.(map[string]any)
+		normalizeChatFinishReason(choice)
+	}
 }
 
 func validateRequiredU32(values map[string]any, key string) error {

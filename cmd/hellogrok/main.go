@@ -669,7 +669,9 @@ func (a *App) resolveSearchRoutes(
 
 // Grok Build serializes hosted_tools and consumes structured search results only
 // on Responses. Capable channels therefore use the Responses facade while the
-// route retains the provider's real upstream protocol.
+// route retains the provider's real upstream protocol. Ordinary Chat and
+// Messages channels keep their configured consumer so Grok Build's first-party
+// mapper and L2 sampler stay on the wire. An omitted backend stays catalog-owned.
 func buildAPIBackend(route config.Route) string {
 	if route.SupportsBackendSearch {
 		return "responses"

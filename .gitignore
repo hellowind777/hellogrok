@@ -87,5 +87,9 @@ sessions*.json
 /hot-switch-restart/
 /.hellogrok-*
 
+# Local scratch binaries (never commit a running-tray copy)
+*-new.exe
+*.bak
+
 # local only — committed syso under cmd/hellogrok are OK for PE icons
 # *.syso

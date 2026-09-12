@@ -509,6 +509,7 @@ func (s *Server) streamResponsesSSE(w http.ResponseWriter, response *http.Respon
 	var streamedText strings.Builder
 	var streamedURLs []string
 	itemIDs := responseIDs{}
+	responsesThought := newResponsesThoughtRectifier()
 
 	writePayloadFrame := func(lines []string, payload string) error {
 		insertedData := false
@@ -605,6 +606,9 @@ func (s *Server) streamResponsesSSE(w http.ResponseWriter, response *http.Respon
 			return fmt.Errorf("invalid upstream Responses SSE data: %w", err)
 		}
 		setDownstreamResponseModel(event, responseModelForRoute(route))
+		if !responsesThought.keep(event) {
+			return nil
+		}
 		s.captureReasoningProvenance(route, event)
 		streamedURLs = mergeUniqueStrings(streamedURLs, urlsFromJSON(event)...)
 		switch stringValue(event["type"]) {

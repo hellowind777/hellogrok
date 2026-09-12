@@ -4,6 +4,22 @@ All notable changes to this project are documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.24] — 2026-09-12
+
+### Fixed
+
+- Native Chat SSE no longer lets a later empty `"name"` overwrite a known tool name, and no longer rewrites incomplete argument JSON per frame. Grok Build's last-write-wins Chat accumulator therefore keeps `list_dir` / `run_terminal_command` instead of reporting NotFound.
+- Empty or vendor `finish_reason` values (`""`, GLM `sensitive` / `network_error` / `model_context_window_exceeded`) are dropped or mapped onto Grok Build's Chat enum so serde no longer cancels the stream.
+- Reasoning is forwarded only as a prefix sibling. Thought after visible text is dropped on Chat, Messages, and Responses; `<think>` blocks are peeled out of answer text; protocol self-talk such as `reply only:` / `任务已全部完成` is stripped from prefix CoT. Streaming `reasoning_content` deltas keep leading BPE spaces.
+- Chat history no longer replays plaintext CoT across user turns except on DeepSeek and MiMo. Intra-turn tool-loop reasoning is kept. Encrypted or signed blobs are never removed, and `"tool call"` placeholders are never injected.
+
+### Changed
+
+- Ordinary Chat and Messages channels stay on Grok Build's first-party mapper. Responses projection remains search-only.
+- Upstream Chat tool lists keep Grok Build `client_name` values. Claude/Codex aliases are rewritten on inbound calls instead of being cloned into every `tools` array.
+- Every upstream request is presented as Grok Build (`grok-shell` User-Agent and `X-Grok-Client-Identifier`). hellogrok's own product string is never forwarded.
+- Streaming Chat keeps `stream_options.include_usage=true`. GLM Chat with tools also sets `tool_stream=true` when omitted.
+
 ## [0.1.23] — 2026-09-11
 
 ### Fixed
@@ -335,7 +351,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - CC Switch compatibility detection and conflict warnings.
 - Builds for Windows, Linux, and macOS on amd64 and arm64.
 
-[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.23...HEAD
+[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.24...HEAD
+[0.1.24]: https://github.com/hellowind777/hellogrok/compare/v0.1.23...v0.1.24
 [0.1.23]: https://github.com/hellowind777/hellogrok/compare/v0.1.22...v0.1.23
 [0.1.22]: https://github.com/hellowind777/hellogrok/compare/v0.1.21...v0.1.22
 [0.1.21]: https://github.com/hellowind777/hellogrok/compare/v0.1.20...v0.1.21

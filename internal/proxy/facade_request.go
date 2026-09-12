@@ -48,6 +48,8 @@ func channelFromPath(escapedPath string) (string, wireProtocol, bool) {
 	switch {
 	case len(parts) == 3 && parts[2] == "responses":
 		protocol = wireResponses
+	case len(parts) == 4 && parts[2] == "responses" && parts[3] == "compact":
+		protocol = wireResponses
 	case len(parts) == 3 && parts[2] == "messages":
 		protocol = wireMessages
 	case len(parts) == 4 && parts[2] == "chat" && parts[3] == "completions":
@@ -244,7 +246,6 @@ func adaptFacadeRequestWithReasoning(
 		request.AdvertisedTools = collectAdvertisedFunctionTools(root, incoming)
 		prepareGrokBuildToolWire(root, incoming)
 		adaptGrokBuildToolIdentity(root, incoming, request.AdvertisedTools)
-		projectGrokToolAliases(root, incoming)
 		searchEligible := request.HostedWebSearch && toolChoiceAllowsHostedSearch(root["tool_choice"])
 		if !searchEligible {
 			request.Protocol = native
@@ -274,6 +275,9 @@ func adaptFacadeRequestWithReasoning(
 			var converted map[string]any
 			converted, err = responsesToChatRequest(root, route)
 			if err == nil {
+				if !replayChatReasoningHistory(route) {
+					stripChatHistoryReasoning(converted)
+				}
 				normalizeDeepSeekRequest(converted, route, request.Protocol)
 				request.Body, err = encodeRequestObject(converted)
 			}
@@ -292,19 +296,61 @@ func adaptFacadeRequestWithReasoning(
 	request.AdvertisedTools = collectAdvertisedFunctionTools(root, native)
 	prepareGrokBuildToolWire(root, native)
 	adaptGrokBuildToolIdentity(root, native, request.AdvertisedTools)
+	if native == wireChatCompletions && !replayChatReasoningHistory(route) {
+		stripChatHistoryReasoning(root)
+	}
 	request.SearchQuery = lastUserTextForProtocol(root, native)
 	if err := validateNativeToolHistory(root, native); err != nil {
 		return facadeRequest{}, err
 	}
 	describeClientWebTools(root)
-	projectGrokToolAliases(root, native)
 	request.ClientSearchAlias = chooseClientWebSearchWireAlias(root)
 	if !aliasClientWebSearchOnWire(root, request.ClientSearchAlias, native) {
 		request.ClientSearchAlias = ""
 	}
 	normalizeDeepSeekRequest(root, route, request.Protocol)
+	ensureChatStreamIncludeUsage(root)
+	ensureGLMChatToolStream(root, route, request.Protocol)
 	request.Body, err = encodeRequestObject(root)
 	return request, err
+}
+
+// ensureChatStreamIncludeUsage keeps Grok Build's Chat wrapper contract:
+// stream_options.include_usage=true so the trailing usage chunk can feed
+// auto-compact. Unknown extra keys on stream_options are left in place.
+func ensureChatStreamIncludeUsage(root map[string]any) {
+	if root == nil || root["stream"] != true {
+		return
+	}
+	options, _ := root["stream_options"].(map[string]any)
+	if options == nil {
+		options = map[string]any{}
+		root["stream_options"] = options
+	}
+	options["include_usage"] = true
+}
+
+func ensureGLMChatToolStream(root map[string]any, route config.Route, protocol wireProtocol) {
+	if root == nil || protocol != wireChatCompletions || len(anySlice(root["tools"])) == 0 {
+		return
+	}
+	if !looksLikeGLMRoute(route) {
+		return
+	}
+	if _, exists := root["tool_stream"]; exists {
+		return
+	}
+	root["tool_stream"] = true
+}
+
+func looksLikeGLMRoute(route config.Route) bool {
+	blob := strings.ToLower(strings.Join([]string{route.ChannelID, route.WireModel, route.Host, route.OriginBase}, " "))
+	for _, needle := range []string{"glm", "zhipu", "bigmodel", "chatglm"} {
+		if strings.Contains(blob, needle) {
+			return true
+		}
+	}
+	return false
 }
 
 func protocolLabel(protocol wireProtocol) string {
@@ -702,11 +748,7 @@ func responsesToChatRequest(root map[string]any, route config.Route) (map[string
 		"messages": messages,
 		"stream":   root["stream"] == true,
 	}
-	if root["stream"] == true {
-		// OpenAI-compatible gateways report final token usage in a trailing
-		// streaming chunk only when this option is enabled.
-		out["stream_options"] = map[string]any{"include_usage": true}
-	}
+	ensureChatStreamIncludeUsage(out)
 	if n := positiveInt(root["max_output_tokens"], 0); n > 0 {
 		out["max_tokens"] = n
 	}

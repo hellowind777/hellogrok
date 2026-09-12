@@ -84,6 +84,21 @@ func TestBashMissingDescriptionIsFilled(t *testing.T) {
 	}
 }
 
+func TestAdaptResolvedCallLeavesIncompleteJSON(t *testing.T) {
+	name, args, notes := adaptResolvedCall("run_terminal_command", `{"command":"git`, grokBuildTools())
+	if name != "run_terminal_command" {
+		t.Fatalf("name=%q", name)
+	}
+	if args != `{"command":"git` {
+		t.Fatalf("incomplete JSON rewritten args=%q notes=%v", args, notes)
+	}
+	for _, note := range notes {
+		if strings.Contains(note, "-canon") {
+			t.Fatalf("canon ran on incomplete JSON notes=%v", notes)
+		}
+	}
+}
+
 func TestSpawnSubagentDefaults(t *testing.T) {
 	tools := append(grokBuildTools(), advertisedTool{
 		Name:  "spawn_subagent",
@@ -99,35 +114,38 @@ func TestSpawnSubagentDefaults(t *testing.T) {
 	}
 }
 
-func TestProjectAliasesForGrokBuildToolset(t *testing.T) {
-	root := map[string]any{
-		"tools": []any{
-			map[string]any{"type": "function", "function": map[string]any{"name": "list_dir", "description": "list", "parameters": map[string]any{"type": "object"}}},
-			map[string]any{"type": "function", "function": map[string]any{"name": "read_file", "description": "read", "parameters": map[string]any{"type": "object"}}},
-		},
+func TestNativeChatKeepsGrokClientToolNamesAndIncludeUsage(t *testing.T) {
+	route := config.Route{
+		ChannelID:            "Kimi-K3-ipix",
+		WireModel:            "Kimi-K3",
+		APIBackend:           "chat_completions",
+		APIBackendConfigured: true,
 	}
-	if n := projectGrokToolAliases(root, wireChatCompletions); n == 0 {
-		t.Fatal("expected alias projection")
+	body := []byte(`{"model":"Kimi-K3-ipix","stream":true,"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"read_file","parameters":{"type":"object","properties":{}}}},{"type":"function","function":{"name":"list_dir","parameters":{"type":"object","properties":{}}}}]}`)
+	request, err := adaptFacadeRequest(body, route, wireChatCompletions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := decodeRequestObject(request.Body)
+	if err != nil {
+		t.Fatal(err)
 	}
 	names := map[string]bool{}
 	for _, raw := range anySlice(root["tools"]) {
-		names[functionToolName(raw.(map[string]any))] = true
+		tool, _ := raw.(map[string]any)
+		names[functionToolName(tool)] = true
 	}
-	for _, want := range []string{"list_dir", "LS", "List", "read_file", "Read"} {
-		if !names[want] {
-			t.Fatalf("missing %s in %v", want, names)
+	if !names["read_file"] || !names["list_dir"] {
+		t.Fatalf("grok client names missing: %v", names)
+	}
+	for _, extra := range []string{"Read", "LS", "List", "Grep", "Bash", "Edit"} {
+		if names[extra] {
+			t.Fatalf("claude alias projected onto native wire: %s in %v", extra, names)
 		}
 	}
-}
-
-func TestProjectAliasesSkippedForSearchOnlyTools(t *testing.T) {
-	root := map[string]any{
-		"tools": []any{
-			map[string]any{"type": "function", "function": map[string]any{"name": "web_fetch", "parameters": map[string]any{"type": "object"}}},
-		},
-	}
-	if n := projectGrokToolAliases(root, wireChatCompletions); n != 0 {
-		t.Fatalf("search-only tools should not grow aliases, n=%d", n)
+	options, _ := root["stream_options"].(map[string]any)
+	if options["include_usage"] != true {
+		t.Fatalf("include_usage missing: %#v", root["stream_options"])
 	}
 }
 
@@ -285,6 +303,36 @@ func TestExtractJSONToolCallFromContent(t *testing.T) {
 	function := calls[0].(map[string]any)["function"].(map[string]any)
 	if function["name"] != "read_file" {
 		t.Fatalf("json content name: %#v", function)
+	}
+}
+
+func TestExtractInvokeAndFencedToolCalls(t *testing.T) {
+	invoke := `note
+<invoke name="list_dir">
+<parameter name="target_directory">.</parameter>
+</invoke>`
+	calls, rest, ok := extractToolCallsFromText(invoke)
+	if !ok || len(calls) != 1 || rest != "note" {
+		t.Fatalf("invoke extract failed ok=%t rest=%q calls=%#v", ok, rest, calls)
+	}
+	function := calls[0].(map[string]any)["function"].(map[string]any)
+	if function["name"] != "list_dir" {
+		t.Fatalf("invoke name: %#v", function)
+	}
+	if !strings.Contains(stringValue(function["arguments"]), "target_directory") {
+		t.Fatalf("invoke args: %#v", function["arguments"])
+	}
+
+	fenced := "pre\n```tool_call\n{\"name\":\"Read\",\"arguments\":{\"target_file\":\"a.go\"}}\n```"
+	message := map[string]any{"role": "assistant", "content": fenced}
+	notes := adaptChatMessageTools(message, grokBuildTools(), true)
+	got := anySlice(message["tool_calls"])
+	if len(got) != 1 {
+		t.Fatalf("fenced extract failed notes=%v message=%#v", notes, message)
+	}
+	function = got[0].(map[string]any)["function"].(map[string]any)
+	if function["name"] != "read_file" {
+		t.Fatalf("fenced name: %#v", function)
 	}
 }
 

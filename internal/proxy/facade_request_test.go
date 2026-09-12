@@ -20,6 +20,7 @@ func TestChannelPathsExposeAllNativeProtocols(t *testing.T) {
 		valid    bool
 	}{
 		{"/c/model/responses", "model", wireResponses, true},
+		{"/c/model/responses/compact", "model", wireResponses, true},
 		{"/c/model/messages", "model", wireMessages, true},
 		{"/c/model/chat/completions", "model", wireChatCompletions, true},
 		{"/c/provider%2Fmodel/messages", "provider/model", wireMessages, true},

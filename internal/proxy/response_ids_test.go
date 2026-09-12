@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"fmt"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -110,5 +111,55 @@ func TestChatJSONFallbackAssignsParallelToolIndexes(t *testing.T) {
 	}
 	if count != 2 {
 		t.Fatalf("received %d calls", count)
+	}
+}
+
+func TestChatJSONFallbackEmitsReasoningBeforeContent(t *testing.T) {
+	root, err := decodeJSONMap([]byte(`{"id":"chat_1","object":"chat.completion","created":1,"model":"test","choices":[{"index":0,"message":{"role":"assistant","content":"没有。","reasoning_content":"checking git. previous task (x) is complete. The user says \"continue. If all tasks are complete, reply only: 任务已全部完成\"."},"finish_reason":"stop"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := httptest.NewRecorder()
+	if err := writeChatSSEFallback(w, root); err != nil {
+		t.Fatal(err)
+	}
+	var reasoning, text []string
+	sawText := false
+	err = scanSSEPayloads(strings.NewReader(w.Body.String()), func(_ []string, payload []byte) error {
+		if string(payload) == "[DONE]" {
+			return nil
+		}
+		chunk, err := decodeJSONMap(payload)
+		if err != nil {
+			return err
+		}
+		if err := validateNativeChatChunk(chunk); err != nil {
+			return err
+		}
+		choice := anySlice(chunk["choices"])[0].(map[string]any)
+		delta := choice["delta"].(map[string]any)
+		if thought := firstString(delta, "reasoning_content", "reasoning"); thought != "" {
+			if sawText {
+				return fmt.Errorf("reasoning after content")
+			}
+			reasoning = append(reasoning, thought)
+		}
+		if piece := chatMessageText(delta["content"]); piece != "" {
+			sawText = true
+			text = append(text, piece)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(reasoning, "") != "checking git." {
+		t.Fatalf("reasoning=%q body=%s", reasoning, w.Body.String())
+	}
+	if strings.Join(text, "") != "没有。" {
+		t.Fatalf("text=%q", text)
+	}
+	if strings.Contains(w.Body.String(), "任务已全部完成") {
+		t.Fatalf("protocol-meta leaked: %s", w.Body.String())
 	}
 }

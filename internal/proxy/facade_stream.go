@@ -207,6 +207,7 @@ type messagesStreamState struct {
 	hadWebSearch bool
 	allURLs      []string
 	textURLs     []string
+	thoughts     thoughtGate
 }
 
 func newMessagesStreamState(writer *translatedStreamWriter, route config.Route, request facadeRequest) *messagesStreamState {
@@ -323,6 +324,9 @@ func (s *messagesStreamState) startBlock(index int, raw map[string]any) error {
 		}
 		return s.appendMessageText(block, stringValue(raw["text"]))
 	case "thinking":
+		if s.thoughts.sawText {
+			return nil
+		}
 		block.signature.WriteString(stringValue(raw["signature"]))
 		item := reasoningItem("", "")
 		item["status"] = "in_progress"
@@ -412,6 +416,7 @@ func (s *messagesStreamState) appendMessageText(block *messagesStreamBlock, text
 	if text == "" || block.item == nil {
 		return nil
 	}
+	s.thoughts.noteText(text)
 	block.text.WriteString(text)
 	return s.writer.emit("response.output_text.delta", map[string]any{
 		"output_index": block.outputIndex, "item_id": stringValue(block.item["id"]),
@@ -423,7 +428,12 @@ func (s *messagesStreamState) appendThinking(block *messagesStreamBlock, text st
 	if text == "" || block.item == nil {
 		return nil
 	}
-	block.text.WriteString(text)
+	cleaned, ok := s.thoughts.accept(text)
+	if !ok {
+		return nil
+	}
+	block.text.WriteString(cleaned)
+	text = cleaned
 	return s.writer.emit("response.reasoning_text.delta", map[string]any{
 		"output_index": block.outputIndex, "item_id": stringValue(block.item["id"]),
 		"content_index": 0, "delta": text,
@@ -455,6 +465,9 @@ func (s *messagesStreamState) stopBlock(index int) error {
 		}
 		return s.emitItemDone(block)
 	case "thinking":
+		if block.item == nil {
+			return nil
+		}
 		text := block.text.String()
 		block.native["thinking"] = text
 		block.native["signature"] = block.signature.String()
@@ -764,6 +777,8 @@ type chatStreamState struct {
 	allURLs      []string
 	sawChunk     bool
 	terminal     bool
+	thoughts     thoughtGate
+	thinks       inlineThinkState
 }
 
 func newChatStreamState(writer *translatedStreamWriter, route config.Route, request facadeRequest) *chatStreamState {
@@ -812,17 +827,45 @@ func (s *chatStreamState) handle(payload []byte) error {
 		if delta == nil {
 			delta = map[string]any{}
 		}
-		if text := firstString(delta, "reasoning_content", "reasoning"); text != "" {
-			if err := s.appendReasoning(text); err != nil {
+		liftChatWireDialect(delta)
+		if cleaned, ok := s.thoughts.accept(chatThoughtText(delta)); ok {
+			if err := s.appendReasoning(cleaned); err != nil {
 				return err
 			}
 		}
-		if text := chatMessageText(delta["content"]); text != "" {
+		content := chatMessageText(delta["content"])
+		reasoning, text, hold := s.thinks.feed(content)
+		if reasoning != "" {
+			if cleaned, ok := s.thoughts.accept(reasoning); ok {
+				if err := s.appendReasoning(cleaned); err != nil {
+					return err
+				}
+			}
+		}
+		if !hold && text != "" {
+			s.thoughts.noteText(text)
 			if err := s.appendText(text); err != nil {
 				return err
 			}
 		}
-		for _, rawCall := range anySlice(delta["tool_calls"]) {
+		calls := anySlice(delta["tool_calls"])
+		if len(calls) > 0 || stringValue(choice["finish_reason"]) != "" {
+			extraReasoning, extraText := s.thinks.flush()
+			if extraReasoning != "" {
+				if cleaned, ok := s.thoughts.accept(extraReasoning); ok {
+					if err := s.appendReasoning(cleaned); err != nil {
+						return err
+					}
+				}
+			}
+			if extraText != "" {
+				s.thoughts.noteText(extraText)
+				if err := s.appendText(extraText); err != nil {
+					return err
+				}
+			}
+		}
+		for _, rawCall := range calls {
 			call, _ := rawCall.(map[string]any)
 			if call == nil {
 				continue
@@ -969,6 +1012,21 @@ func (s *chatStreamState) finish() error {
 	}
 	if !s.sawChunk {
 		return fmt.Errorf("Chat Completions stream contained no chunks")
+	}
+	if reasoning, text := s.thinks.flush(); reasoning != "" || text != "" {
+		if reasoning != "" {
+			if cleaned, ok := s.thoughts.accept(reasoning); ok {
+				if err := s.appendReasoning(cleaned); err != nil {
+					return err
+				}
+			}
+		}
+		if text != "" {
+			s.thoughts.noteText(text)
+			if err := s.appendText(text); err != nil {
+				return err
+			}
+		}
 	}
 	searchConfirmed := s.search != nil || (s.request.HostedWebSearch && (len(s.allURLs) > 0 || positiveSearchUsage(s.usage)))
 	if searchConfirmed && s.message != nil {
@@ -1144,8 +1202,15 @@ func (s *Server) streamNativeSSE(w http.ResponseWriter, response *http.Response,
 	frames := 0
 	chatStreamID := compatID("chatcmpl")
 	chatCreatedAt := time.Now().Unix()
-	chatIDs := chatCallIDs{}
+	chatRectifier := (*chatToolRectifier)(nil)
+	if request.Protocol == wireChatCompletions {
+		chatRectifier = newChatToolRectifier(request.AdvertisedTools, request.ClientSearchAlias)
+	}
 	messagesSearchFilter := newMessagesHostedSearchStreamFilter(request)
+	messagesThought := (*messagesThoughtRectifier)(nil)
+	if request.Protocol == wireMessages {
+		messagesThought = newMessagesThoughtRectifier()
+	}
 	evidence := newSearchEvidence()
 	writeHeartbeat := func() error {
 		_, err := io.WriteString(w, ": keepalive\n\n")
@@ -1154,6 +1219,34 @@ func (s *Server) streamNativeSSE(w http.ResponseWriter, response *http.Response,
 		}
 		return err
 	}
+	writeChatFrames := func(out []map[string]any, lines []string, notes []string) error {
+		if len(notes) > 0 {
+			s.log.Printf("UP channel=%s tool identity adapted %s", route.ChannelID, strings.Join(notes, ","))
+		}
+		for _, frame := range out {
+			if frame == nil {
+				continue
+			}
+			normalizeChatFinishReasons(frame)
+			s.captureReasoningProvenance(route, frame)
+			encoded, err := json.Marshal(frame)
+			if err != nil {
+				return err
+			}
+			if err := validateNativeSSEFrame(request.Protocol, frame); err != nil {
+				return err
+			}
+			if err := writeSSEPayloadFrame(w, flusher, lines, encoded); err != nil {
+				return err
+			}
+			frames++
+			if request.Protocol == wireChatCompletions && frame["error"] != nil {
+				terminal = true
+				return errSSEStreamComplete
+			}
+		}
+		return nil
+	}
 	streamErr := scanSSEPayloads(response.Body, func(lines []string, payload []byte) error {
 		if isPrivateSSEHeartbeat(lines, string(payload)) {
 			heartbeats++
@@ -1161,6 +1254,12 @@ func (s *Server) streamNativeSSE(w http.ResponseWriter, response *http.Response,
 		}
 		trimmed := strings.TrimSpace(string(payload))
 		if request.Protocol == wireChatCompletions && trimmed == "[DONE]" {
+			if chatRectifier != nil {
+				out, notes := chatRectifier.flush()
+				if err := writeChatFrames(out, nil, notes); err != nil {
+					return err
+				}
+			}
 			if err := writeSSEPayloadFrame(w, flusher, lines, []byte("[DONE]")); err != nil {
 				return err
 			}
@@ -1190,17 +1289,20 @@ func (s *Server) streamNativeSSE(w http.ResponseWriter, response *http.Response,
 		}
 		if request.Protocol == wireMessages {
 			normalizeMessagesStreamRequiredFields(root)
+			if messagesThought != nil && !messagesThought.keep(root) {
+				return nil
+			}
 		}
 		if request.Protocol == wireChatCompletions {
 			normalizeNativeChatRequiredFields(root, route, true, chatStreamID, chatCreatedAt)
-			prepareGrokBuildToolWire(root, request.Protocol)
-			if err := chatIDs.normalize(root, true); err != nil {
-				return err
-			}
 			normalizeNativeChatUsage(root, liveContextWindow(route, response.Header))
 		}
 		setDownstreamResponseModel(root, responseModelForRoute(route))
 		restoreClientWebSearchAlias(root, request.ClientSearchAlias, request.Protocol)
+		if request.Protocol == wireChatCompletions {
+			out, notes := chatRectifier.ingest(root)
+			return writeChatFrames(out, lines, notes)
+		}
 		if notes := adaptGrokBuildToolIdentity(root, request.Protocol, request.AdvertisedTools); len(notes) > 0 {
 			s.log.Printf("UP channel=%s tool identity adapted %s", route.ChannelID, strings.Join(notes, ","))
 		}
@@ -1231,6 +1333,12 @@ func (s *Server) streamNativeSSE(w http.ResponseWriter, response *http.Response,
 	})
 	if errors.Is(streamErr, errSSEStreamComplete) {
 		streamErr = nil
+	}
+	if chatRectifier != nil {
+		out, notes := chatRectifier.flush()
+		if err := writeChatFrames(out, nil, notes); err != nil && streamErr == nil {
+			streamErr = err
+		}
 	}
 	if streamErr != nil {
 		s.log.Printf("UP channel=%s %s SSE read error: %v", route.ChannelID, protocolLabel(request.Protocol), streamErr)
@@ -1509,20 +1617,34 @@ func writeChatSSEFallback(w http.ResponseWriter, response map[string]any) error 
 		choice, _ := raw.(map[string]any)
 		choice["delta"] = valueOr(choice["message"], map[string]any{})
 		delta, _ := choice["delta"].(map[string]any)
+		liftChatWireDialect(delta)
 		for index, rawCall := range anySlice(delta["tool_calls"]) {
 			call, _ := rawCall.(map[string]any)
 			call["index"] = index
 		}
 		delete(choice, "message")
 	}
-	payload, err := json.Marshal(chunk)
-	if err != nil {
-		return err
+	rectifier := newChatToolRectifier(nil, "")
+	frames := rectifier.takeReasoningPrefix(chunk)
+	if chatChunkHasClientPayload(chunk) {
+		frames = append(frames, chunk)
+	}
+	if len(frames) == 0 {
+		frames = []map[string]any{chunk}
 	}
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.WriteHeader(http.StatusOK)
-	_, err = fmt.Fprintf(w, "data: %s\n\ndata: [DONE]\n\n", payload)
+	for _, frame := range frames {
+		payload, err := json.Marshal(frame)
+		if err != nil {
+			return err
+		}
+		if _, err := fmt.Fprintf(w, "data: %s\n\n", payload); err != nil {
+			return err
+		}
+	}
+	_, err := io.WriteString(w, "data: [DONE]\n\n")
 	if flusher, ok := w.(http.Flusher); ok {
 		flusher.Flush()
 	}
