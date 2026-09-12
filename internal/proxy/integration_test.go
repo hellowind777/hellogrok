@@ -1622,6 +1622,9 @@ func TestRetryDispositionPreservesUpstreamAndClassifiesDefaults(t *testing.T) {
 		{"invalid model", http.StatusServiceUnavailable, "", `{"error":{"code":"model_not_found","message":"unknown model"}}`, "false"},
 		{"upstream veto", http.StatusServiceUnavailable, "false", `{"error":{"code":"service_unavailable"}}`, "false"},
 		{"upstream retry wins", http.StatusUnauthorized, "true", `{"error":{"code":"invalid_api_key"}}`, "true"},
+		{"cloudflare edge timeout", 524, "", `<html><head><title>relay.example | 524: A timeout occurred</title></head></html>`, "true"},
+		{"origin tls handshake", statusOriginTLSHandshake, "", `<html><head><title>relay.example | 525: SSL Handshake Failed</title></head></html>`, "false"},
+		{"origin tls certificate", statusOriginTLSCertificate, "", `<html><head><title>relay.example | 526: Invalid SSL Certificate</title></head></html>`, "false"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

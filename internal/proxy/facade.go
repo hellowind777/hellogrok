@@ -268,8 +268,12 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 			response.Header.Set("X-Should-Retry", "false")
 			retryable = false
 		}
-		if retryable && absorb.wait(upstreamContext, retryAfterSeconds(response.Header)) {
-			s.logAbsorbWait(route.ChannelID, absorb, "retryable upstream error", response.StatusCode)
+		if absorbEligible(response.StatusCode, retryable) && absorb.wait(upstreamContext, retryAfterSeconds(response.Header)) {
+			reason := "retryable upstream error"
+			if !retryable {
+				reason = "origin-TLS upstream error"
+			}
+			s.logAbsorbWait(route.ChannelID, absorb, reason, response.StatusCode)
 			continue
 		}
 		if upstreamContext.Err() != nil {
@@ -484,19 +488,46 @@ func requestKindLabel(kind facadeRequestKind) string {
 	return "native_session"
 }
 
+// Cloudflare origin-TLS statuses: 525 means the edge could not complete a
+// TLS handshake with the origin, 526 means the origin certificate is
+// invalid. Grok Build classifies both as terminal (a broken origin
+// certificate never clears on its own), so they pass through as
+// non-retryable; the absorb layer still retries them inside the proxy,
+// because relay origin restarts and certificate rotations routinely clear
+// within the absorb window, and a request that failed the edge-origin TLS
+// handshake never reached the origin application, keeping the replay
+// side-effect free.
+const (
+	statusOriginTLSHandshake   = 525
+	statusOriginTLSCertificate = 526
+)
+
 func setRetryDisposition(header http.Header, status int, body []byte) bool {
 	if upstreamHint := strings.TrimSpace(header.Get("X-Should-Retry")); upstreamHint != "" {
 		// An explicit upstream override wins; report its effective value so
 		// the absorb layer only swallows failures Grok Build would retry.
 		return !strings.EqualFold(upstreamHint, "false")
 	}
-	retry := status == http.StatusTooManyRequests || status == http.StatusInternalServerError ||
-		status == http.StatusBadGateway || status == http.StatusServiceUnavailable || status == http.StatusGatewayTimeout
+	// Mirror Grok Build's edge-client retry policy: 429 and every 5xx are
+	// retryable except the origin-TLS statuses it treats as terminal. A
+	// narrower local list would stamp X-Should-Retry: false on transient
+	// edge pages (520-524, 529, 530) and veto Grok Build's own retry of a
+	// failure that clears on its own.
+	retry := status == http.StatusTooManyRequests ||
+		(status >= http.StatusInternalServerError && status != statusOriginTLSHandshake && status != statusOriginTLSCertificate)
 	if classified, value := classifyStructuredRetry(body); classified {
 		retry = value
 	}
 	header.Set("X-Should-Retry", fmt.Sprintf("%t", retry))
 	return retry
+}
+
+// absorbEligible reports whether the absorb layer may retry this failure
+// inside the proxy: everything Grok Build would retry, plus the origin-TLS
+// statuses Grok Build treats as terminal but which routinely clear on
+// relays within the absorb window.
+func absorbEligible(status int, retryable bool) bool {
+	return retryable || status == statusOriginTLSHandshake || status == statusOriginTLSCertificate
 }
 
 func (s *Server) logBreakerTransition(channel string, transition breakerTransition) {

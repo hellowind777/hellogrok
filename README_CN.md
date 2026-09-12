@@ -6,7 +6,7 @@
 
 跨平台 Grok Build 本地代理，让自定义模型渠道兼容常见 API 格式、Build 原生 Web 工具、独立鉴权和自动配置恢复。
 
-[![Version](https://img.shields.io/badge/version-0.1.26-2f6feb.svg)](./internal/appinfo/appinfo.go)
+[![Version](https://img.shields.io/badge/version-0.1.27-2f6feb.svg)](./internal/appinfo/appinfo.go)
 [![Go](https://img.shields.io/badge/Go-1.26.6-00ADD8.svg)](./go.mod)
 [![CI](https://github.com/hellowind777/hellogrok/actions/workflows/ci.yml/badge.svg)](https://github.com/hellowind777/hellogrok/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
@@ -58,8 +58,8 @@ hellogrok 为这些自定义渠道提供统一的本地兼容层。运行时准�
 - 转发前校验各协议的工具历史：Responses 调用必须有匹配的 `function_call_output`，Messages 的 `tool_use` 必须由紧邻的下一条 user 消息中的 `tool_result` 完整配对，Chat 工具调用必须有匹配的 tool 消息。确定性错误返回不可重试的 `400`，不会进入 Grok Build 重试循环。
 - 在私有 `keepalive`、`keep-alive`、`keep_alive`、`heartbeat`、`ping` 帧到达 Grok Build 前将其转换为标准 SSE 注释，不占用 Responses 事件序号；收到各协议的终止事件后立即关闭上游流。
 - 普通渠道的上游响应头等待及所有响应正文的两次读取间隔最多为 601 秒，比 Grok Build shell 默认的 600 秒多一秒；`api.deepseek.com` 官方路由使用 660 秒，以覆盖服务商记录的最长十分钟排队。请求没有总时限，非流式排队空行或规范化心跳等任意上游字节都会刷新空闲时限。
-- 在 Grok Build 看到之前吸收上游瞬态软故障。上游响应头尚未发出时，可重试失败（busy/过载 `503`、`429`、可重试 `5xx` 或响应头超时）会在代理内以指数退避（2s 至 30s，尊重上游 `Retry-After`，上限 60s）自动重试，默认最多等待 90 秒。窗口期内 Grok Build 自己的 15 次重试预算完全不动：只有窗口耗尽后客户端才会看到失败，且该失败仍以可重试形式透传，客户端原生预算分毫不少。传输错误不做吸收，因为 Grok Build 首次重试时的 HTTP/1.1 客户端重建比代理内重放更擅长处理；响应头发送后的流式失败不受影响。`absorb_retry_max_secs = 0` 可按渠道关闭该窗口。
-- 对软故障永不缩短 Grok Build 的原生重试预算。只有重试必然无果的确定性错误（鉴权、权限、账单、额度、无效请求或模型）才收到 `X-Should-Retry: false`，让 Grok Build 直接显示供应商的真实解释，而不是用反复重试掩盖。可重试的 busy/过载 `503` 透传时若上游未带 `Retry-After`，代理会补充 30 秒的 `Retry-After`，让 Grok Build 的重试节奏更合理。
+- 在 Grok Build 看到之前吸收上游瞬态软故障。上游响应头尚未发出时，可重试失败（busy/过载 `503`、`429`、可重试 `5xx` 或响应头超时）会在代理内以指数退避（2s 至 30s，尊重上游 `Retry-After`，上限 60s）自动重试，默认最多等待 90 秒。Cloudflare 源站 TLS 失败（`525`、`526`）也按同样方式吸收，尽管 Grok Build 把它们归为终止类：中转源站重启或证书轮换通常会在窗口内恢复，而在边缘与源站 TLS 握手阶段失败的请求根本没有到达源站应用，重放没有副作用；窗口耗尽后按 Grok Build 预期的终止判定透传。窗口期内 Grok Build 自己的 15 次重试预算完全不动：只有窗口耗尽后客户端才会看到失败，且该失败仍以可重试形式透传，客户端原生预算分毫不少。传输错误不做吸收，因为 Grok Build 首次重试时的 HTTP/1.1 客户端重建比代理内重放更擅长处理；响应头发送后的流式失败不受影响。`absorb_retry_max_secs = 0` 可按渠道关闭该窗口。
+- 对软故障永不缩短 Grok Build 的原生重试预算。只有重试必然无果的确定性错误（鉴权、权限、账单、额度、无效请求或模型）才收到 `X-Should-Retry: false`，让 Grok Build 直接显示供应商的真实解释，而不是用反复重试掩盖。默认透传判定与 Grok Build 的边缘客户端策略一致——除源站 TLS 两个状态码外，`429` 和所有 `5xx` 都可重试——因此瞬态 Cloudflare 边缘页（`520`–`524`、`529`、`530`）不会因代理加盖的请求头而失去客户端原生重试。可重试的 busy/过载 `503` 透传时若上游未带 `Retry-After`，代理会补充 30 秒的 `Retry-After`，让 Grok Build 的重试节奏更合理。
 - 按渠道提供可选的死渠道熔断器（`dead_channel_fail_fast = true`，默认关闭）。只有拨号级失败——连接被拒、DNS 失败、TLS 握手失败——才会计数，因为这类失败重试永远不可能成功；busy `503`、`429`、超时和传输重置一律不计数。连续 6 次拨号级失败（可用 `dead_channel_fail_threshold` 调整）后，代理返回不可重试的 `503 proxy_circuit_open`（`X-Should-Retry: false`）。熔断后每 5 分钟放行一次探测请求：上游返回任何状态的响应都会自动合闸，探测失败则重新计时。探测若始终没有报告结果——调用方中途断开，或探测的响应头超时——2 分钟租约到期即视为丢失，后续请求可以重新探测，不会把渠道永久锁死在断开状态。
 - 在规范化前记录原始上游响应声明的模型，支持终止帧优先、大小写不敏感的不一致判断和多帧冲突标记，不改变路由或响应数据。
 - Messages 的 `thinking` 起始块缺少空 `signature` 时补齐该字段，同时保留供应商随后发送的真实 `signature_delta`，使 Messages 兼容中转可被 Grok Build 的严格原生解码器消费。
@@ -184,7 +184,7 @@ supports_backend_search = false
 | `max_completion_tokens` | 否 | 模型元数据 | 最大生成 token 额度。显式配置优先；缺失时，hellogrok 根据实际发出的请求和可信上游元数据计算预算，但不会把请求中观察到的值写回为模型输出上限。 |
 | `auto_compact_threshold_percent` | 否 | 模型值，其次 `[session]`，最后 `85` | Grok Build 相对于 `context_window` 的首选压缩触发百分比。安全时保持原值；需要为最大输出和安全余量预留空间时，按模型临时降低。有效范围为 `0` 到 `100`。 |
 | `inference_idle_timeout_secs` | 否 | Grok Build/供应商策略 | 等待上游响应头或正文数据时允许的最长空闲间隔。模型值优先于全局 `[models]` 值；DeepSeek 官方端点未显式设置时使用 660 秒。 |
-| `absorb_retry_max_secs` | 否 | `90` | 代理侧重试上游瞬态软故障（busy/过载 `503`、`429`、可重试 `5xx`、响应头超时）的总等待窗口。窗口期内 Grok Build 的重试预算不受影响。显式 `0` 可关闭该渠道的吸收层。 |
+| `absorb_retry_max_secs` | 否 | `90` | 代理侧重试上游瞬态软故障（busy/过载 `503`、`429`、可重试 `5xx`、响应头超时，以及 Cloudflare 源站 TLS `525`/`526`）的总等待窗口。窗口期内 Grok Build 的重试预算不受影响。显式 `0` 可关闭该渠道的吸收层。 |
 | `absorb_retry_backoff_cap_secs` | 否 | `30` | 吸收层单次退避上限。错误响应上的上游 `Retry-After` 仍会主导等待节奏，上限 60 秒。 |
 | `dead_channel_fail_fast` | 否 | `false` | 渠道真正不可达时的可选快速失败：连续拨号级失败（连接被拒、DNS、TLS 握手）后，代理返回不可重试的 `503 proxy_circuit_open`，不再空烧 Grok Build 重试预算。软故障永不计数。 |
 | `dead_channel_fail_threshold` | 否 | `6` | 触发可选死渠道熔断所需的连续拨号级失败次数。 |
@@ -497,6 +497,10 @@ Grok Build 对可重试状态码（429、5xx）最多重试 15 次，单轮最�
 - 连续看到该错误说明该渠道长期不可达，请切换到其它渠道（`/model`），直到中转修复。
 
 502 也可能表示上游返回了结构不完整的成功响应。hellogrok 会在转发前校验 Responses、Messages 或 Chat Completions 的最小响应结构，日志会指出缺失或类型错误的字段。
+
+### 中转返回 `Server error (525)`
+
+525 表示中转前面的 Cloudflare 边缘节点与中转自己的源站完成 TLS 握手失败，526 表示源站证书无效；请求根本没有到达中转的应用。Grok Build 把这两个状态归为终止类——损坏的源站证书不会自行恢复——并显示通用的服务端错误文案，因此除非故障在 hellogrok 的吸收窗口内恢复（默认会在代理内重试 525/526），本轮会在首次出现时直接失败。偶发一次、重发即消失的 525 通常是中转源站重启或证书轮换，可查看中转的状态页。某渠道持续报 525 时，是其源站证书或 TLS 终止配置错误，只能由中转运营方修复：用 `/model` 切换渠道，或在中转轮换耗时经常超过默认窗口时提高 `absorb_retry_max_secs`。
 
 渠道 ID 含点号时优先使用 `[model."完整.ID"]`。未引用的 `[model.foo.bar]` 会被 TOML 解析成嵌套表，Grok Build 原本只看到 `foo`；hellogrok 启用后会临时规范化并验证该表头。`name` 中的点号或连字符不会参与鉴权。
 

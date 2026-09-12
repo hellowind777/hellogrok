@@ -4,6 +4,17 @@ All notable changes to this project are documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.27] — 2026-09-12
+
+### Fixed
+
+- Cloudflare origin-TLS failures from relays (`525` handshake failed, `526` invalid origin certificate) are now retried inside the absorb window before reaching Grok Build, which classifies both statuses as terminal and fails the turn on first sight. The request never reached the relay's origin application, so the proxy-side replay is side-effect free; a relay origin restart or certificate rotation that clears inside the window no longer interrupts a turn, and an exhausted window passes the failure through with the terminal disposition Grok Build expects.
+- The passthrough retry disposition now mirrors Grok Build's edge-client policy (`429` and every `5xx` except `525`/`526` are retryable). The previous narrower status list stamped `X-Should-Retry: false` on transient Cloudflare edge pages (`520`–`524`, `529`, `530`), and that header vetoes Grok Build's own retry, turning a self-clearing edge blip into an instant turn failure.
+
+### Added
+
+- Regression coverage for origin-TLS absorb-then-recover, terminal passthrough after the absorb window, and the retryable disposition of Cloudflare edge pages.
+
 ## [0.1.26] — 2026-09-12
 
 ### Fixed
@@ -380,7 +391,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - CC Switch compatibility detection and conflict warnings.
 - Builds for Windows, Linux, and macOS on amd64 and arm64.
 
-[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.26...HEAD
+[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.27...HEAD
+[0.1.27]: https://github.com/hellowind777/hellogrok/compare/v0.1.26...v0.1.27
 [0.1.26]: https://github.com/hellowind777/hellogrok/compare/v0.1.25...v0.1.26
 [0.1.25]: https://github.com/hellowind777/hellogrok/compare/v0.1.24...v0.1.25
 [0.1.24]: https://github.com/hellowind777/hellogrok/compare/v0.1.23...v0.1.24
