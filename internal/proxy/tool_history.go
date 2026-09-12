@@ -80,7 +80,12 @@ func (ids chatCallIDs) normalize(root map[string]any, stream bool) error {
 				}
 				for other, used := range ids {
 					if other != key && used == id {
-						return fmt.Errorf("duplicate tool call ID")
+						// A relay reused one call ID across calls in the same
+						// response. Remap this call to a fresh ID instead of
+						// rejecting a repairable wire defect: the delivered ID
+						// is what the next round's history will carry.
+						id = compatID("call")
+						break
 					}
 				}
 				ids[key] = id

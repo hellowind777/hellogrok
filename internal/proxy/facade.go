@@ -185,6 +185,48 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 		}
 		response.Body = withBodyIdleTimeout(response.Body, bodyIdleTimeout)
 		if response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices {
+			if !strings.Contains(strings.ToLower(response.Header.Get("Content-Type")), "text/event-stream") {
+				data, readErr := readBodyLimited(response.Body, maxFacadeBodyBytes)
+				_ = response.Body.Close()
+				if readErr != nil {
+					if errors.Is(readErr, errUpstreamBodyIdleTimeout) {
+						writeRetryableJSONError(w, http.StatusGatewayTimeout, "upstream timed out waiting for response body data")
+					} else if errors.Is(readErr, errBodyTooLarge) {
+						writeJSONError(w, http.StatusBadGateway, "upstream response body exceeds 64 MiB")
+					} else {
+						writeRetryableJSONError(w, http.StatusBadGateway, "read upstream response: "+readErr.Error())
+					}
+					return
+				}
+				if surrogate, retryable, wrapped := wrappedUpstreamError(data); wrapped {
+					// The relay reported a failure with a success status. Give
+					// it the failure path: transient envelopes are absorbed
+					// and retried here, deterministic ones pass through with
+					// the provider's explanation instead of an opaque
+					// envelope-validation rejection.
+					response.Header.Set("X-Should-Retry", fmt.Sprintf("%t", retryable))
+					if absorbEligible(surrogate, retryable) && absorb.wait(upstreamContext, retryAfterSeconds(response.Header)) {
+						s.logAbsorbWait(route.ChannelID, absorb, "wrapped 2xx upstream error", surrogate)
+						continue
+					}
+					if upstreamContext.Err() != nil {
+						return
+					}
+					s.log.Printf("UP channel=%s wrapped 2xx error surrogate=%d retryable=%t", route.ChannelID, surrogate, retryable)
+					mergeGrokModelHeaders(w.Header(), response.Header)
+					if !positiveModelHeader(w.Header().Get(grokContextWindowHeader), 64) && discoveredContextWindow > 0 {
+						w.Header().Set(grokContextWindowHeader, fmt.Sprintf("%d", discoveredContextWindow))
+					}
+					copySafeResponseHeaders(w.Header(), response.Header)
+					if retryable && surrogate >= http.StatusInternalServerError && retryAfterSeconds(w.Header()) == 0 {
+						w.Header().Set("Retry-After", strconv.Itoa(synthesizedRetryAfterSeconds))
+					}
+					w.WriteHeader(surrogate)
+					_, _ = w.Write(data)
+					return
+				}
+				response.Body = io.NopCloser(bytes.NewReader(data))
+			}
 			break
 		}
 		if response.StatusCode >= http.StatusMultipleChoices && response.StatusCode < http.StatusBadRequest {
@@ -267,6 +309,17 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 		if reasoningRejected {
 			response.Header.Set("X-Should-Retry", "false")
 			retryable = false
+		}
+		if !reasoningRejected && isCloudflareChallenge(response.Header, data, response.StatusCode) {
+			// A shield challenge in front of the relay is transient: it clears
+			// or the relay routes around it. 403 would classify terminal in
+			// Grok Build, so present the challenge as a retryable 503 and let
+			// the absorb layer hide short challenges.
+			if response.StatusCode == http.StatusForbidden {
+				response.StatusCode = http.StatusServiceUnavailable
+			}
+			response.Header.Set("X-Should-Retry", "true")
+			retryable = true
 		}
 		if absorbEligible(response.StatusCode, retryable) && absorb.wait(upstreamContext, retryAfterSeconds(response.Header)) {
 			reason := "retryable upstream error"
@@ -530,6 +583,49 @@ func absorbEligible(status int, retryable bool) bool {
 	return retryable || status == statusOriginTLSHandshake || status == statusOriginTLSCertificate
 }
 
+// wrappedUpstreamError detects relays that answer a failure with HTTP 200
+// plus an error envelope. A legitimate success envelope never carries a
+// top-level error slot without its object marker, so a Responses terminal
+// body (object "response" with its own error member) keeps its native path.
+// Transient envelopes become a retryable 503 the absorb layer can hide;
+// deterministic ones become a non-retryable 400 that keeps the provider's
+// explanation visible to the client.
+func wrappedUpstreamError(data []byte) (int, bool, bool) {
+	root, err := decodeJSONMap(data)
+	if err != nil {
+		return 0, false, false
+	}
+	if root["error"] == nil || stringValue(root["object"]) != "" {
+		return 0, false, false
+	}
+	if classified, transient := classifyStructuredRetry(data); classified && transient {
+		return http.StatusServiceUnavailable, true, true
+	}
+	return http.StatusBadRequest, false, true
+}
+
+// isCloudflareChallenge reports whether a 403/503 error body is a Cloudflare
+// shield challenge page rather than an origin API rejection. The
+// cf-mitigated header is authoritative; the body markers only apply when the
+// server header names Cloudflare, so a genuine origin 403 never matches.
+func isCloudflareChallenge(header http.Header, body []byte, status int) bool {
+	if status != http.StatusForbidden && status != http.StatusServiceUnavailable {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(header.Get("cf-mitigated")), "challenge") {
+		return true
+	}
+	if !strings.Contains(strings.ToLower(header.Get("server")), "cloudflare") {
+		return false
+	}
+	sample := body
+	if len(sample) > 4096 {
+		sample = sample[:4096]
+	}
+	low := strings.ToLower(string(sample))
+	return strings.Contains(low, "just a moment") || strings.Contains(low, "cf-chl") || strings.Contains(low, "challenge-platform")
+}
+
 func (s *Server) logBreakerTransition(channel string, transition breakerTransition) {
 	switch transition {
 	case breakerOpened:
@@ -675,6 +771,21 @@ func (s *Server) normalizeResponsesJSON(data []byte, route config.Route, request
 	setDownstreamResponseModel(root, responseModelForRoute(route))
 	backfillResponseSearchSources(root, request.HostedWebSearch, request.SearchQuery)
 	alignResponsesOutputThoughts(root)
+	if output, ok := root["output"].([]any); ok && len(output) > 0 {
+		// Relays occasionally omit envelope bookkeeping on an otherwise
+		// complete terminal body. Synthesize the missing markers instead of
+		// rejecting a repairable omission; present-but-wrong values and a
+		// missing or malformed output remain rejections.
+		if stringValue(root["id"]) == "" {
+			root["id"] = compatID("resp")
+		}
+		if stringValue(root["object"]) == "" {
+			root["object"] = "response"
+		}
+		if stringValue(root["status"]) == "" {
+			root["status"] = "completed"
+		}
+	}
 	if err := validateResponsesEnvelope(root); err != nil {
 		return nil, nil, err
 	}

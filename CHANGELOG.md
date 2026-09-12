@@ -4,6 +4,19 @@ All notable changes to this project are documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.28] — 2026-09-12
+
+### Fixed
+
+- Relays that answer a failure with HTTP 200 plus an error envelope no longer die as an opaque envelope-validation rejection. A transient envelope (rate limit, overloaded, timeout) now enters the absorb window and is retried inside the proxy; a deterministic envelope (authentication, billing, invalid request) passes through with the provider's explanation and a terminal disposition. Responses terminal bodies that carry their own error member keep the native failed-response path.
+- A Cloudflare shield challenge in front of a relay (`cf-mitigated: challenge` or a Cloudflare-served challenge page) is treated as transient: absorbed inside the retry window, and passed through as a retryable `503` when it outlasts the window, because a bare `403` classifies terminal in Grok Build. A genuine origin `403` without Cloudflare markers is untouched.
+- Non-streaming Chat Completions responses whose relay reuses one `tool_call` ID across calls are remapped to fresh unique IDs, matching the streaming rectifier's tolerance, instead of being rejected; the next round's tool history stays valid.
+- Responses bodies that omit envelope bookkeeping (`id`, `object`, `status`) on an otherwise complete terminal payload get the missing markers synthesized instead of a 502 rejection; present-but-wrong values and a missing or malformed `output` remain rejections.
+
+### Added
+
+- Regression coverage for wrapped-2xx absorb-then-recover and deterministic passthrough, Cloudflare challenge absorb/passthrough and origin-403 separation, envelope bookkeeping synthesis, and non-streaming duplicate call-ID remapping.
+
 ## [0.1.27] — 2026-09-12
 
 ### Fixed
@@ -391,7 +404,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - CC Switch compatibility detection and conflict warnings.
 - Builds for Windows, Linux, and macOS on amd64 and arm64.
 
-[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.27...HEAD
+[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.28...HEAD
+[0.1.28]: https://github.com/hellowind777/hellogrok/compare/v0.1.27...v0.1.28
 [0.1.27]: https://github.com/hellowind777/hellogrok/compare/v0.1.26...v0.1.27
 [0.1.26]: https://github.com/hellowind777/hellogrok/compare/v0.1.25...v0.1.26
 [0.1.25]: https://github.com/hellowind777/hellogrok/compare/v0.1.24...v0.1.25
