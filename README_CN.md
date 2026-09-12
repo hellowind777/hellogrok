@@ -6,7 +6,7 @@
 
 跨平台 Grok Build 本地代理，让自定义模型渠道兼容常见 API 格式、Build 原生 Web 工具、独立鉴权和自动配置恢复。
 
-[![Version](https://img.shields.io/badge/version-0.1.24-2f6feb.svg)](./internal/appinfo/appinfo.go)
+[![Version](https://img.shields.io/badge/version-0.1.25-2f6feb.svg)](./internal/appinfo/appinfo.go)
 [![Go](https://img.shields.io/badge/Go-1.26.6-00ADD8.svg)](./go.mod)
 [![CI](https://github.com/hellowind777/hellogrok/actions/workflows/ci.yml/badge.svg)](https://github.com/hellowind777/hellogrok/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
@@ -66,7 +66,7 @@ hellogrok 为这些自定义渠道提供统一的本地兼容层。运行时准�
 - 在供应商边界保留每个渠道配置的上游 URL 路径和上游模型标识。
 - 使用前准备所有显式自定义渠道，避免通过 `/model` 切换后首次请求失败。
 - 热切换模型时保留可移植的会话历史，只排除已知属于不同渠道、协议、线上模型或上游端点的加密推理。
-- 在原生 Chat 和 Messages 响应交给客户端前补齐缺失的本地工具调用 ID；Responses 流在不同事件间保持输出项和函数调用身份一致；Chat JSON 转 SSE 时为并行工具调用分配独立索引。已有 Chat 历史仅在一个缺失调用 ID 能与唯一结果关联时修复，有歧义的历史仍会报错。
+- 在原生 Chat 和 Messages 响应交给客户端前补齐缺失的本地工具调用 ID；Responses 流在不同事件间保持输出项和函数调用身份一致，上游把同一个 ID 复用到不同输出槽或 Chat 工具调用时，为冲突槽位改写一个保留类型前缀的新唯一 ID 而不是掐断流，同一槽位内的真实冲突仍然拒绝；Chat JSON 转 SSE 时为并行工具调用分配独立索引。已有 Chat 历史仅在一个缺失调用 ID 能与唯一结果关联时修复，有歧义的历史仍会报错。
 - 在 Grok Build 的 last-write-wins 累加器看到原生 Chat 工具调用 SSE 之前先重组：后续空 `"name"` 不会抹掉已知名称，参数片段在 JSON 完整前不做改写。空的或厂商私有的 `finish_reason` 会删除或映射到 Grok Build 的 Chat 枚举（`stop`、`length`、`tool_calls`、`content_filter`、`function_call`）。
 - 把 Grok Build 无法反序列化的 Chat 方言收成线格式：数组 `content`、`thinking`/`reasoning`/`reasoning_details`、Gemini `functionCall`，以及答案正文里的 `<think>`…`</think>`。推理只作为前缀兄弟转发；可见正文之后的思考会丢掉，避免 TUI 在回复下面再开一块 Thought。流式 `reasoning_content` 增量按原样拼接，不按帧裁掉 BPE 词首空格。
 - Chat 历史上，DeepSeek 和 MiMo 保留上一轮 `reasoning_content`（网关缺了会 400）。其他 Chat 渠道只在当前工具循环（最后一条 user 之后）保留模型自己的 CoT，跨轮明文思考会剥掉。加密或带签名的块不删除，也不会注入 `"tool call"` 占位符。
@@ -508,7 +508,7 @@ Grok Build 按精确 `client_name` 分发（是 `list_dir`，不是 `List`）。
 
 ### `tool_use` ID 后没有紧邻的 `tool_result`
 
-Chat 或 Messages 响应中缺失的 ID 会在交给 Grok Build 前补齐；Responses 流通过 `output_index` 关联身份，存在冲突时拒绝响应。旧 Chat 会话若已含缺失 ID，只能修复能唯一关联的调用与结果；历史有歧义时请新建会话。修复不会重建缺失的工具名称、参数或结果。
+Chat 或 Messages 响应中缺失的 ID 会在交给 Grok Build 前补齐；Responses 流通过 `output_index` 关联身份，上游把同一个 item ID 复用到不同输出槽时，后到的冲突槽位会被改写成保留原类型前缀（`rs_`、`ws_`……）的新 ID，该槽位后续所有 `item_id` 事件一致改写，会话不再因反复 500 而失败；Chat Completions 并行工具调用复用同一 `tool_call` ID 时同样唯一化处理。同一槽位内的身份冲突仍然按错误拒绝。旧 Chat 会话若已含缺失 ID，只能修复能唯一关联的调用与结果；历史有歧义时请新建会话。修复不会重建缺失的工具名称、参数或结果。
 
 这个供应商错误表示 Messages 会话历史结构无效：只要 assistant 消息含一个或多个 `tool_use`，紧邻的下一条 user 消息就必须用开头的 `tool_result` 块完整解析这一批调用。hellogrok 会校验原生历史，并在 Responses 转 Messages 时把并行调用及结果分别合并为紧邻的一条 assistant/user 消息后再请求供应商。真正缺失的结果仍返回不可重试的 `400`，不会伪造工具状态。
 

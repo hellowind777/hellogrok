@@ -54,6 +54,50 @@ func TestResponsesToolIdentityAcrossEvents(t *testing.T) {
 	}
 }
 
+func TestResponsesDuplicateItemIDRemapped(t *testing.T) {
+	ids := responseIDs{}
+	first := map[string]any{"type": "response.output_item.done", "output_index": 0,
+		"item": map[string]any{"type": "reasoning", "id": "rs_shared", "status": "completed"}}
+	if err := ids.normalize(first); err != nil {
+		t.Fatal(err)
+	}
+	second := map[string]any{"type": "response.output_item.added", "output_index": 1,
+		"item": map[string]any{"type": "reasoning", "id": "rs_shared", "status": "in_progress"}}
+	if err := ids.normalize(second); err != nil {
+		t.Fatalf("duplicate id rejected instead of remapped: %v", err)
+	}
+	remapped := stringValue(second["item"].(map[string]any)["id"])
+	if remapped == "" || remapped == "rs_shared" {
+		t.Fatalf("id not remapped: %#v", second)
+	}
+	if !strings.HasPrefix(remapped, "rs_") {
+		t.Fatalf("type prefix lost: %s", remapped)
+	}
+	// Later events for the second slot must keep the remapped id.
+	delta := map[string]any{"type": "response.reasoning_summary_text.delta", "output_index": 1, "item_id": "rs_shared", "delta": "x"}
+	if err := ids.normalize(delta); err != nil {
+		t.Fatal(err)
+	}
+	if delta["item_id"] != remapped {
+		t.Fatalf("delta item_id=%v want %s", delta["item_id"], remapped)
+	}
+	// A completed snapshot carrying both items must stay consistent.
+	completed := map[string]any{"type": "response.completed", "response": map[string]any{"output": []any{
+		map[string]any{"type": "reasoning", "id": "rs_shared"},
+		map[string]any{"type": "reasoning", "id": "rs_shared"},
+	}}}
+	if err := ids.normalize(completed); err != nil {
+		t.Fatal(err)
+	}
+	output := anySlice(completed["response"].(map[string]any)["output"])
+	if stringValue(output[0].(map[string]any)["id"]) != "rs_shared" || stringValue(output[1].(map[string]any)["id"]) != remapped {
+		t.Fatalf("completed output ids inconsistent: %#v", output)
+	}
+	if ids.remapped == 0 {
+		t.Fatal("remap not counted")
+	}
+}
+
 func TestMessagesMissingToolIDsBeforeValidation(t *testing.T) {
 	first := map[string]any{"type": "tool_use", "name": "read_file", "input": map[string]any{}}
 	second := map[string]any{"type": "tool_use", "name": "read_file", "input": map[string]any{}}

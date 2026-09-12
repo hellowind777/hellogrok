@@ -6,7 +6,7 @@
 
 A cross-platform local proxy that makes Grok Build custom model channels work with common API formats, native Web tools, isolated authentication, and automatic configuration recovery.
 
-[![Version](https://img.shields.io/badge/version-0.1.24-2f6feb.svg)](./internal/appinfo/appinfo.go)
+[![Version](https://img.shields.io/badge/version-0.1.25-2f6feb.svg)](./internal/appinfo/appinfo.go)
 [![Go](https://img.shields.io/badge/Go-1.26.6-00ADD8.svg)](./go.mod)
 [![CI](https://github.com/hellowind777/hellogrok/actions/workflows/ci.yml/badge.svg)](https://github.com/hellowind777/hellogrok/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
@@ -66,7 +66,7 @@ It is intended for users who maintain multiple third-party model channels — in
 - Preserves each configured upstream URL path and wire-model identifier at the provider boundary.
 - Prepares every explicit custom channel before use, avoiding first-request failures after `/model` switching.
 - Preserves portable conversation history during model hot switching while withholding only encrypted reasoning known to belong to a different channel, protocol, wire model, or upstream endpoint.
-- Normalizes missing local tool-call IDs before delivery in native Chat and Messages responses. Responses streams retain output-item and function-call identities across events. Chat JSON-to-SSE fallback assigns independent indexes to parallel tool calls. Existing Chat history is repaired only when one missing call ID has one unambiguous matching result; ambiguous histories remain errors.
+- Normalizes missing local tool-call IDs before delivery in native Chat and Messages responses. Responses streams retain output-item and function-call identities across events; a provider that reuses one upstream ID across output slots or Chat tool calls receives a fresh unique ID for the colliding slot instead of a dropped stream, while genuine same-slot conflicts are still rejected. Chat JSON-to-SSE fallback assigns independent indexes to parallel tool calls. Existing Chat history is repaired only when one missing call ID has one unambiguous matching result; ambiguous histories remain errors.
 - Reassembles native Chat tool-call SSE before Grok Build's last-write-wins accumulator sees it: empty later `"name"` fields do not erase a known name, and argument fragments are not rewritten until the JSON is complete. Empty or vendor `finish_reason` values are dropped or mapped onto Grok Build's Chat enum (`stop`, `length`, `tool_calls`, `content_filter`, `function_call`).
 - Lifts Chat dialects Grok Build does not deserialize: array `content`, `thinking`/`reasoning`/`reasoning_details`, Gemini `functionCall`, and `<think>`…`</think>` in the answer text. Reasoning is forwarded only as a prefix sibling; later thought after visible text is dropped so the TUI does not open a second Thought under the reply. Streaming `reasoning_content` deltas are concatenated as-is so leading BPE spaces are not trimmed per frame.
 - On Chat history, DeepSeek and MiMo keep previous-turn `reasoning_content` (their gateways 400 without it). Other Chat channels keep the model's own CoT only inside the current tool loop (after the latest user message) and strip cross-turn plaintext thought. Encrypted or signed blobs are never removed, and hellogrok never injects `"tool call"` placeholders.
@@ -508,7 +508,7 @@ Restart both hellogrok executables after upgrading, then start a **new** session
 
 ### `tool_use` IDs have no immediately following `tool_result`
 
-Missing Chat or Messages response IDs are normalized before Grok Build receives them. Responses stream identities are associated by `output_index`; conflicting identities are rejected. If an older Chat session already contains missing IDs, only uniquely associated call/result pairs can be repaired. Start a new session when the history is ambiguous. Repair does not reconstruct missing tool names, arguments, or results.
+Missing Chat or Messages response IDs are normalized before Grok Build receives them. Responses stream identities are associated by `output_index`; when a relay reuses one item ID across output slots, the colliding later slot is remapped to a fresh ID that keeps the provider's type prefix (`rs_`, `ws_`, …) and every later `item_id` event for that slot is rewritten consistently — the turn survives instead of failing after repeated 500s. The same tolerance covers Chat Completions `tool_call` IDs reused across parallel calls. Same-slot identity conflicts are still rejected as errors. If an older Chat session already contains missing IDs, only uniquely associated call/result pairs can be repaired. Start a new session when the history is ambiguous. Repair does not reconstruct missing tool names, arguments, or results.
 
 This provider error means the Messages conversation history is structurally invalid: every assistant message containing one or more `tool_use` blocks must be followed immediately by one user message whose leading `tool_result` blocks resolve that entire batch. hellogrok validates native history and also groups parallel Responses calls/results into one adjacent Messages assistant/user pair before the provider call. Missing results still return a non-retryable `400`; they are never invented because that would corrupt tool state.
 

@@ -11,13 +11,21 @@ type responseItemIDs struct {
 }
 
 // One registry belongs to one response, not to a connection or channel.
-type responseIDs map[int]*responseItemIDs
+type responseIDs struct {
+	items map[int]*responseItemIDs
+	// remapped counts upstream items whose id collided with another output
+	// slot and was rewritten to keep the stream alive.
+	remapped int
+}
 
-func (ids responseIDs) item(index int, item map[string]any) error {
-	entry := ids[index]
+func (ids *responseIDs) item(index int, item map[string]any) error {
+	if ids.items == nil {
+		ids.items = map[int]*responseItemIDs{}
+	}
+	entry := ids.items[index]
 	if entry == nil {
 		entry = &responseItemIDs{}
-		ids[index] = entry
+		ids.items[index] = entry
 	}
 	if err := ids.assign(index, &entry.id, item, "id", "item"); err != nil {
 		return err
@@ -28,19 +36,26 @@ func (ids responseIDs) item(index int, item map[string]any) error {
 	return nil
 }
 
-func (ids responseIDs) assign(index int, saved *string, object map[string]any, key, prefix string) error {
+func (ids *responseIDs) assign(index int, saved *string, object map[string]any, key, prefix string) error {
 	value := stringValue(object[key])
 	if *saved != "" && value != "" && value != *saved {
-		return fmt.Errorf("Responses output %d has conflicting %s", index, key)
+		if !ids.collides(index, value) {
+			return fmt.Errorf("Responses output %d has conflicting %s", index, key)
+		}
+		// The value belongs to a different slot whose id this provider
+		// reused; treat the event as referring to this slot and rewrite
+		// it below.
 	}
 	if *saved == "" {
 		if value == "" {
 			value = compatID(prefix)
 		}
-		for other, entry := range ids {
-			if other != index && ((key == "id" && entry.id == value) || (key == "call_id" && entry.callID == value)) {
-				return fmt.Errorf("Responses output has duplicate %s", key)
-			}
+		if ids.collides(index, value) {
+			// Some providers reuse one item id across output slots (for
+			// example a single reasoning id per response). Remap the later
+			// slot to a fresh id instead of failing the whole stream.
+			value = ids.freshID(value, prefix)
+			ids.remapped++
 		}
 		*saved = value
 	}
@@ -48,7 +63,31 @@ func (ids responseIDs) assign(index int, saved *string, object map[string]any, k
 	return nil
 }
 
-func (ids responseIDs) normalize(event map[string]any) error {
+func (ids *responseIDs) collides(self int, value string) bool {
+	for other, entry := range ids.items {
+		if other != self && (entry.id == value || entry.callID == value) {
+			return true
+		}
+	}
+	return false
+}
+
+// freshID keeps the provider's type prefix (rs_, ws_, msg_, ...) so the
+// rewritten id still reads like the item it labels.
+func (ids *responseIDs) freshID(original, prefix string) string {
+	base := prefix
+	if cut := strings.IndexByte(original, '_'); cut > 0 {
+		base = original[:cut]
+	}
+	for {
+		candidate := compatID(base)
+		if !ids.collides(-1, candidate) {
+			return candidate
+		}
+	}
+}
+
+func (ids *responseIDs) normalize(event map[string]any) error {
 	if response, _ := event["response"].(map[string]any); response != nil {
 		for index, raw := range anySlice(response["output"]) {
 			if item, _ := raw.(map[string]any); item != nil {
@@ -60,7 +99,8 @@ func (ids responseIDs) normalize(event map[string]any) error {
 	}
 	item, _ := event["item"].(map[string]any)
 	typ := stringValue(event["type"])
-	if item == nil && !strings.HasPrefix(typ, "response.function_call_arguments.") {
+	_, hasItemID := event["item_id"]
+	if item == nil && !hasItemID && !strings.HasPrefix(typ, "response.function_call_arguments.") {
 		return nil
 	}
 	if _, present, valid := optionalCanonicalToken(event, "output_index"); !present || !valid {
@@ -70,10 +110,13 @@ func (ids responseIDs) normalize(event map[string]any) error {
 	if item != nil {
 		return ids.item(index, item)
 	}
-	entry := ids[index]
+	if ids.items == nil {
+		ids.items = map[int]*responseItemIDs{}
+	}
+	entry := ids.items[index]
 	if entry == nil {
 		entry = &responseItemIDs{}
-		ids[index] = entry
+		ids.items[index] = entry
 	}
 	alias := map[string]any{"id": event["item_id"]}
 	if err := ids.assign(index, &entry.id, alias, "id", "item"); err != nil {

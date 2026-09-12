@@ -264,6 +264,7 @@ func (r *chatToolRectifier) flush() ([]map[string]any, []string) {
 		indexes = append(indexes, index)
 	}
 	sort.Ints(indexes)
+	seenIDs := map[string]struct{}{}
 	var notes []string
 	for _, index := range indexes {
 		state := r.tools[index]
@@ -276,6 +277,12 @@ func (r *chatToolRectifier) flush() ([]map[string]any, []string) {
 		if state.id == "" {
 			state.id = compatID("call")
 		}
+		if _, taken := seenIDs[state.id]; taken {
+			// Gateways that reuse one call id for every tool_call would
+			// poison the next round's tool history; assign a unique id.
+			state.id = compatID("call")
+		}
+		seenIDs[state.id] = struct{}{}
 		name := restoreStreamToolName(state.name, r.searchAlias)
 		args := state.args.String()
 		resolved, rewritten, callNotes := adaptResolvedCall(name, args, r.advertised)

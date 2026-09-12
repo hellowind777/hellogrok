@@ -93,6 +93,37 @@ func TestChatRectifierResolvesBashAliasOnce(t *testing.T) {
 	}
 }
 
+func TestChatRectifierDeduplicatesReusedCallIDs(t *testing.T) {
+	rectifier := newChatToolRectifier(grokBuildTools(), "")
+	var out []map[string]any
+	for _, chunk := range []map[string]any{
+		chatToolChunk(0, "call_dup", "read_file", `{"path":"a"}`, nil),
+		chatToolChunk(1, "call_dup", "read_file", `{"path":"b"}`, nil),
+		chatFinishChunk("tool_calls"),
+	} {
+		frames, _ := rectifier.ingest(chunk)
+		out = append(out, frames...)
+	}
+	var ids []string
+	for _, frame := range out {
+		for _, raw := range anySlice(anySlice(frame["choices"])[0].(map[string]any)["delta"].(map[string]any)["tool_calls"]) {
+			call := raw.(map[string]any)
+			if id := stringValue(call["id"]); id != "" {
+				ids = append(ids, id)
+			}
+		}
+	}
+	if len(ids) != 2 {
+		t.Fatalf("expected 2 tool frames, got ids=%v", ids)
+	}
+	if ids[0] == ids[1] {
+		t.Fatalf("duplicate call id survived: %v", ids)
+	}
+	if ids[0] != "call_dup" {
+		t.Fatalf("first call id rewritten unnecessarily: %s", ids[0])
+	}
+}
+
 func TestChatRectifierPassesReasoningImmediately(t *testing.T) {
 	rectifier := newChatToolRectifier(grokBuildTools(), "")
 	frames, _ := rectifier.ingest(map[string]any{

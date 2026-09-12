@@ -4,6 +4,18 @@ All notable changes to this project are documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.25] — 2026-09-12
+
+### Fixed
+
+- Responses streams no longer fail when an upstream reuses one item ID across output slots (observed on sub2api-style gateways that share a single reasoning ID per response). The colliding later slot is remapped to a fresh unique ID that keeps the provider's type prefix (`rs_`, `ws_`, `msg_`, …), and every later `item_id` event for that slot — reasoning summary deltas, function-call argument deltas, and the final `response.completed` snapshot — is rewritten consistently. Affected turns previously exhausted Grok Build's retry budget and ended as `Server error (500)`.
+- Chat Completions streams now assign a unique `call_` ID to any `tool_call` whose upstream ID was already used by another call in the same response, keeping the next round's tool history valid instead of tripping request-side history validation.
+- The per-stream remap count is logged (`remapped N duplicate upstream item id(s)`) so a defective upstream remains visible in diagnostics.
+
+### Changed
+
+- Responses stream identity validation distinguishes two failure classes: cross-slot ID reuse (remapped, stream survives) and same-slot identity conflicts (still rejected). Request-side tool-history validation is unchanged.
+
 ## [0.1.24] — 2026-09-12
 
 ### Fixed
@@ -351,7 +363,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - CC Switch compatibility detection and conflict warnings.
 - Builds for Windows, Linux, and macOS on amd64 and arm64.
 
-[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.24...HEAD
+[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.25...HEAD
+[0.1.25]: https://github.com/hellowind777/hellogrok/compare/v0.1.24...v0.1.25
 [0.1.24]: https://github.com/hellowind777/hellogrok/compare/v0.1.23...v0.1.24
 [0.1.23]: https://github.com/hellowind777/hellogrok/compare/v0.1.22...v0.1.23
 [0.1.22]: https://github.com/hellowind777/hellogrok/compare/v0.1.21...v0.1.22

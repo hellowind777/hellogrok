@@ -1,13 +1,11 @@
-# 发布说明 — v0.1.24
+# 发布说明 — v0.1.25
 
-## 原生 Chat 对齐 Grok Build
+## 容忍上游在 Responses 与 Chat Completions 流中复用 ID
 
-- 普通 Chat / Messages 渠道继续走 Grok Build 的第一方映射器。Responses 投影只用于托管搜索和 WebSearchClient。
-- 原生 Chat SSE 在 last-write-wins 之前重组工具调用：后续空 `"name"` 不再抹掉已知工具，不完整的参数 JSON 不再按帧改写。
-- 空的或厂商私有的 `finish_reason` 会删除或映射为 `stop` / `length` / `tool_calls` / `content_filter` / `function_call`。
-- 思考只作为前缀兄弟。答案后的 CoT、正文里的 `<think>`，以及 `reply only:` / `任务已全部完成` 这类协议自语会剥掉。推理增量保留 BPE 词首空格。
-- Chat 历史保留同轮工具循环的 `reasoning_content`，跨轮明文 CoT 会剥掉（DeepSeek / MiMo 除外），不注入思考占位符。加密或带签名的块原样通过。
-- 发给上游的工具表只留 Grok Build 的 `client_name`。Claude/Codex 别名只在回来的调用上改写。
-- 每个上游请求都按 `grok-shell` 出示。流式 Chat 保留 `include_usage`；带工具的 GLM Chat 在缺省时设置 `tool_stream=true`。
+- sub2api 类中转网关和部分渠道会把同一个 item ID 复用到 Responses 的不同输出槽（例如整条响应共用一个 reasoning ID），或把同一个 call ID 复用到 Chat Completions 的并行 `tool_call` 上。此前 hellogrok 的身份校验会直接拒绝这条流，Grok Build 重试到预算耗尽后，整轮以 `Server error (500)` 失败。
+- Responses 流现在为后到的冲突槽位改写一个保留上游类型前缀（`rs_`、`ws_`、`msg_`……）的新唯一 ID。该槽位后续所有携带 `item_id` 的事件——reasoning 摘要增量、函数调用参数增量、以及最终的 `response.completed` 快照——都会被一致改写，Grok Build 收到的是一条自洽的流，会话不再中断。
+- Chat Completions 流现在为同一条响应中与先前调用撞 ID 的 `tool_call` 分配唯一的 `call_` ID，保证下一轮的工具历史仍然有效。
+- 每条流的改写次数都会计数并写入日志（`remapped N duplicate upstream item id(s)`），让有缺陷的上游在诊断中仍然可见，而不是静默失败。
+- 同一槽位内的真实身份冲突——某槽位突然换成一个全新无关的 ID——仍然会被拒绝。容忍只针对已确认的上游 ID 复用模式；请求侧的工具历史校验保持不变，继续保护后续轮次不被脏 ID 污染。
 
-升级后请重启 hellogrok 并新开 session。已存盘的气泡不会改写。未在当前请求中声明的工具不会被凭空创造。
+升级后请重启 hellogrok 并新开一轮会话。已存盘的对话气泡不会改写。
