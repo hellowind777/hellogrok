@@ -4,6 +4,23 @@ All notable changes to this project are documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.26] — 2026-09-12
+
+### Fixed
+
+- A response-header timeout no longer cancels the context shared by the retry loop. Previously the attempt timer canceled that shared context, the absorb layer's wait returned immediately, and the handler finished without writing anything: the client received an empty `200` instead of the designed retryable `504`, and absorb retries after a header timeout were a dead path. The timeout now cancels only the failing attempt's derived context, so a header timeout produces the retryable `504`, the absorb layer retries within its configured budget, and a successful retry surfaces as a normal response. Regression tests cover both paths.
+- An opt-in dead-channel breaker probe that ended without reporting an outcome (the caller disconnected mid-probe, or the probe's response headers timed out) previously left the breaker latched in probing state, fast-failing the channel permanently even after connectivity returned. Each probe now carries a 2-minute lease; an expired lease releases a fresh probe on the next request. Probes that report an outcome close or re-arm the breaker as before.
+- Proxy apply and restore now re-read `config.toml` immediately before the atomic rename. When another program changed the file after hellogrok read it for the current operation, the write aborts with a retryable error before touching the file, preserving the concurrent edit; the rewrite state remains on disk for a simple retry.
+- Recovery removes a hellogrok-created `subagents.enabled` dotted key only from the configuration root table. The user's own `subagents.enabled` inside any other table (for example `[model.one]`) is no longer deleted as a temporary projection.
+- When `config.toml` no longer exists, `hellogrok restore` drops the obsolete recovery record instead of failing every later start and restore on a record that can never succeed. An unsupported rewrite-state format error now names the state file to delete.
+- A corrupt `capacity_cache.json` or preferences file no longer blocks startup or later reads and writes. The unparseable file is preserved with a `.bad` suffix and the application continues with an empty capacity cache or default preferences; both are derived state that rebuilds from live traffic and the next write.
+- On Windows, console allocation failures other than "a console already exists" surface as errors, and a failure to bind `CONOUT$` / `CONIN$` returns an error instead of silently leaving stdio unbound. Repeated **Status and logs** clicks while the window is still being created no longer start a second creation attempt, and the creation-timeout error points to the actual log-file path.
+
+### Changed
+
+- Atomic configuration writes flush the renamed file's directory entry so a power loss cannot lose a committed rename (best-effort on filesystems without directory sync).
+- The release workflow fails a tagged build whose tag does not match `Version` in `internal/appinfo/appinfo.go`, and CI pins `govulncheck` to v1.1.4 for reproducible vulnerability scans.
+
 ## [0.1.25] — 2026-09-12
 
 ### Fixed
@@ -363,7 +380,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - CC Switch compatibility detection and conflict warnings.
 - Builds for Windows, Linux, and macOS on amd64 and arm64.
 
-[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.25...HEAD
+[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.26...HEAD
+[0.1.26]: https://github.com/hellowind777/hellogrok/compare/v0.1.25...v0.1.26
 [0.1.25]: https://github.com/hellowind777/hellogrok/compare/v0.1.24...v0.1.25
 [0.1.24]: https://github.com/hellowind777/hellogrok/compare/v0.1.23...v0.1.24
 [0.1.23]: https://github.com/hellowind777/hellogrok/compare/v0.1.22...v0.1.23

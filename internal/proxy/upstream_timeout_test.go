@@ -72,11 +72,12 @@ func TestDoUpstreamRequestCancelsWhileWaitingForHeaders(t *testing.T) {
 	defer upstream.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, upstream.URL, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	response, err := doUpstreamRequest(upstream.Client(), request, 25*time.Millisecond, cancel)
+	response, err := doUpstreamRequest(upstream.Client(), request, 25*time.Millisecond)
 	if response != nil || !errors.Is(err, errUpstreamResponseHeaderTimeout) {
 		t.Fatalf("response=%v error=%v", response, err)
 	}
@@ -84,6 +85,11 @@ func TestDoUpstreamRequestCancelsWhileWaitingForHeaders(t *testing.T) {
 	case <-requestCanceled:
 	case <-time.After(time.Second):
 		t.Fatal("upstream request was not canceled after the response-header deadline")
+	}
+	// The attempt timeout must not cancel the caller's context: the retry loop
+	// reuses it for the next attempt and the absorb wait.
+	if ctx.Err() != nil {
+		t.Fatalf("response-header timeout canceled the caller's context: %v", ctx.Err())
 	}
 }
 
@@ -105,7 +111,7 @@ func TestDoUpstreamRequestStopsHeaderTimerBeforeReadingLongBody(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	response, err := doUpstreamRequest(upstream.Client(), request, 25*time.Millisecond, cancel)
+	response, err := doUpstreamRequest(upstream.Client(), request, 25*time.Millisecond)
 	if err != nil {
 		t.Fatal(err)
 	}

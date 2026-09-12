@@ -3,6 +3,7 @@ package cfgpatch
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +12,92 @@ import (
 
 	"github.com/pelletier/go-toml/v2"
 )
+
+func TestRestoreClearsStateWhenConfigMissing(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	statePath := filepath.Join(dir, "config_rewrite_state.json")
+	if err := os.WriteFile(configPath, []byte(`[model.one]
+base_url = "https://one.example/v1"
+model = "one-model"
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ApplyTargets(configPath, statePath, []Target{{ID: "one"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(statePath); err != nil {
+		t.Fatalf("state file should exist after apply: %v", err)
+	}
+	if err := os.Remove(configPath); err != nil {
+		t.Fatal(err)
+	}
+	// The config is gone: there is nothing to restore, so the record must be
+	// cleared rather than deadlocking every later start/restore on it.
+	n, err := Restore(configPath, statePath)
+	if err != nil {
+		t.Fatalf("Restore with missing config: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("restored=%d want 0", n)
+	}
+	if _, statErr := os.Stat(statePath); !os.IsNotExist(statErr) {
+		t.Fatalf("state file should be cleared, stat err=%v", statErr)
+	}
+	// Idempotent: a second call also succeeds instead of failing again.
+	if _, err := Restore(configPath, statePath); err != nil {
+		t.Fatalf("second Restore with missing config: %v", err)
+	}
+}
+
+func TestRestoreUnsupportedStateFormatGuidesDeletion(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	statePath := filepath.Join(dir, "config_rewrite_state.json")
+	if err := os.WriteFile(configPath, []byte("[model.one]\nbase_url = \"https://one.example/v1\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(statePath, []byte(`{"format":"other","models":{}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Restore(configPath, statePath)
+	if err == nil {
+		t.Fatal("unsupported state format should error")
+	}
+	if !strings.Contains(err.Error(), statePath) {
+		t.Fatalf("error should name the state file to delete, got: %v", err)
+	}
+}
+
+func TestWriteConfigAtomicCompareAbortsOnExternalChange(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	original := []byte("[model.one]\nbase_url = \"https://one.example/v1\"\n")
+	if err := os.WriteFile(configPath, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// An external editor writes between our read and our atomic replace.
+	external := []byte("[model.one]\nbase_url = \"https://one.example/v1\"\n# user note\n")
+	if err := os.WriteFile(configPath, external, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := writeConfigAtomicCompare(configPath, []byte("[model.two]\n"), original)
+	if !errors.Is(err, errConfigChangedExternally) {
+		t.Fatalf("err=%v want errConfigChangedExternally", err)
+	}
+	// The external edit must survive untouched.
+	current, readErr := os.ReadFile(configPath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if !bytes.Equal(current, external) {
+		t.Fatalf("external edit was overwritten:\n%s", current)
+	}
+	// Matching content writes through.
+	if err := writeConfigAtomicCompare(configPath, []byte("[model.two]\n"), external); err != nil {
+		t.Fatalf("compare-and-write with matching content: %v", err)
+	}
+}
 
 func TestApplyAndRestoreWriteUTF8WithoutBOM(t *testing.T) {
 	dir := t.TempDir()
@@ -48,6 +135,38 @@ func TestApplyAndRestoreWriteUTF8WithoutBOM(t *testing.T) {
 	}
 	if !bytes.Equal(restored, content) {
 		t.Fatalf("restore did not return BOM-free original content\nwant: %x\ngot:  %x", content, restored)
+	}
+}
+
+func TestRestoreKeepsSubagentDottedKeyInsideModelTable(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	statePath := filepath.Join(dir, "state.json")
+	// A root dotted subagents key (no [subagents] section) makes the apply
+	// create a root dotted `subagents.enabled` line. The user's own
+	// `subagents.enabled` inside [model.one] is a different, legal TOML key.
+	content := []byte(`subagents.max_concurrent = 2
+
+[model.one]
+base_url = "https://one.example/v1"
+subagents.enabled = true
+`)
+	if err := os.WriteFile(configPath, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ApplyTargets(configPath, statePath, []Target{{ID: "one"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Restore(configPath, statePath); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(restored)
+	if !strings.Contains(text, "[model.one]") || !strings.Contains(text, "subagents.enabled = true") {
+		t.Fatalf("restore deleted the user's [model.one] subagents.enabled key:\n%s", text)
 	}
 }
 

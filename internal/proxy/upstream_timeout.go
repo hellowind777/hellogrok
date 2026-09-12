@@ -50,11 +50,21 @@ func routeUpstreamIdleTimeout(route config.Route, fallback time.Duration) time.D
 }
 
 // doUpstreamRequest applies a deadline only until response headers arrive.
-// http.Client.Timeout would also cap a healthy long-running stream.
-func doUpstreamRequest(client *http.Client, request *http.Request, timeout time.Duration, cancel context.CancelFunc) (*http.Response, error) {
+// http.Client.Timeout would also cap a healthy long-running stream. The
+// timeout cancels only this attempt's derived context, never the caller's
+// context: the caller's context is shared by the retry loop, and canceling it
+// would mark every later retry (and the absorb layer's wait) as done.
+func doUpstreamRequest(client *http.Client, request *http.Request, timeout time.Duration) (*http.Response, error) {
 	if timeout <= 0 {
 		return client.Do(request)
 	}
+
+	attemptCtx, attemptCancel := context.WithCancel(request.Context())
+	request = request.WithContext(attemptCtx)
+	// Do NOT defer attemptCancel: on success the caller still owns the body
+	// under this context after we return, and canceling here would cut the
+	// stream. Cancel only on the timeout and error paths below; on success the
+	// context is reclaimed when the caller's request finishes.
 
 	var stateMu sync.Mutex
 	returned := false
@@ -66,7 +76,7 @@ func doUpstreamRequest(client *http.Client, request *http.Request, timeout time.
 			return
 		}
 		timedOut = true
-		cancel()
+		attemptCancel()
 	})
 
 	response, err := client.Do(request)
@@ -76,12 +86,17 @@ func doUpstreamRequest(client *http.Client, request *http.Request, timeout time.
 	stateMu.Unlock()
 	_ = timer.Stop()
 	if headerTimedOut {
+		attemptCancel()
 		if response != nil && response.Body != nil {
 			_ = response.Body.Close()
 		}
 		return nil, errUpstreamResponseHeaderTimeout
 	}
-	return response, err
+	if err != nil {
+		attemptCancel()
+		return nil, err
+	}
+	return response, nil
 }
 
 type idleTimeoutReadCloser struct {

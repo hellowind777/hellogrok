@@ -6,7 +6,7 @@
 
 A cross-platform local proxy that makes Grok Build custom model channels work with common API formats, native Web tools, isolated authentication, and automatic configuration recovery.
 
-[![Version](https://img.shields.io/badge/version-0.1.25-2f6feb.svg)](./internal/appinfo/appinfo.go)
+[![Version](https://img.shields.io/badge/version-0.1.26-2f6feb.svg)](./internal/appinfo/appinfo.go)
 [![Go](https://img.shields.io/badge/Go-1.26.6-00ADD8.svg)](./go.mod)
 [![CI](https://github.com/hellowind777/hellogrok/actions/workflows/ci.yml/badge.svg)](https://github.com/hellowind777/hellogrok/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
@@ -60,7 +60,7 @@ It is intended for users who maintain multiple third-party model channels — in
 - Bounds ordinary upstream response-header waits and gaps between reads from every response body at 601 seconds, one second beyond Grok Build's 600-second shell default. First-party `api.deepseek.com` routes use 660 seconds to cover the provider's documented ten-minute queue. There is no total request deadline, and every upstream byte, including a non-streaming queue newline or normalized heartbeat, renews the idle window.
 - Absorbs transient upstream soft failures before Grok Build ever sees them. While the upstream response headers have not been sent, a retryable failure (busy/overloaded `503`, `429`, retryable `5xx`, or a response-header timeout) is retried inside the proxy with exponential backoff (2s to 30s, honoring an upstream `Retry-After` up to 60s) for up to 90 seconds by default. Grok Build's own 15-attempt retry budget stays untouched during the window: it only sees a failure when the window is exhausted, and even then the failure passes through as retryable, so the client keeps its full native budget. Transport errors are not absorbed because Grok Build's first-retry HTTP/1.1 client rebuild handles those better. Streaming failures after headers are sent are unaffected. `absorb_retry_max_secs = 0` disables the window per channel.
 - Never shortens Grok Build's native retry budget for soft failures. Only deterministic errors whose retries cannot succeed (authentication, permission, billing, quota, invalid request/model) receive `X-Should-Retry: false`, so Grok Build shows the provider explanation instead of hiding it behind repeated retries. When a retryable busy/overloaded `503` passes through without an upstream `Retry-After`, the proxy adds a 30-second one so Grok Build paces its retries.
-- Keeps an opt-in dead-channel breaker per channel (`dead_channel_fail_fast = true`, default off). Only dial-level failures — connection refused, DNS errors, TLS handshakes — count toward it, because those never succeed on retry; busy `503`, `429`, timeouts, and transport resets never do. After 6 consecutive dial-level failures (configurable via `dead_channel_fail_threshold`) the proxy answers a non-retryable `503 proxy_circuit_open` with `X-Should-Retry: false`. One probe request is allowed through after a 5-minute cooldown: any upstream response of any status closes the breaker automatically, a failed probe re-arms it.
+- Keeps an opt-in dead-channel breaker per channel (`dead_channel_fail_fast = true`, default off). Only dial-level failures — connection refused, DNS errors, TLS handshakes — count toward it, because those never succeed on retry; busy `503`, `429`, timeouts, and transport resets never do. After 6 consecutive dial-level failures (configurable via `dead_channel_fail_threshold`) the proxy answers a non-retryable `503 proxy_circuit_open` with `X-Should-Retry: false`. One probe request is allowed through after a 5-minute cooldown: any upstream response of any status closes the breaker automatically, a failed probe re-arms it. A probe that never reports an outcome — the caller disconnected mid-probe, or the probe's response headers timed out — is presumed lost after a 2-minute lease, and a later request may probe again instead of leaving the channel latched open.
 - Logs the model declared by the raw upstream response before normalization, including terminal-frame precedence, case-insensitive mismatch detection, and conflicting declarations, without changing routing or response data.
 - Completes a missing empty `signature` on Messages `thinking` block starts while preserving the provider's later `signature_delta`, so Messages-compatible relays remain consumable by Grok Build's strict native decoder.
 - Preserves each configured upstream URL path and wire-model identifier at the provider boundary.
@@ -104,13 +104,13 @@ Grok Build executes files, shell, grep, subagents, client `web_search`, MCP (`se
 - Checks and temporarily completes required Grok settings when the proxy starts.
 - Leaves `reasoning_effort`, `reasoning_efforts`, and `supports_reasoning_effort` entirely user- or Grok Build-owned: it never creates, migrates, reorders, or replaces them. Temporary proxy-owned settings such as `supports_backend_search` remain byte-stable across repeated applies, and stop restores only values managed by the active transaction.
 - Preserves upstream error status and body while classifying retry behavior from structured error codes. Authentication, permission, billing, insufficient balance/quota, invalid request, and invalid model failures are non-retryable; rate limits, timeouts, overload, and temporary service failures remain retryable. An explicit upstream `X-Should-Retry` header always wins.
-- Accepts `config.toml` as UTF-8 with or without a BOM. Read-only checks never rewrite the file; every successful proxy apply, restore, or rollback write saves it atomically as UTF-8 without BOM. Invalid TOML reports the file path, line, and column instead of an undecorated parser error.
+- Accepts `config.toml` as UTF-8 with or without a BOM. Read-only checks never rewrite the file; every successful proxy apply, restore, or rollback write saves it atomically as UTF-8 without BOM. Invalid TOML reports the file path, line, and column instead of an undecorated parser error. Apply and restore re-read the file immediately before the atomic rename: an external edit made during the update aborts the write with a retryable error and is preserved, and the rename's directory entry is flushed so a power loss cannot lose a committed write.
 - Computes an independent auto-compaction budget for each custom model from its effective context window and maximum output. It temporarily lowers only unsafe thresholds, never raises a lower user value, and restores every managed value when the proxy stops.
 - Forwards only live-context usage that can fit the known `context_window`. Hosted-search billing totals and other measurements larger than the window become `usage: null` so Grok Build keeps its previous baseline instead of compacting on an impossible count.
 - On normal stop, tray exit, Ctrl+C, SIGTERM, or failed startup, restores untouched temporary values while preserving concurrent user edits through a field-level three-way merge. If unrelated edits make the full TOML document invalid but it remains valid UTF-8, line-scoped recovery still restores independently valid managed assignments while preserving the malformed user text.
 - Always honors the tray **Exit** command after attempting cleanup. If safe restoration is impossible because the file cannot be accessed or an unowned local route remains, the recovery transaction stays on disk for the next launch instead of trapping the user in the tray process.
 - Keeps a diagnostic listener after an ordinary proxy stop so stale sessions receive a structured, non-retryable `proxy_stopped` error that asks the user to reselect a model. Tray **Exit** closes that listener and releases the port even when configuration cleanup must be deferred.
-- Recovers proxy-managed settings after an unclean exit with `hellogrok restore`.
+- Recovers proxy-managed settings after an unclean exit with `hellogrok restore`. When `config.toml` no longer exists there is nothing to restore, so the obsolete recovery record is dropped instead of failing every later start and restore. Recovery removes a hellogrok-created `subagents.enabled` dotted key only from the file's root table; the user's own `subagents.enabled` inside any other table is preserved.
 
 ### Desktop and operations
 
@@ -373,7 +373,7 @@ The Windows tray application and optional Unix tray build provide:
 
 Only one tray instance runs in a login session; launching it again exits immediately instead of creating a second tray. The remembered tray state is independent from the foreground `hellogrok start` command.
 
-On Windows, the divider in **Status and logs** contains a retention selector and log search. Retention counts distinct dates on which hellogrok actually wrote logs rather than elapsed calendar days; the default keeps the latest 7 usage days, with `off`, 3, 7, 14, and 30 available. Cleanup runs at the next application start. Repeated **Search** clicks move to the next match and wrap to the beginning. Status text wraps; raw log lines remain unwrapped for reliable scanning.
+On Windows, the divider in **Status and logs** contains a retention selector and log search. Retention counts distinct dates on which hellogrok actually wrote logs rather than elapsed calendar days; the default keeps the latest 7 usage days, with `off`, 3, 7, 14, and 30 available. Cleanup runs at the next application start. Repeated **Search** clicks move to the next match and wrap to the beginning. Repeated **Status and logs** clicks while the window is still being created do not queue a second window; a later click can retry if creation failed or timed out. Status text wraps; raw log lines remain unwrapped for reliable scanning.
 
 **Stop protection**: The **Start proxy** toggle and foreground signal handler remain fail-closed when another provider manager owns Grok Build or a temporary hellogrok route cannot be restored safely. The tray **Exit** command is different: it always terminates after the cleanup attempt, so an external ownership conflict can never trap the user in the application.
 
@@ -413,7 +413,7 @@ If both Grok proxies were enabled accidentally, disable CC Switch's Grok Build t
 | Windows | `%LOCALAPPDATA%\hellogrok` |
 | Linux and macOS | `~/.hellogrok` |
 
-Runtime data contains application preferences, logs, the recovery state used to restore managed configuration, and `reasoning_provenance.json`. Files owned by hellogrok are written as UTF-8 without BOM. The provenance index stores only SHA-256 digests of opaque reasoning values and route signature domains; it never stores raw reasoning, channel IDs, model names, upstream URLs, or credentials.
+Runtime data contains application preferences, logs, the recovery state used to restore managed configuration, and `reasoning_provenance.json`. Files owned by hellogrok are written as UTF-8 without BOM. Corrupt derived-state files never block startup: an unparseable capacity cache or preferences file is preserved next to the original with a `.bad` suffix while the application continues with an empty cache or default preferences. The provenance index stores only SHA-256 digests of opaque reasoning values and route signature domains; it never stores raw reasoning, channel IDs, model names, upstream URLs, or credentials.
 
 Log retention is applied on every platform. The native retention selector and in-window search are currently Windows-only because the standard Linux and macOS builds use terminal log viewing instead of the Win32 status window.
 
@@ -490,7 +490,7 @@ A 502 can also mean that an upstream returned a malformed success response. hell
 
 Grok Build retries retryable statuses (429, 5xx) up to 15 times, roughly 5.5 minutes per turn. Transient provider overload (a busy `503`) is hidden first by hellogrok's absorb window and then paced by a synthesized `Retry-After`, so a short outage usually never reaches the UI at all. When a relay's origin stays down for longer than the absorb window, the client keeps its full retry budget and the UI stays in the retrying phase — the expected native behavior.
 
-For a channel that is truly unreachable (connection refused, DNS, TLS handshake), retries can never succeed. Set `dead_channel_fail_fast = true` on that channel to opt into the dead-channel breaker: after 6 consecutive dial-level failures (configurable via `dead_channel_fail_threshold`) the proxy answers `503 proxy_circuit_open` with `X-Should-Retry: false` so the turn fails in seconds instead of burning the budget. After a 5-minute cooldown one probe request is allowed through; any upstream response closes the breaker automatically, a failed probe re-arms the cooldown. Busy `503`, `429`, timeouts, and transport resets never count toward the breaker.
+For a channel that is truly unreachable (connection refused, DNS, TLS handshake), retries can never succeed. Set `dead_channel_fail_fast = true` on that channel to opt into the dead-channel breaker: after 6 consecutive dial-level failures (configurable via `dead_channel_fail_threshold`) the proxy answers `503 proxy_circuit_open` with `X-Should-Retry: false` so the turn fails in seconds instead of burning the budget. After a 5-minute cooldown one probe request is allowed through; any upstream response closes the breaker automatically, a failed probe re-arms the cooldown. A probe that never reports an outcome is presumed lost after a 2-minute lease, so a disconnected or header-timed-out probe cannot latch the channel open forever. Busy `503`, `429`, timeouts, and transport resets never count toward the breaker.
 
 When you see `proxy_circuit_open`:
 
@@ -627,7 +627,7 @@ Run the local quality checks:
 ```bash
 go test ./... -count=1
 go vet ./...
-go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
 ```
 
 Windows users with configured live channels can run the integration smoke tests:
@@ -639,7 +639,7 @@ Windows users with configured live channels can run the integration smoke tests:
 .\scripts\run_grok_all_channels_test.ps1 -RequireWebFetch -MaxTurns 2 -TimeoutSeconds 150
 ```
 
-CI runs tests and default builds on Windows, Linux, Intel macOS, and Apple Silicon macOS. It also builds the optional tray target natively on Linux and macOS. Tagged releases produce amd64 and arm64 artifacts for all three operating systems.
+CI runs tests and default builds on Windows, Linux, Intel macOS, and Apple Silicon macOS. It also builds the optional tray target natively on Linux and macOS. Tagged releases produce amd64 and arm64 artifacts for all three operating systems; the release workflow fails a tagged build whose tag does not match `Version` in `internal/appinfo/appinfo.go`.
 
 ## Limitations
 

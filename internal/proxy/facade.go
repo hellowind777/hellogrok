@@ -142,7 +142,7 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 			req.Header.Set("Anthropic-Version", "2023-06-01")
 		}
 		req.ContentLength = int64(len(payload))
-		return doUpstreamRequest(upstreamClient, req, responseHeaderTimeout, cancelUpstream)
+		return doUpstreamRequest(upstreamClient, req, responseHeaderTimeout)
 	}
 
 	var response *http.Response

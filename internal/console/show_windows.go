@@ -14,7 +14,10 @@ func Show(title string) error {
 	alloc := kernel32.NewProc("AllocConsole")
 	setTitle := kernel32.NewProc("SetConsoleTitleW")
 
-	_, _, _ = alloc.Call()
+	if _, _, err := alloc.Call(); err != nil && err != syscall.ERROR_ACCESS_DENIED {
+		// ERROR_ACCESS_DENIED means a console already exists, which is fine.
+		return err
+	}
 	if title != "" {
 		t, err := syscall.UTF16PtrFromString(title)
 		if err == nil {
@@ -24,13 +27,15 @@ func Show(title string) error {
 
 	// Bind Go stdio to the new console devices
 	out, err := os.OpenFile("CONOUT$", os.O_RDWR, 0)
-	if err == nil {
-		os.Stdout = out
-		os.Stderr = out
+	if err != nil {
+		return err
 	}
+	os.Stdout = out
+	os.Stderr = out
 	in, err := os.OpenFile("CONIN$", os.O_RDWR, 0)
-	if err == nil {
-		os.Stdin = in
+	if err != nil {
+		return err
 	}
+	os.Stdin = in
 	return nil
 }

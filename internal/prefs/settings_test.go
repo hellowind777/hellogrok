@@ -46,14 +46,31 @@ func TestProxyEnabledDefaultsTrueAndPersistsExplicitChoice(t *testing.T) {
 	}
 }
 
-func TestProxyEnabledRejectsCorruptSettings(t *testing.T) {
+func TestCorruptSettingsBackedUpAndResetToDefaults(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, settingsFileName)
-	if err := os.WriteFile(path, []byte("not json"), 0o600); err != nil {
+	corrupt := []byte("not json")
+	if err := os.WriteFile(path, corrupt, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ProxyEnabled(path); err == nil {
-		t.Fatal("corrupt settings must not be ignored")
+	// Reads fall back to defaults instead of failing forever.
+	if enabled, err := ProxyEnabled(path); err != nil || !enabled {
+		t.Fatalf("corrupt settings read: enabled=%v err=%v (want default true, no error)", enabled, err)
+	}
+	// The corrupt content is preserved for inspection.
+	backup, err := os.ReadFile(path + ".bad")
+	if err != nil {
+		t.Fatalf("corrupt settings should be backed up: %v", err)
+	}
+	if !bytes.Equal(backup, corrupt) {
+		t.Fatalf("backup=%q want original corrupt content %q", backup, corrupt)
+	}
+	// Writes rebuild a valid file rather than erroring.
+	if err := SetProxyEnabled(path, false); err != nil {
+		t.Fatalf("write after corrupt settings: %v", err)
+	}
+	if enabled, err := ProxyEnabled(path); err != nil || enabled {
+		t.Fatalf("rebuilt settings: enabled=%v err=%v (want false)", enabled, err)
 	}
 }
 

@@ -521,7 +521,10 @@ func ApplyTargets(configPath, statePath string, targets []Target) (ApplyResult, 
 	if !bytes.Equal(persistedState, encoded) {
 		return ApplyResult{}, restorePreviousRewriteState(statePath, previousState, hadPreviousState, fmt.Errorf("rewrite state read-back mismatch"))
 	}
-	if err := writeConfigAtomic(configPath, prepared); err != nil {
+	if err := writeConfigAtomicCompare(configPath, prepared, raw); err != nil {
+		if errors.Is(err, errConfigChangedExternally) {
+			return ApplyResult{}, restorePreviousRewriteState(statePath, previousState, hadPreviousState, err)
+		}
 		return ApplyResult{}, restorePreviousRewriteState(statePath, previousState, hadPreviousState, fmt.Errorf("write config: %w", err))
 	}
 	written, err := os.ReadFile(configPath)
@@ -1312,10 +1315,13 @@ func Restore(configPath, statePath string) (int, error) {
 		return 0, fmt.Errorf("decode rewrite state: %w", err)
 	}
 	if state.Format != stateFormat || state.Models == nil {
-		return 0, fmt.Errorf("unsupported rewrite state format %q", state.Format)
+		return 0, fmt.Errorf("unsupported rewrite state format %q; delete %s to clear it and start again", state.Format, statePath)
 	}
 	configPath, err = canonicalConfigPath(configPath)
 	if err != nil {
+		if configMissingErr(err) {
+			return clearStateWithoutConfig(statePath)
+		}
 		return 0, fmt.Errorf("resolve config path: %w", err)
 	}
 	if !sameConfigPath(state.ConfigPath, configPath) {
@@ -1323,6 +1329,9 @@ func Restore(configPath, statePath string) (int, error) {
 	}
 	raw, err := os.ReadFile(configPath)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return clearStateWithoutConfig(statePath)
+		}
 		return 0, err
 	}
 	if err := tomlutil.ValidateUTF8File(configPath, raw); err != nil {
@@ -1399,7 +1408,7 @@ func Restore(configPath, statePath string) (int, error) {
 		return 0, fmt.Errorf("config still contains temporary hellogrok routes after preserving concurrent edits: %s", strings.Join(remaining, ", "))
 	}
 	restoredBytes := []byte(text)
-	if err := writeConfigAtomic(configPath, restoredBytes); err != nil {
+	if err := writeConfigAtomicCompare(configPath, restoredBytes, raw); err != nil {
 		return 0, err
 	}
 	if err := os.Remove(statePath); err != nil && !os.IsNotExist(err) {
@@ -1522,6 +1531,23 @@ func sameConfigPath(left, right string) bool {
 		return strings.EqualFold(left, right)
 	}
 	return left == right
+}
+
+// configMissingErr reports whether a canonicalConfigPath failure is the config
+// file itself being absent (as opposed to an I/O or permission error).
+func configMissingErr(err error) bool {
+	return os.IsNotExist(err) || errors.Is(err, syscall.ENOENT)
+}
+
+// clearStateWithoutConfig drops a recovery record when the config it would
+// restore no longer exists. There is nothing left to restore, so keeping the
+// record would deadlock every later start and `restore` invocation on a record
+// that can never succeed.
+func clearStateWithoutConfig(statePath string) (int, error) {
+	if err := os.Remove(statePath); err != nil && !os.IsNotExist(err) {
+		return 0, err
+	}
+	return 0, nil
 }
 
 func managedSemanticValue(rendered string) string {
@@ -2117,10 +2143,20 @@ func restoreSubagentEnabled(text string, state SubagentState) (string, int) {
 	restored := 0
 
 	if state.DottedLineCreated {
+		// Only the root table (before the first section header) belongs to this
+		// rewrite. A `subagents.enabled` dotted key inside any other table (for
+		// example `[model.one]`) is the user's own key, not ours.
+		rootEnd := len(lines)
+		for index, line := range lines {
+			if structural[index] && tomlSection(line) != nil {
+				rootEnd = index
+				break
+			}
+		}
 		updated := make([]string, 0, len(lines))
 		for index, line := range lines {
 			bare := strings.TrimRight(line, "\r\n")
-			if structural[index] && (subagentsEnabledDottedLine.MatchString(bare) || subagentsEnabledDottedAnyLine.MatchString(bare)) {
+			if index < rootEnd && structural[index] && (subagentsEnabledDottedLine.MatchString(bare) || subagentsEnabledDottedAnyLine.MatchString(bare)) {
 				restored++
 				continue
 			}
@@ -2489,11 +2525,34 @@ func existingFileMode(path string, fallback os.FileMode) os.FileMode {
 	return fallback
 }
 
+// errConfigChangedExternally reports that config.toml was modified after it
+// was read for the current apply/restore. The operation is aborted before any
+// write so the external edit is preserved; the rewrite state is still on disk
+// and the operation can simply be retried.
+var errConfigChangedExternally = errors.New("config.toml changed during hellogrok's update; your concurrent edit was preserved, please retry")
+
 func writeConfigAtomic(path string, data []byte) error {
 	if err := tomlutil.ValidateUTF8File(path, data); err != nil {
 		return err
 	}
 	return writeFileAtomic(path, tomlutil.StripUTF8BOM(data), existingFileMode(path, 0o600))
+}
+
+// writeConfigAtomicCompare atomically replaces the config only if it still
+// matches expected (the bytes originally read for this operation). The compare
+// happens immediately before the atomic rename, narrowing the read→write
+// window in which a concurrent editor could be silently overwritten.
+func writeConfigAtomicCompare(path string, data, expected []byte) error {
+	if expected != nil {
+		current, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		if !bytes.Equal(current, expected) {
+			return errConfigChangedExternally
+		}
+	}
+	return writeConfigAtomic(path, data)
 }
 
 func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
@@ -2528,8 +2587,21 @@ func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
 	if err := renameAtomic(tmpPath, path); err != nil {
 		return err
 	}
+	syncDir(dir)
 	keep = true
 	return nil
+}
+
+// syncDir flushes the directory entry for the just-renamed file so a power
+// loss cannot lose the rename itself. It is best-effort: some filesystems
+// (notably on Windows) do not support directory sync, which is not fatal.
+func syncDir(dir string) {
+	d, err := os.Open(dir)
+	if err != nil {
+		return
+	}
+	_ = d.Sync()
+	_ = d.Close()
 }
 
 func renameAtomic(source, target string) error {

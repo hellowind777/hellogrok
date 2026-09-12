@@ -6,7 +6,7 @@
 
 跨平台 Grok Build 本地代理，让自定义模型渠道兼容常见 API 格式、Build 原生 Web 工具、独立鉴权和自动配置恢复。
 
-[![Version](https://img.shields.io/badge/version-0.1.25-2f6feb.svg)](./internal/appinfo/appinfo.go)
+[![Version](https://img.shields.io/badge/version-0.1.26-2f6feb.svg)](./internal/appinfo/appinfo.go)
 [![Go](https://img.shields.io/badge/Go-1.26.6-00ADD8.svg)](./go.mod)
 [![CI](https://github.com/hellowind777/hellogrok/actions/workflows/ci.yml/badge.svg)](https://github.com/hellowind777/hellogrok/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
@@ -60,7 +60,7 @@ hellogrok 为这些自定义渠道提供统一的本地兼容层。运行时准�
 - 普通渠道的上游响应头等待及所有响应正文的两次读取间隔最多为 601 秒，比 Grok Build shell 默认的 600 秒多一秒；`api.deepseek.com` 官方路由使用 660 秒，以覆盖服务商记录的最长十分钟排队。请求没有总时限，非流式排队空行或规范化心跳等任意上游字节都会刷新空闲时限。
 - 在 Grok Build 看到之前吸收上游瞬态软故障。上游响应头尚未发出时，可重试失败（busy/过载 `503`、`429`、可重试 `5xx` 或响应头超时）会在代理内以指数退避（2s 至 30s，尊重上游 `Retry-After`，上限 60s）自动重试，默认最多等待 90 秒。窗口期内 Grok Build 自己的 15 次重试预算完全不动：只有窗口耗尽后客户端才会看到失败，且该失败仍以可重试形式透传，客户端原生预算分毫不少。传输错误不做吸收，因为 Grok Build 首次重试时的 HTTP/1.1 客户端重建比代理内重放更擅长处理；响应头发送后的流式失败不受影响。`absorb_retry_max_secs = 0` 可按渠道关闭该窗口。
 - 对软故障永不缩短 Grok Build 的原生重试预算。只有重试必然无果的确定性错误（鉴权、权限、账单、额度、无效请求或模型）才收到 `X-Should-Retry: false`，让 Grok Build 直接显示供应商的真实解释，而不是用反复重试掩盖。可重试的 busy/过载 `503` 透传时若上游未带 `Retry-After`，代理会补充 30 秒的 `Retry-After`，让 Grok Build 的重试节奏更合理。
-- 按渠道提供可选的死渠道熔断器（`dead_channel_fail_fast = true`，默认关闭）。只有拨号级失败——连接被拒、DNS 失败、TLS 握手失败——才会计数，因为这类失败重试永远不可能成功；busy `503`、`429`、超时和传输重置一律不计数。连续 6 次拨号级失败（可用 `dead_channel_fail_threshold` 调整）后，代理返回不可重试的 `503 proxy_circuit_open`（`X-Should-Retry: false`）。熔断后每 5 分钟放行一次探测请求：上游返回任何状态的响应都会自动合闸，探测失败则重新计时。
+- 按渠道提供可选的死渠道熔断器（`dead_channel_fail_fast = true`，默认关闭）。只有拨号级失败——连接被拒、DNS 失败、TLS 握手失败——才会计数，因为这类失败重试永远不可能成功；busy `503`、`429`、超时和传输重置一律不计数。连续 6 次拨号级失败（可用 `dead_channel_fail_threshold` 调整）后，代理返回不可重试的 `503 proxy_circuit_open`（`X-Should-Retry: false`）。熔断后每 5 分钟放行一次探测请求：上游返回任何状态的响应都会自动合闸，探测失败则重新计时。探测若始终没有报告结果——调用方中途断开，或探测的响应头超时——2 分钟租约到期即视为丢失，后续请求可以重新探测，不会把渠道永久锁死在断开状态。
 - 在规范化前记录原始上游响应声明的模型，支持终止帧优先、大小写不敏感的不一致判断和多帧冲突标记，不改变路由或响应数据。
 - Messages 的 `thinking` 起始块缺少空 `signature` 时补齐该字段，同时保留供应商随后发送的真实 `signature_delta`，使 Messages 兼容中转可被 Grok Build 的严格原生解码器消费。
 - 在供应商边界保留每个渠道配置的上游 URL 路径和上游模型标识。
@@ -104,13 +104,13 @@ Grok Build 在本地执行文件、终端、grep、子代理、客户端 `web_se
 - 代理启动时检查并临时补全 Grok 必需设置。
 - `reasoning_effort`、`reasoning_efforts` 和 `supports_reasoning_effort` 完全归用户或 Grok Build 管理，hellogrok 不会创建、迁移、重排或替换这些字段。`supports_backend_search` 等代理临时管理的设置在重复应用时保持稳定，停止时只恢复当前事务管理的值。
 - 保留上游错误状态和正文，并根据结构化错误代码判断是否重试。鉴权、权限、账单、余额或额度不足、无效请求和无效模型错误不可重试；限流、超时、过载和临时服务错误仍可重试。上游显式返回的 `X-Should-Retry` 始终优先。
-- 接受带或不带 BOM 的 UTF-8 `config.toml`。只读检查不会改写文件；代理每次成功应用、恢复或回滚配置时，都会以 UTF-8 无 BOM 原子写入。TOML 无效时会显示文件路径、行号和列号，不再只输出缺少上下文的解析器错误。
+- 接受带或不带 BOM 的 UTF-8 `config.toml`。只读检查不会改写文件；代理每次成功应用、恢复或回滚配置时，都会以 UTF-8 无 BOM 原子写入。TOML 无效时会显示文件路径、行号和列号，不再只输出缺少上下文的解析器错误。应用与恢复在原子重命名前会重新读取文件：更新期间的外部修改会让本次写入以可重试错误中止并原样保留该修改；重命名后还会刷新目录项，断电不会丢失已提交的写入。
 - 根据每个自定义模型的有效上下文窗口和最大输出分别计算自动压缩预算；只临时降低不安全的阈值，不会提高用户设置的较低值，停止代理时恢复全部受管值。
 - 只转发能放入已知 `context_window` 的实时上下文用量。hosted search 的累计计费总量以及其他大于窗口的测量会变成 `usage: null`，让 Grok Build 保留原基线，而不是按不可能的计数去压缩。
 - 正常停止、退出托盘、Ctrl+C、SIGTERM 或启动失败时恢复未被用户改动的临时值，并通过字段级三方合并保留代理运行期间的用户修改。无关修改使整份 TOML 无效但文件仍是有效 UTF-8 时，逐行恢复仍会撤销可独立解析的受管字段，并保留用户写入的无效 TOML 文本。
 - 托盘“退出”始终会在尝试清理后结束进程。若文件无法访问或仍有不属于原事务结构的本地路由，恢复事务会留在磁盘供下次启动处理，不会把用户困在托盘程序中。
 - 普通停止代理后保留诊断监听，让旧会话收到结构化、不可重试的 `proxy_stopped` 错误，并提示用户重新选择模型。托盘“退出”会关闭该监听并释放端口，即使配置清理需要推迟也不例外。
-- 异常退出后可以使用 `hellogrok restore` 恢复代理管理的设置。
+- 异常退出后可以使用 `hellogrok restore` 恢复代理管理的设置。`config.toml` 已不存在时没有可恢复的内容，restore 会清除过期的恢复记录，而不是让之后每次启动和恢复都失败。恢复只会删除文件根表中由 hellogrok 创建的 `subagents.enabled` 赋值，用户写在其他表里的同名点号键不受影响。
 
 ### 桌面与运维
 
@@ -373,7 +373,7 @@ Windows 托盘程序和可选 Unix 托盘版提供：
 
 同一登录会话只运行一个托盘实例；再次打开会直接退出，不会创建第二个托盘。托盘记忆状态与前台运行的 `hellogrok start` 命令相互独立。
 
-Windows 的“状态与日志”分割工具条提供自动清理天数选择和日志搜索。保留天数按 hellogrok 实际写过日志的不同日期计数，而不是按连续自然日计数；默认保留最近 7 个使用日，可选关闭、3、7、14、30。清理在下次启动应用时执行。重复点击“搜索”会跳到下一处匹配并在末尾回到开头。状态文本自动换行，原始日志行保持不换行，便于逐行检查。
+Windows 的“状态与日志”分割工具条提供自动清理天数选择和日志搜索。保留天数按 hellogrok 实际写过日志的不同日期计数，而不是按连续自然日计数；默认保留最近 7 个使用日，可选关闭、3、7、14、30。清理在下次启动应用时执行。重复点击“搜索”会跳到下一处匹配并在末尾回到开头。窗口仍在创建时重复点击“状态与日志”不会排队创建第二个窗口；创建失败或超时后，下一次点击会重试。状态文本自动换行，原始日志行保持不换行，便于逐行检查。
 
 **停止保护：** 当其他供应商管理工具持有 Grok Build，或临时 hellogrok 路由无法安全恢复时，“启动代理”开关和前台信号处理仍会保持失败关闭。托盘“退出”不同：完成清理尝试后始终结束进程，外部所有权冲突不会再把用户困在程序中。
 
@@ -413,7 +413,7 @@ Windows 的“状态与日志”分割工具条提供自动清理天数选择和
 | Windows | `%LOCALAPPDATA%\hellogrok` |
 | Linux 和 macOS | `~/.hellogrok` |
 
-运行数据包括应用偏好、日志、用于恢复代理管理配置的恢复状态，以及 `reasoning_provenance.json`。hellogrok 自己拥有的文件统一写成 UTF-8 无 BOM。推理来源索引只保存不透明推理值和路由签名域的 SHA-256 摘要，不保存原始推理、渠道 ID、模型名、上游 URL 或凭据。
+运行数据包括应用偏好、日志、用于恢复代理管理配置的恢复状态，以及 `reasoning_provenance.json`。hellogrok 自己拥有的文件统一写成 UTF-8 无 BOM。损坏的派生状态文件不会阻塞启动：无法解析的容量缓存或偏好文件会以 `.bad` 后缀保留在原文件旁，应用则以空缓存或默认偏好继续运行。推理来源索引只保存不透明推理值和路由签名域的 SHA-256 摘要，不保存原始推理、渠道 ID、模型名、上游 URL 或凭据。
 
 日志保留规则在所有平台生效。原生下拉框和窗口内搜索目前仅适用于 Windows，因为标准 Linux 与 macOS 构建使用终端日志视图，没有对应的 Win32 状态窗口。
 
@@ -488,7 +488,7 @@ hellogrok 会保留上游状态和错误正文。结构化鉴权、权限、账�
 
 Grok Build 对可重试状态码（429、5xx）最多重试 15 次，单轮最长约 5.5 分钟。供应商瞬时过载（busy `503`）会先被 hellogrok 的吸收窗口隐藏，透传时还会用补充的 `Retry-After` 调整重试节奏，因此短时故障通常根本不会出现在界面上。当上游持续故障的时间超过吸收窗口时，客户端保留完整重试预算、界面停留在“重试中”阶段——这正是原生预期行为。
 
-对于真正不可达的渠道（连接被拒、DNS、TLS 握手），重试永远不可能成功。可以对该渠道设置 `dead_channel_fail_fast = true` 启用死渠道熔断：连续 6 次拨号级失败（可用 `dead_channel_fail_threshold` 调整）后，代理返回 `503 proxy_circuit_open`（`X-Should-Retry: false`），本轮在几秒内结束而不是空烧预算。熔断后每 5 分钟放行一次探测请求；上游返回任何状态的响应都会自动合闸，探测失败则重新计时。busy `503`、`429`、超时和传输重置永不计数。
+对于真正不可达的渠道（连接被拒、DNS、TLS 握手），重试永远不可能成功。可以对该渠道设置 `dead_channel_fail_fast = true` 启用死渠道熔断：连续 6 次拨号级失败（可用 `dead_channel_fail_threshold` 调整）后，代理返回 `503 proxy_circuit_open`（`X-Should-Retry: false`），本轮在几秒内结束而不是空烧预算。熔断后每 5 分钟放行一次探测请求；上游返回任何状态的响应都会自动合闸，探测失败则重新计时；探测若始终没有报告结果，2 分钟租约到期即视为丢失，断开或响应头超时的探测不会把渠道永久锁死。busy `503`、`429`、超时和传输重置永不计数。
 
 看到 `proxy_circuit_open` 时：
 
@@ -627,7 +627,7 @@ go test ./internal/proxy -run '^TestLiveProviderReadTool$' -count=1 -timeout 4m
 ```bash
 go test ./... -count=1
 go vet ./...
-go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
 ```
 
 Windows 用户配置真实渠道后，可以运行集成冒烟测试：
@@ -639,7 +639,7 @@ Windows 用户配置真实渠道后，可以运行集成冒烟测试：
 .\scripts\run_grok_all_channels_test.ps1 -RequireWebFetch -MaxTurns 2 -TimeoutSeconds 150
 ```
 
-CI 会在 Windows、Linux、Intel macOS 和 Apple Silicon macOS 上运行测试与默认构建，并在 Linux 和 macOS 原生构建可选托盘目标。标签发布会生成三个操作系统的 amd64 与 arm64 产物。
+CI 会在 Windows、Linux、Intel macOS 和 Apple Silicon macOS 上运行测试与默认构建，并在 Linux 和 macOS 原生构建可选托盘目标。标签发布会生成三个操作系统的 amd64 与 arm64 产物；标签与 `internal/appinfo/appinfo.go` 中的 `Version` 不一致时，发布工作流会直接失败。
 
 ## 使用限制
 

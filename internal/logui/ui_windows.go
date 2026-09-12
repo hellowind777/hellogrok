@@ -65,6 +65,7 @@ var (
 
 	openMu      sync.Mutex
 	openHWND    uintptr
+	building    bool
 	keepAlive   = map[uintptr]*winState{}
 	keepAliveMu sync.Mutex
 )
@@ -259,6 +260,11 @@ func Open(
 		logf("focus existing hwnd=%#x", hwnd)
 		return nil
 	}
+	if building {
+		openMu.Unlock()
+		return nil // a window is already being created for this request
+	}
+	building = true
 	openMu.Unlock()
 
 	type readyMsg struct {
@@ -280,11 +286,18 @@ func Open(
 		logf("pump ended hwnd=%#x", hwnd)
 	}()
 
+	// buildWindow succeeded: openHWND is set inside buildWindow, so the build is
+	// no longer in flight. If it failed or timed out, reset building so a later
+	// click can retry.
+	openMu.Lock()
+	building = false
+	openMu.Unlock()
+
 	select {
 	case r := <-ready:
 		return r.err
 	case <-time.After(5 * time.Second):
-		return fmt.Errorf("创建状态与日志窗口超时，请查看 %%LOCALAPPDATA%%\\hellogrok\\hellogrok.log")
+		return fmt.Errorf("创建状态与日志窗口超时，请查看 %s", path)
 	}
 }
 

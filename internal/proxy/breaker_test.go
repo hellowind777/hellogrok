@@ -84,6 +84,46 @@ func stubAbsorbClock(server *Server) *time.Time {
 	return &clock
 }
 
+// A probe released by allow() that never reports a result (client
+// disconnected mid-probe, or the response headers timed out: neither calls
+// recordSuccess/recordFailure) must not latch probing forever. The lease lets
+// a fresh probe through after the previous one is presumed lost.
+func TestBreakerLostProbeLeaseReleasesProbing(t *testing.T) {
+	clock := time.Now()
+	store := newBreakerStore()
+	store.now = func() time.Time { return clock }
+	params := breakerParams{Enabled: true, Threshold: 2}
+	const channel = "c"
+
+	store.recordFailure(channel, params)
+	if got := store.recordFailure(channel, params); got != breakerOpened {
+		t.Fatalf("second failure transition=%v, want breakerOpened", got)
+	}
+	// In cooldown: rejected.
+	if store.allow(channel, params) {
+		t.Fatal("allow inside cooldown should be false")
+	}
+	// After cooldown: a probe is released.
+	clock = clock.Add(deadChannelCooldown + time.Second)
+	if !store.allow(channel, params) {
+		t.Fatal("first probe after cooldown should be allowed")
+	}
+	// A concurrent request while the probe is in flight is rejected.
+	if store.allow(channel, params) {
+		t.Fatal("allow while probe in flight should be false")
+	}
+	// The probe is lost (no record call). Before the lease expires, still rejected.
+	clock = clock.Add(deadChannelProbeLease - time.Second)
+	if store.allow(channel, params) {
+		t.Fatal("allow before probe lease expiry should be false")
+	}
+	// After the lease, a fresh probe is released instead of latching forever.
+	clock = clock.Add(2 * time.Second)
+	if !store.allow(channel, params) {
+		t.Fatal("allow after probe lease expiry should release a fresh probe, not stay latched")
+	}
+}
+
 // deadUpstreamURL returns a URL that refuses connections.
 func deadUpstreamURL(t *testing.T) string {
 	t.Helper()

@@ -90,10 +90,15 @@ func open(dataDir string, now func() time.Time) (*Cache, error) {
 	}
 	var stored cacheFile
 	if err := json.Unmarshal(raw, &stored); err != nil {
-		return nil, fmt.Errorf("decode capacity cache: %w", err)
+		// The cache is purely derived state (it only speeds up capacity
+		// probing and can be rebuilt from live traffic). A corrupt file must
+		// not block startup: back it up and start empty.
+		backupCorrupt(cache.path, raw)
+		return cache, nil
 	}
 	if stored.Format != cacheFormat {
-		return nil, fmt.Errorf("unsupported capacity cache format %d", stored.Format)
+		backupCorrupt(cache.path, raw)
+		return cache, nil
 	}
 	cutoff := now().Add(-cacheMaxAge)
 	for key, entry := range stored.Entries {
@@ -103,6 +108,12 @@ func open(dataDir string, now func() time.Time) (*Cache, error) {
 		}
 	}
 	return cache, nil
+}
+
+// backupCorrupt preserves a cache file that failed to parse so it can be
+// inspected, while allowing an empty cache to take over.
+func backupCorrupt(path string, raw []byte) {
+	_ = os.WriteFile(path+".bad", raw, 0o600)
 }
 
 // RouteKey produces a non-reversible cache identity. The persisted file never

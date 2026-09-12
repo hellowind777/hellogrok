@@ -25,6 +25,12 @@ func Path(dataDir string) string {
 	return filepath.Join(dataDir, settingsFileName)
 }
 
+// backupCorrupt preserves a settings file that failed to parse so the user can
+// inspect it, while allowing defaults to take over.
+func backupCorrupt(path string, raw []byte) {
+	_ = os.WriteFile(path+".bad", raw, 0o600)
+}
+
 func ProxyEnabled(path string) (bool, error) {
 	current, err := load(path)
 	if err != nil {
@@ -85,7 +91,11 @@ func load(path string) (settings, error) {
 	}
 	var stored storedSettings
 	if err := json.Unmarshal(raw, &stored); err != nil {
-		return settings{}, fmt.Errorf("decode settings: %w", err)
+		// A corrupt settings file must not deadlock every read and write:
+		// back it up for inspection and fall back to defaults so the next
+		// write rebuilds a valid file.
+		backupCorrupt(path, raw)
+		return current, nil
 	}
 	if stored.ProxyEnabled != nil {
 		current.ProxyEnabled = *stored.ProxyEnabled

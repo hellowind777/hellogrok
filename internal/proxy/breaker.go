@@ -30,6 +30,13 @@ const (
 	// deadChannelCooldown is how long the open breaker rejects requests
 	// before allowing a single probe attempt.
 	deadChannelCooldown = 5 * time.Minute
+	// deadChannelProbeLease caps how long a probe may stay in flight before it
+	// is presumed lost. A probe that ends without a dial-level failure or an
+	// upstream response (for example the client disconnected mid-probe, or the
+	// response headers timed out) never calls recordSuccess/recordFailure;
+	// without a lease that would leave probing latched and the channel
+	// permanently fast-failing.
+	deadChannelProbeLease = 2 * time.Minute
 )
 
 // deadChannelErrorMessage is reported when the opt-in breaker rejects a
@@ -46,9 +53,10 @@ const (
 )
 
 type upstreamBreaker struct {
-	failures int
-	openedAt time.Time // zero = closed
-	probing  bool
+	failures     int
+	openedAt     time.Time // zero = closed
+	probing      bool
+	probeStarted time.Time // when the in-flight probe was released
 }
 
 // breakerParams carries a channel's opt-in policy. When Enabled is false the
@@ -139,9 +147,15 @@ func (b *breakerStore) allow(channel string, params breakerParams) bool {
 		return false
 	}
 	if state.probing {
-		return false
+		if b.now().Sub(state.probeStarted) < deadChannelProbeLease {
+			return false
+		}
+		// The previous probe never reported a result (non-dial failure or a
+		// lost client). Release it and allow a fresh probe.
+		state.probing = false
 	}
 	state.probing = true
+	state.probeStarted = b.now()
 	return true
 }
 

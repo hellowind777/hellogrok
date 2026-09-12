@@ -9,6 +9,33 @@ import (
 	"unicode/utf8"
 )
 
+func TestCorruptCacheBackedUpAndReopenedEmpty(t *testing.T) {
+	for _, content := range []string{"not json", `{"format":99,"entries":{}}`} {
+		dir := t.TempDir()
+		path := Path(dir)
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		cache, err := open(dir, func() time.Time { return time.Now() })
+		if err != nil {
+			t.Fatalf("corrupt cache %q should open empty, got error: %v", content, err)
+		}
+		if cache == nil {
+			t.Fatal("corrupt cache should still yield a usable empty cache")
+		}
+		backup, backupErr := os.ReadFile(path + ".bad")
+		if backupErr != nil {
+			t.Fatalf("corrupt cache should be backed up: %v", backupErr)
+		}
+		if string(backup) != content {
+			t.Fatalf("backup=%q want %q", backup, content)
+		}
+	}
+}
+
 func TestCachePersistsOnlyHashedRouteIdentity(t *testing.T) {
 	now := time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
 	dir := t.TempDir()
