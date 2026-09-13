@@ -1,13 +1,13 @@
-# 发布说明 — v0.1.31
+# 发布说明 — v0.1.32
 
-## 自相矛盾的渠道 usage 上报不再推高 Grok Build 上下文计量、不再提前触发自动压缩
+## DeepSeek 下线 hosted 搜索后，其模型不再获得隐式后端搜索默认值
 
-- **本次修复的对象是一个被报错的数字,而不是被配错的阈值。** Grok Build 把渠道上报的 `total_tokens` 直接写入上下文计量表,并用于 `auto_compact_threshold_percent` 判定,全程不与"实际发出去的请求"做交叉校验。部分中转渠道会在某一次响应里把缓存前缀重复计入 prompt(或上报会话累计的 prompt tokens)。实测事故中,一份这样的上报把一个真实占用约 45% 的会话一步推到 91%,随即触发了一次本不该发生的自动压缩;而压缩要把整段历史发给同一慢渠道做摘要,又额外消耗了数分钟。
+- **旧默认值现在会把 `web_search` 引向死路。** 此前 hellogrok 会对精确指向官方 `api.deepseek.com` 端点且未配置该字段的模型，临时投影为 `supports_backend_search = true`——依据是 DeepSeek 文档承诺的供应商托管搜索。DeepSeek 已下线该能力：当前 Responses API 将 `web_search` 及全部内建工具类型标记为忽略，响应格式也不再包含 `web_search_call`。在旧默认值下，`web_search` 调用被路由到 DeepSeek 渠道，端点不执行任何搜索就静默作答，Grok Build 显示一个没有任何来源的"已完成"回合——而客户端搜索回退链（`[models].web_search`、`GROK_WEB_SEARCH_MODEL`、已登录官方账号回退）被整体绕过，因为该渠道看起来具备搜索能力。
 
-- **hellogrok 现在用物理请求体交叉校验每一份 usage 上报。** 以"渠道 + 客户端会话标识"(Grok Build 每个请求都会携带)为键,守卫从每个会话第一份自洽的上报中学习"字节/token 比率":请求体的可 tokenize 体积(编码后字节数扣除内嵌 base64 data URI——它们携带图像字节但只占近乎恒定的 token 成本)除以上报的 prompt tokens。此后任何一次上报,若 prompt tokens 超过按当前请求体推算期望值的 1.25 倍,即在构造上自相矛盾,整份 usage 被丢弃,Grok Build 回落到它自己的字节估算,直到渠道恢复自洽上报。请求体收缩超过四分之一(压缩、回退、恢复)时重新学习基线,而不是把新的更小上下文误判为超报。
+- **字段缺省时的行为现在与其他供应商完全一致。** 隐式默认值已移除。缺省一律保留 Grok Build 模型目录行为：客户端 `web_search` 依次从 `[models].web_search`、`GROK_WEB_SEARCH_MODEL` 或已登录官方账号回退中解析；全都不可用时，模型如实报告无法使用 web 搜索，而不是假装搜索。hellogrok 不再为缺省该字段的 DeepSeek 渠道向活动配置写入 `supports_backend_search = true`。显式值的含义不变：`true` 仍作为路由声明被尊重（对仍实现真实搜索扩展的中转端点有用；官方端点会静默忽略），`false` 仍保持关闭，除非该渠道被选为默认搜索模型。
 
-- **校验覆盖全部线路,其余情况完全不介入。** native Chat Completions 透传(流式与缓冲)、native Responses 透传(流式与缓冲,且先于 `context_details` 投影执行,避免错误数字借投影存活)、以及两条翻译路径(Messages 与 Chat 转 Responses,流式与缓冲)都经过同一守卫。没有稳定会话标识的会话完全跳过校验,因此不提供标识的客户端行为不变;自洽的渠道永远不会被触碰——守卫只抑制"超出请求体推算期望"的上报,从不改写任何数字;上报自洽时,计费可见字段保持原样。
+- **其他 DeepSeek 行为均未改变。** `[1m]` Anthropic Messages 别名、思考模式规范化、覆盖官方十分钟排队的 660 秒空闲策略、Bearer/`X-Api-Key` 鉴权，以及 Chat 到 Responses 的搜索桥接方言全部保持原样。升级前已显式设置 `supports_backend_search` 的配置行为不变。
 
-- **以测试验证,包含对事故形态的端到端复现。** 单元测试固定了基线学习、翻倍上报抑制、下一份自洽上报恢复、上下文重写后基线重学、以及按渠道/按会话隔离;两个端到端测试驱动真实 SSE 上游,令第二次调用的 prompt 计数翻倍(分别走 native Chat 与 native Responses 路径),断言下游流中 `usage` 为 null 且助手正文完整保留。全量测试通过。
+文档同步反映：DeepSeek 2026-09-10 公告以模型 ID `deepseek-flash` 上线 V4.1 Flash 一代（已退役的 `deepseek-v4-flash` / `deepseek-v4-flash-vision-exp` 名称仍路由到该模型），V4 Pro 服务继续提供。既有 DeepSeek 渠道配置无需任何改动。
 
 升级后请重启两个 hellogrok 可执行文件。

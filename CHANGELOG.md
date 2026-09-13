@@ -4,6 +4,12 @@ All notable changes to this project are documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.32] — 2026-09-14
+
+### Changed
+
+- Removed the implicit `supports_backend_search = true` default for models on the exact first-party `api.deepseek.com` endpoint. DeepSeek has retired its hosted web search — the current Responses API documents `web_search` and all other built-in tools as ignored — so the old default routed `web_search` to a channel that silently answers without search results, bypassing the client-search fallback chain (`[models].web_search`, `GROK_WEB_SEARCH_MODEL`, authenticated official fallback) with no error or sources. An omitted field now preserves Grok Build catalog behavior for every provider uniformly; explicit `true`/`false` values keep their meaning, and a channel explicitly set to `true` still works for relayed endpoints that implement a real search extension. DeepSeek-specific protocol handling (the `[1m]` Messages alias, thinking normalization, 660-second idle policy, and the Chat Responses bridge dialect) is unchanged.
+
 ## [0.1.31] — 2026-09-13
 
 ### Fixed

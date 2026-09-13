@@ -609,11 +609,7 @@ func (a *App) Start() error {
 		if route.DefaultSearchModel {
 			a.logger.Printf("channel search: model=%s supports_backend_search=true mode=hosted-current-channel source=default-search-model", route.ChannelID)
 		} else if route.SupportsBackendSearch {
-			source := "config"
-			if !route.SupportsBackendSearchConfigured && config.IsOfficialDeepSeekRoute(route) {
-				source = "deepseek-provider-default"
-			}
-			a.logger.Printf("channel search: model=%s supports_backend_search=true mode=hosted-current-channel source=%s", route.ChannelID, source)
+			a.logger.Printf("channel search: model=%s supports_backend_search=true mode=hosted-current-channel source=config", route.ChannelID)
 		} else {
 			a.logger.Printf("channel search: model=%s supports_backend_search=false mode=client-web_search configured-model-or-authenticated-official-default", route.ChannelID)
 		}
@@ -639,11 +635,6 @@ func (a *App) resolveSearchRoutes(
 	effective := append([]config.Route(nil), routes...)
 	proxiedSearchModel := false
 	for index := range effective {
-		if config.IsOfficialDeepSeekRoute(effective[index]) &&
-			!effective[index].SupportsBackendSearchConfigured {
-			effective[index].SupportsBackendSearch = true
-			a.logger.Printf("search routing: model=%s source=deepseek-provider-default supports_backend_search=true", effective[index].ChannelID)
-		}
 		if selection.Explicit && selection.Model != "" && effective[index].ChannelID == selection.Model {
 			proxiedSearchModel = true
 			effective[index].DefaultSearchModel = true
@@ -687,7 +678,7 @@ func buildSupportsBackendSearch(route config.Route) bool {
 }
 
 func projectBackendSearch(route config.Route) bool {
-	return route.SupportsBackendSearchConfigured || route.DefaultSearchModel || config.IsOfficialDeepSeekRoute(route)
+	return route.SupportsBackendSearchConfigured || route.DefaultSearchModel
 }
 
 func configuredMaxCompletionTokens(route config.Route) uint64 {

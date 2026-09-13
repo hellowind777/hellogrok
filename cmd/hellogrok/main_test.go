@@ -1563,22 +1563,20 @@ func TestResolveSearchRoutesProjectsSelectedCustomModelAsBackendSearch(t *testin
 	}
 }
 
-func TestResolveSearchRoutesDefaultsOfficialDeepSeekSearchUnlessExplicitlyDisabled(t *testing.T) {
+func TestResolveSearchRoutesTreatsOfficialDeepSeekLikeAnyOtherChannel(t *testing.T) {
 	app := &App{logger: log.New(io.Discard, "", 0)}
 	routes := []config.Route{
 		{ChannelID: "deepseek-default", Host: "api.deepseek.com", WireModel: "deepseek-v4-pro", APIBackend: "chat_completions"},
-		{ChannelID: "deepseek-disabled", Host: "api.deepseek.com", WireModel: "deepseek-v4-flash", APIBackend: "responses", SupportsBackendSearchConfigured: true},
-		{ChannelID: "deepseek-future", Host: "api.deepseek.com", WireModel: "deepseek-future-model", APIBackend: "responses"},
+		{ChannelID: "deepseek-explicit", Host: "api.deepseek.com", WireModel: "deepseek-v4-flash", APIBackend: "responses", SupportsBackendSearch: true, SupportsBackendSearchConfigured: true},
 		{ChannelID: "relay", Host: "relay.example", WireModel: "deepseek-v4-pro", APIBackend: "responses"},
 	}
 	effective := app.resolveSearchRoutes(routes, config.WebSearchSelection{})
-	if !effective[0].SupportsBackendSearch || effective[1].SupportsBackendSearch ||
-		!effective[2].SupportsBackendSearch || effective[3].SupportsBackendSearch {
-		t.Fatalf("DeepSeek provider search defaults were not scoped correctly: %+v", effective)
+	if effective[0].SupportsBackendSearch || !effective[1].SupportsBackendSearch || effective[2].SupportsBackendSearch {
+		t.Fatalf("DeepSeek provider search defaults were not removed: %+v", effective)
 	}
 	for index := range routes {
-		if routes[index].SupportsBackendSearch {
-			t.Fatalf("search default mutated input route %d: %+v", index, routes[index])
+		if routes[index].SupportsBackendSearch != (index == 1) {
+			t.Fatalf("search routing mutated input route %d: %+v", index, routes[index])
 		}
 	}
 }
@@ -1618,14 +1616,8 @@ func TestProjectBackendSearchOnlyForExplicitOrDocumentedDefaults(t *testing.T) {
 			want:  true,
 		},
 		{
-			name:  "documented V4 default",
+			name:  "official DeepSeek endpoint follows explicit configuration only",
 			route: config.Route{Host: "api.deepseek.com", WireModel: "deepseek-v4-pro"},
-			want:  true,
-		},
-		{
-			name:  "future DeepSeek model gets endpoint default",
-			route: config.Route{Host: "api.deepseek.com", WireModel: "deepseek-future-model"},
-			want:  true,
 		},
 		{
 			name:  "unconfigured generic model stays catalog owned",
