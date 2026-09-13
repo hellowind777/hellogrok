@@ -423,6 +423,38 @@ func TestSearchSourcesCoverResponsesAndChatMetadataVariants(t *testing.T) {
 	}
 }
 
+func TestSanitizeArkCitationAnnotationsFillsMissingIndices(t *testing.T) {
+	root := map[string]any{"output": []any{
+		map[string]any{"type": "message", "content": []any{
+			map[string]any{"type": "output_text", "text": "answer", "annotations": []any{
+				map[string]any{"type": "url_citation", "url": "https://a.example", "title": "A"},
+				map[string]any{"type": "url_citation", "url": "https://b.example", "start_index": 1, "end_index": 2},
+				map[string]any{"type": "file_citation", "url": "https://c.example"},
+			}},
+		}},
+	}}
+	if !sanitizeArkCitationAnnotations(root) {
+		t.Fatal("missing citation indices were not reported as changed")
+	}
+	content := anySlice(root["output"])[0].(map[string]any)["content"].([]any)[0].(map[string]any)
+	annotations := anySlice(content["annotations"])
+	first, _ := annotations[0].(map[string]any)
+	if first["start_index"] != 0 || first["end_index"] != 0 {
+		t.Fatalf("missing indices were not filled: %#v", first)
+	}
+	second, _ := annotations[1].(map[string]any)
+	if second["start_index"] != 1 || second["end_index"] != 2 {
+		t.Fatalf("present indices were overwritten: %#v", second)
+	}
+	third, _ := annotations[2].(map[string]any)
+	if _, exists := third["start_index"]; exists {
+		t.Fatalf("non url_citation annotation was modified: %#v", third)
+	}
+	if sanitizeArkCitationAnnotations(root) {
+		t.Fatal("second sanitize pass reported a change")
+	}
+}
+
 func TestReadBodyLimitedDetectsOverflow(t *testing.T) {
 	data, err := readBodyLimited(strings.NewReader("1234"), 4)
 	if err != nil || string(data) != "1234" {

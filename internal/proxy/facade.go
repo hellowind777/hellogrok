@@ -249,6 +249,11 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 		if observedContextBudget && discoveredContextWindow == 0 {
 			discoveredContextWindow = observation.MaximumTokens
 		}
+		if schemaRetry, schemaReason := strictSchemaRetry(&request, response.StatusCode, data); schemaRetry {
+			s.log.Printf("UP channel=%s %s", route.ChannelID, schemaReason)
+			saveLastRequestMeta(logTarget, route.WireModel, len(request.Body), tools, webSearch, hostedSearch, functionSearch, xSearch, request)
+			continue
+		}
 		if retry, reason := decider.onErrorResponse(response, data, request, observation, observedContextBudget); retry {
 			if decider.reasoningRetried {
 				s.log.Printf("UP channel=%s %s", route.ChannelID, reason)
@@ -792,6 +797,9 @@ func (s *Server) normalizeResponsesJSON(data []byte, route config.Route, request
 	}
 	setDownstreamResponseModel(root, responseModelForRoute(route))
 	backfillResponseSearchSources(root, request.HostedWebSearch, request.SearchQuery)
+	// Grok Build's citation parser requires index fields some Responses
+	// providers omit; filling them never changes which URLs are displayed.
+	sanitizeArkCitationAnnotations(root)
 	alignResponsesOutputThoughts(root)
 	if output, ok := root["output"].([]any); ok && len(output) > 0 {
 		// Relays occasionally omit envelope bookkeeping on an otherwise

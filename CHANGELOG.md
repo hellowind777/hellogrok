@@ -4,6 +4,16 @@ All notable changes to this project are documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.30] — 2026-09-13
+
+### Added
+
+- Closed-Responses-schema negotiation for hosted web search. The standard `web_search_call.action.sources` include hint remains the default for compliant providers. Volcengine Ark (`*.volces.com`) — whose `include` is a closed enum rejecting unknown values with `InvalidParameter`, and whose tool schema rejects unknown declaration fields such as `filters` and the `allowed_tools` selector — is handled ahead of time: the hint is omitted and the hosted-search declaration is sanitized to the documented field set, with a pure hosted-search `allowed_tools` selection collapsed to `required`. Any other upstream that proves its schema closed with a `400` (include or tool-declaration rejection) triggers one in-request rewrite-and-replay; the rewrite is single-shot per request and no per-host, per-channel, or on-disk state is retained. A rejected request never executed a search, so the replay is side-effect free and consumes no billed search quota.
+
+### Fixed
+
+- Hosted-search responses whose `url_citation` annotations omit `start_index`/`end_index` no longer fail Grok Build's annotation parser: missing indices are filled with `0` on every route, in non-streaming bodies and streaming terminal events alike, preserving search availability at the cost of citation highlight precision only.
+
 ## [0.1.29] — 2026-09-13
 
 ### Added

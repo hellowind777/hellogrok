@@ -1979,3 +1979,82 @@ func TestConcurrentNativeChannelsRemainIsolated(t *testing.T) {
 		t.Fatalf("isolated concurrent requests failed=%d", failures.Load())
 	}
 }
+
+func strictSchemaUpstream(t *testing.T, rejectNeedle string, errorBody string) (*httptest.Server, *int32) {
+	t.Helper()
+	var hits int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		wire, _ := io.ReadAll(request.Body)
+		if bytes.Contains(wire, []byte(rejectNeedle)) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(errorBody))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_1","object":"response","status":"completed","model":"wire","output":[` +
+			`{"type":"web_search_call","id":"ws_1","status":"completed","action":{"type":"search","query":"q","sources":[]}},` +
+			`{"type":"message","id":"msg_1","status":"completed","role":"assistant","content":[{"type":"output_text","text":"answer","annotations":[]}]}],` +
+			`"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`))
+	}))
+	t.Cleanup(upstream.Close)
+	return upstream, &hits
+}
+
+func TestStrictSchemaRetryStripsRejectedIncludeOnce(t *testing.T) {
+	upstream, hits := strictSchemaUpstream(t, `"include"`,
+		`{"error":{"code":"InvalidParameter","message":"The parameter `+"`include`"+` specified in the request are not valid: unknown type: web_search_call.action.sources.","param":"include","type":"BadRequest"}}`)
+	route := facadeRoute("strict-relay", "responses", "wire", "key", upstream.URL)
+	route.Host = "relay.example"
+	route.SupportsBackendSearch = true
+	s := New(log.New(io.Discard, "", 0))
+	s.SetRoutes([]config.Route{route})
+	startPathTestServer(t, s)
+	data, status := postFacade(t, s, route.ChannelID,
+		[]byte(`{"input":"search news","tools":[{"type":"web_search"}],"stream":false}`), "")
+	if status != http.StatusOK {
+		t.Fatalf("status=%d body=%s", status, data)
+	}
+	if got := atomic.LoadInt32(hits); got != 2 {
+		t.Fatalf("upstream hits=%d want 2 (one rejection, one replay)", got)
+	}
+}
+
+func TestStrictSchemaRetrySanitizesRejectedToolDeclaration(t *testing.T) {
+	upstream, hits := strictSchemaUpstream(t, `"filters"`,
+		`{"error":{"code":"InvalidParameter","message":"The parameter `+"`tool`"+` specified in the request are not valid: `+"`json: unknown field \\\"filters\\\"`"+`.","param":"tool","type":"BadRequest"}}`)
+	route := facadeRoute("strict-relay-tools", "responses", "wire", "key", upstream.URL)
+	route.Host = "relay.example"
+	route.SupportsBackendSearch = true
+	s := New(log.New(io.Discard, "", 0))
+	s.SetRoutes([]config.Route{route})
+	startPathTestServer(t, s)
+	data, status := postFacade(t, s, route.ChannelID,
+		[]byte(`{"input":"search news","tools":[{"type":"web_search","filters":{"allowed_domains":["example.test"]}}],"tool_choice":{"type":"allowed_tools","tools":[{"type":"web_search"}]},"stream":false}`), "")
+	if status != http.StatusOK {
+		t.Fatalf("status=%d body=%s", status, data)
+	}
+	if got := atomic.LoadInt32(hits); got != 2 {
+		t.Fatalf("upstream hits=%d want 2 (one rejection, one replay)", got)
+	}
+}
+
+func TestCitationIndexFillAppliesToEveryRoute(t *testing.T) {
+	s := New(log.New(io.Discard, "", 0))
+	route := config.Route{ChannelID: "relay", Host: "relay.example", OriginBase: "https://relay.example/v1", APIBackend: "responses"}
+	body := []byte(`{"id":"resp_1","object":"response","status":"completed","model":"wire","output":[` +
+		`{"type":"web_search_call","id":"ws_1","status":"completed","action":{"type":"search","query":"q","sources":[]}},` +
+		`{"type":"message","id":"msg_1","status":"completed","role":"assistant","content":[{"type":"output_text","text":"answer","annotations":[` +
+		`{"type":"url_citation","url":"https://example.test/a","title":"A"}]}]}],` +
+		`"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`)
+	root, _, err := s.normalizeResponsesJSON(body, route, facadeRequest{Protocol: wireResponses, HostedWebSearch: true}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := anySlice(root["output"])[1].(map[string]any)["content"].([]any)[0].(map[string]any)
+	annotation := anySlice(content["annotations"])[0].(map[string]any)
+	if annotation["start_index"] != 0 || annotation["end_index"] != 0 {
+		t.Fatalf("missing citation indices were not filled on non-Ark route: %#v", annotation)
+	}
+}

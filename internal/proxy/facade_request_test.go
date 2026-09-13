@@ -884,6 +884,64 @@ func TestResponsesHostedSearchPreservesExistingIncludes(t *testing.T) {
 	}
 }
 
+func TestOfficialArkRouteSkipsSourcesInclude(t *testing.T) {
+	body := []byte(`{
+		"input":"search current news",
+		"tools":[{"type":"web_search","filters":{"allowed_domains":["example.test"]},"user_location":{"type":"approximate","country":"CN"}}],
+		"tool_choice":{"type":"allowed_tools","tools":[{"type":"web_search"}]}
+	}`)
+	ark, err := adaptFacadeRequest(body, config.Route{
+		ChannelID: "doubao-search", Host: "ark.cn-beijing.volces.com",
+		OriginBase: "https://ark.cn-beijing.volces.com/api/v3",
+		WireModel:  "doubao-seed-2-0-mini-260428",
+		APIBackend: "responses", APIBackendConfigured: true, SupportsBackendSearch: true,
+	}, wireResponses)
+	if err != nil {
+		t.Fatal(err)
+	}
+	arkRoot, _ := decodeRequestObject(ark.Body)
+	if arkRoot["include"] != nil {
+		t.Fatalf("Ark route gained sources include: %#v", arkRoot["include"])
+	}
+	tools := anySlice(arkRoot["tools"])
+	if len(tools) != 1 {
+		t.Fatalf("Ark tools changed count: %#v", tools)
+	}
+	tool, _ := tools[0].(map[string]any)
+	if _, exists := tool["filters"]; exists {
+		t.Fatalf("Ark tool kept rejected filters field: %#v", tool)
+	}
+	if _, exists := tool["user_location"]; !exists {
+		t.Fatalf("Ark tool lost documented user_location field: %#v", tool)
+	}
+	if stringValue(arkRoot["tool_choice"]) != "required" {
+		t.Fatalf("Ark allowed_tools selector not collapsed: %#v", arkRoot["tool_choice"])
+	}
+
+	relay, err := adaptFacadeRequest(body, config.Route{
+		ChannelID: "ark-relay", Host: "relay.example", OriginBase: "https://relay.example/v1",
+		WireModel:  "doubao-seed-2-0-mini-260428",
+		APIBackend: "responses", APIBackendConfigured: true, SupportsBackendSearch: true,
+	}, wireResponses)
+	if err != nil {
+		t.Fatal(err)
+	}
+	relayRoot, _ := decodeRequestObject(relay.Body)
+	includes := anySlice(relayRoot["include"])
+	if len(includes) != 1 || includes[0] != responsesWebSearchSourcesInclude {
+		t.Fatalf("non-Ark Responses route lost sources include: %#v", relayRoot["include"])
+	}
+	relayTools := anySlice(relayRoot["tools"])
+	relayTool, _ := relayTools[0].(map[string]any)
+	if filters, _ := relayTool["filters"].(map[string]any); len(anySlice(filters["allowed_domains"])) != 1 {
+		t.Fatalf("non-Ark route lost web_search filters: %#v", relayTool)
+	}
+	relayChoice, _ := relayRoot["tool_choice"].(map[string]any)
+	if stringValue(relayChoice["type"]) != "allowed_tools" {
+		t.Fatalf("non-Ark route collapsed allowed_tools selector: %#v", relayRoot["tool_choice"])
+	}
+}
+
 func TestCapableMessagesConsumesResponsesAndUsesHostedSearch(t *testing.T) {
 	body := []byte(`{
 		"model":"display",

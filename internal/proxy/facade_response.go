@@ -1701,6 +1701,40 @@ func urlsToSources(urls []string) []any {
 	return sources
 }
 
+// sanitizeArkCitationAnnotations fills the citation index fields that Grok
+// Build's annotation parser requires but Volcengine Ark omits on its
+// url_citation entries.
+func sanitizeArkCitationAnnotations(root map[string]any) bool {
+	changed := false
+	for _, rawItem := range anySlice(root["output"]) {
+		item, _ := rawItem.(map[string]any)
+		if item == nil || stringValue(item["type"]) != "message" {
+			continue
+		}
+		for _, rawContent := range anySlice(item["content"]) {
+			content, _ := rawContent.(map[string]any)
+			if content == nil {
+				continue
+			}
+			for _, rawAnnotation := range anySlice(content["annotations"]) {
+				annotation, _ := rawAnnotation.(map[string]any)
+				if annotation == nil || stringValue(annotation["type"]) != "url_citation" {
+					continue
+				}
+				for _, key := range []string{"start_index", "end_index"} {
+					switch annotation[key].(type) {
+					case float64, int, int32, int64:
+					default:
+						annotation[key] = 0
+						changed = true
+					}
+				}
+			}
+		}
+	}
+	return changed
+}
+
 // backfillResponseSearchSources supplies the URL list consumed by Grok Build's
 // native "(N sites)" renderer when an upstream confirms that search ran but
 // omits structured citations. Free-form links alone never create a search call.

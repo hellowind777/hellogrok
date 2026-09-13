@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/http"
 	"net/url"
 	"strings"
 
@@ -33,6 +34,13 @@ type facadeRequest struct {
 	AdvertisedTools      []advertisedTool
 	Reasoning            reasoningFilterStats
 	ReasoningRecovery    bool
+	// AddedSourcesInclude reports that the sources include hint was appended,
+	// making the request eligible for one reactive strip when a closed-enum
+	// upstream rejects it.
+	AddedSourcesInclude bool
+	// ToolsSanitized reports the hosted-search declaration was already reduced
+	// to a closed tool schema, making one reactive sanitize eligible.
+	ToolsSanitized bool
 }
 
 func channelFromPath(escapedPath string) (string, wireProtocol, bool) {
@@ -260,8 +268,16 @@ func adaptFacadeRequestWithReasoning(
 		switch request.Protocol {
 		case wireResponses:
 			// Providers that do not implement this standard hint may ignore it. Sending
-			// it keeps source discovery forward-compatible when support is added.
-			includeResponsesWebSearchSources(root)
+			// it keeps source discovery forward-compatible when support is added. Ark
+			// rejects unknown include values outright, so its hosted search runs without
+			// the hint; every other upstream keeps it and proves tolerance by accepting
+			// the request, while a closed-enum rejection triggers one reactive strip.
+			if isOfficialArkRoute(route) {
+				sanitizeArkHostedSearchRequest(root)
+				request.ToolsSanitized = true
+			} else {
+				request.AddedSourcesInclude = includeResponsesWebSearchSources(root)
+			}
 			normalizeDeepSeekRequest(root, route, request.Protocol)
 			request.Body, err = encodeRequestObject(root)
 		case wireMessages:
@@ -351,6 +367,156 @@ func looksLikeGLMRoute(route config.Route) bool {
 		}
 	}
 	return false
+}
+
+// isOfficialArkRoute identifies Volcengine Ark's first-party Responses endpoint.
+// Its include parameter is a closed enum that rejects the sources hint with
+// InvalidParameter, unlike providers that silently ignore unknown values.
+func isOfficialArkRoute(route config.Route) bool {
+	host := strings.ToLower(strings.TrimSpace(route.Host))
+	if parsedHost, _, err := net.SplitHostPort(host); err == nil {
+		host = parsedHost
+	}
+	host = strings.Trim(host, "[]")
+	return host == "volces.com" || strings.HasSuffix(host, ".volces.com")
+}
+
+// arkWebSearchToolKeys are the fields Volcengine Ark accepts inside its hosted
+// web_search tool declaration; any other key fails the whole request.
+var arkWebSearchToolKeys = map[string]bool{
+	"type": true, "max_keyword": true, "limit": true,
+	"sources": true, "user_location": true,
+}
+
+// sanitizeArkHostedSearchRequest adapts Build's hosted-search declaration to
+// Ark's closed request schema: unknown tool fields (for example filters) and
+// the allowed_tools selector are rejected outright by the provider. A pure
+// hosted-search allowed_tools list becomes the equivalent required selector.
+func sanitizeArkHostedSearchRequest(root map[string]any) bool {
+	changed := false
+	for _, raw := range anySlice(root["tools"]) {
+		tool, _ := raw.(map[string]any)
+		if tool == nil || !isHostedWebSearchType(stringValue(tool["type"])) {
+			continue
+		}
+		for key := range tool {
+			if !arkWebSearchToolKeys[key] {
+				delete(tool, key)
+				changed = true
+			}
+		}
+	}
+	choice, _ := root["tool_choice"].(map[string]any)
+	if choice != nil && strings.EqualFold(strings.TrimSpace(stringValue(choice["type"])), "allowed_tools") {
+		hostedOnly := true
+		for _, raw := range anySlice(choice["tools"]) {
+			entry, _ := raw.(map[string]any)
+			if entry == nil || !isHostedWebSearchType(stringValue(entry["type"])) {
+				hostedOnly = false
+				break
+			}
+		}
+		if hostedOnly {
+			root["tool_choice"] = "required"
+			changed = true
+		}
+	}
+	return changed
+}
+
+// includeRejectionError recognizes closed-enum include rejections: the error
+// names the include parameter together with an unknown-value or
+// invalid-parameter condition. Generic validation failures without an include
+// mention do not qualify, so unrelated 4xx responses pass through untouched.
+func includeRejectionError(status int, body []byte) bool {
+	if status < http.StatusBadRequest || status >= http.StatusInternalServerError {
+		return false
+	}
+	blob := strings.ToLower(string(body))
+	if !strings.Contains(blob, "include") {
+		return false
+	}
+	for _, needle := range []string{`"param":"include"`, "unknown type", "invalidparameter", "not valid"} {
+		if strings.Contains(blob, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+// strictToolSchemaError recognizes closed tool-schema rejections: the error
+// names the tool parameter (or tool.type) with an unknown field or unknown
+// tool type. Unrelated validation errors do not match.
+func strictToolSchemaError(status int, body []byte) bool {
+	if status < http.StatusBadRequest || status >= http.StatusInternalServerError {
+		return false
+	}
+	blob := strings.ToLower(string(body))
+	if strings.Contains(blob, `"param":"tool`) || strings.Contains(blob, "unknown tool type") {
+		return true
+	}
+	return strings.Contains(blob, "unknown field") && strings.Contains(blob, "tool")
+}
+
+// stripSourcesInclude removes the include list from an adapted request after
+// the upstream proved its enum closed. Caller entries go with the hint: a host
+// that rejected one include value rejects the whole list.
+func stripSourcesInclude(request *facadeRequest) bool {
+	root, err := decodeRequestObject(request.Body)
+	if err != nil {
+		return false
+	}
+	if _, exists := root["include"]; !exists {
+		return false
+	}
+	delete(root, "include")
+	encoded, err := encodeRequestObject(root)
+	if err != nil {
+		return false
+	}
+	request.Body = encoded
+	request.AddedSourcesInclude = false
+	return true
+}
+
+// sanitizeToolsInBody applies the closed tool schema to an adapted request
+// after the upstream rejected its declaration fields.
+func sanitizeToolsInBody(request *facadeRequest) bool {
+	root, err := decodeRequestObject(request.Body)
+	if err != nil {
+		return false
+	}
+	if !sanitizeArkHostedSearchRequest(root) {
+		return false
+	}
+	encoded, err := encodeRequestObject(root)
+	if err != nil {
+		return false
+	}
+	request.Body = encoded
+	request.ToolsSanitized = true
+	return true
+}
+
+// strictSchemaRetry rewrites a request a closed-schema upstream rejected and
+// reports whether the same request should be replayed once. Each rewrite is
+// single-shot per request: the flags prevent a replay loop, and a rejected
+// request never executed a search, so the replay is side-effect free.
+func strictSchemaRetry(request *facadeRequest, status int, body []byte) (bool, string) {
+	if request.Protocol != wireResponses {
+		return false, ""
+	}
+	if request.AddedSourcesInclude && includeRejectionError(status, body) {
+		if stripSourcesInclude(request) {
+			return true, "schema recovery: upstream rejected the sources include hint; replaying without it"
+		}
+	}
+	if !request.ToolsSanitized && strictToolSchemaError(status, body) {
+		if sanitizeToolsInBody(request) {
+			return true, "schema recovery: upstream rejected hosted-search declaration fields; replaying with sanitized declaration"
+		}
+	}
+	return false, ""
 }
 
 func protocolLabel(protocol wireProtocol) string {

@@ -632,6 +632,7 @@ func (s *Server) streamResponsesSSE(w http.ResponseWriter, response *http.Respon
 			responseBody, _ := event["response"].(map[string]any)
 			if responseBody != nil {
 				backfillResponseSearchSources(responseBody, request.HostedWebSearch, request.SearchQuery)
+				sanitizeArkCitationAnnotations(responseBody)
 				streamedURLs = mergeUniqueStrings(streamedURLs, urlsFromText(streamedText.String())...)
 				mergeResponseSearchURLs(responseBody, streamedURLs)
 			}

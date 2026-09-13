@@ -1,28 +1,19 @@
-# 发布说明 — v0.1.29
+# 发布说明 — v0.1.30
 
-## 上游 408 与中转短时故障不再中断无人值守的任务
+## hosted 搜索改为协商封闭 Responses schema，不再假设供应商容忍
 
-- **上游 `408` 按其真实语义处理。** 服务器之间不存在"客户端太慢"——中转或 Cloudflare 边缘在源站排队、重启时发出的是边缘超时页，语义上等价 504。Grok Build 把字面 408 归类为终局错误并在首次出现即中断本轮。hellogrok 现在会在吸收窗口内重试 408，窗口耗尽后改写为可重试的 `504` 透传，客户端保留原生重试预算而不再直接失败。这正是此前中断长时间智能体任务的那种故障。
+- **标准来源提示保持默认，封闭枚举用证据判定而非猜测。** 每个 Responses hosted 搜索请求仍会请求 `web_search_call.action.sources` —— 这是 OpenAI 文档化的 `include` 值，承载 Grok Build 原生站点数背后的完整被查阅 URL 列表。实现或忽略该提示的供应商保持最大保真度。`include` 为封闭枚举的供应商不再打断搜索：hellogrok 现在依据证据协商偏差，而不是依赖供应商白名单。
 
-- **软故障吸收始终生效，确定性 4xx 可配置。** 可重试 `5xx`、`429`、408 边缘超时页、Cloudflare 源站 TLS `525`/`526` 和响应头超时对每个渠道都吸收——它们会自行恢复，交给客户端重试只是空耗时间。确定性拒绝（鉴权、权限、无效请求/模型）默认立即透传供应商解释。新增全局 `[models]` `error_resilience = "balanced"` 设置可额外把这些 4xx 也纳入吸收窗口，按固定 30 秒后 60 秒的节奏等待，无人值守的任务因此能挺过中转侧令牌轮换、权限修复、配置热加载和短暂部署。推理历史被拒绝在任何设置下都不吸收：它报告的是用户必须看到的异源会话状态。
+- **已知封闭 schema 主机提前处理。** 火山方舟（`*.volces.com`）会以 `InvalidParameter` 拒收未知 `include` 值，并拒收携带封闭 tool schema 之外字段的 hosted 搜索声明（例如 Build 的 `filters` 域名过滤、`allowed_tools` 选择器形态）。对这些主机，hellogrok 省略该提示并发送净化后的声明：tool 内未知字段被剥离到文档集合（`type`、`max_keyword`、`limit`、`sources`、`user_location`），纯 hosted 搜索的 `allowed_tools` 选择折叠为等价的 `required` 选择器。此类主机的来源展示回落到响应注解中的 URL，hellogrok 本就将其归一化到 Grok Build 的两条展示路径。
 
-- **被隐藏较久的失败会标明其时效。** 挺过长时间吸收窗口的错误是最后一次尝试的快照而非实时状态。hellogrok 现在在透传响应上标记 `X-Hellogrok-Absorb-Delay`，并在结构化错误消息前加上 `[hellogrok: upstream stayed failing for ...]` 一行提示，延迟可见而不再伪装成刚发生的失败。窗口耗尽后，Grok Build 的重试指示会显示错误原因（`<原因> | Retrying (N/M)`）并继续原生重试——失败永远不会藏在光秃秃的"重试中"状态后面。
+- **未知严格供应商一次重放自愈，不保留任何状态。** 其他任何以 `400` 自证封闭 schema 的上游（拒收 include 或拒收 tool 声明）会触发同一请求内的单次重写重放：剥离 include 列表，或净化声明，然后重发同一请求。重写按请求单次执行，不会循环；被拒请求未执行搜索，重放无副作用、不消耗计费搜索额度。不保留任何按主机、按渠道或落盘的记忆：协商是线路交换的属性，因此中转、新主机与未来供应商无需 hellogrok 更新即可收敛。
 
-## 中转 TLS 失败现在能触发死渠道熔断
+- **省略解析器必需索引的引用条目不再导致整个响应失败。** Grok Build 的注解解析器要求 `url_citation` 条目带 `start_index`/`end_index`，而部分 Responses 供应商只返回 `url`、`title` 与元数据。缺失索引现在在全路由补 `0`，覆盖非流式响应体与流式终止事件。代价是引用高亮精度；否则代价是整个搜索响应被拒。
 
-可选熔断器（`dead_channel_fail_fast = true`）只统计拨号级失败，但其 TLS 分类此前只覆盖证书校验错误。现在它统计 Go 实际产生的全部握手失败形态——远端/本地 alert 错误、`tls.RecordHeaderError`、HTTPS 指向明文 HTTP 的协议错配——TLS 终止配置错误的渠道会快速失败，而不是烧光客户端全部重试预算。
+## 对真实封闭 schema 供应商的端到端验证
 
-## Responses 思维门控加固
+该协商机制已用火山方舟豆包搜索作为配置的 Grok Build `web_search` 后端实测：直连 API 以 `400 InvalidParameter` 拒收该提示与未净化声明，而协商后的请求返回 `200`，带已完成的 `web_search_call` 与注解来源（代理日志 `search evidence declared=true calls=1 completed=1 sources=5 annotations=5`）。新增测试固定每种行为：include 被拒时不带提示重放一次、tool 声明被拒时带净化声明重放一次、索引补齐适用于全路由、合规中转的 include 条目与选择器保持原样。
 
-- **正文后的思维不再能从 `output_item.done` 帧泄漏。** 该事件现在遵循与其 `added` 对应帧相同的丢弃/剥离规则；`reasoning_summary_part.added/done` 文本经过协议自语过滤；正文后纯 `<think>` 内容块被丢弃。
-- **中转思维变体被门控而非泄漏。** 类型为 `thinking`、`reasoning_summary`、`redacted_thinking` 的 item 与内容块——中转把 Anthropic 风格块经协议转换桥接时的产物——在流式帧与终帧 `response.completed` 中都按官方 `reasoning` 的清洗/丢弃规则处理。
-- **对未知事件响亮失败。** 门控改为表驱动、每种事件类型一条注册规则；未注册但明显携带思维的事件被拦截并记录日志，而不是在用户回复下方泄漏第二个 Thought。无关的未知事件照旧透传。
-
-## 配置恢复修复
-
-- 非法 TOML 恢复不再删除用户编辑过的根表 `subagents.enabled` dotted 行；用户整体删除 `[features]` 节时也不再对其中的功能开关行行使管理权——两者现在都与解析路径一致。新增不变量测试把两条恢复路径钉在同一决策上。
-- 被代理停止时正好在途的请求收到结构化的 `503 proxy_stopped` 诊断，而不是一次性的可重试 `502`，过期会话因此知道要重新选择模型。
-
-全部变更都维持在既有安全契约内：修复发生在 Grok Build 的严格校验器看到线路数据之前，确定性拒绝保持不可重试（被拒绝的请求不会重进重试循环），`error_resilience` 是唯一新增配置——可选、全局、默认关闭。
+所有变更都留在既有安全契约内：重写发生在 Grok Build 严格校验器看到线路之前，确定性拒绝仍不可重试，且未新增任何配置面 —— 协商自动进行，除非记录了 schema 偏差否则不可见。
 
 升级后请重启两个 hellogrok 可执行文件。
