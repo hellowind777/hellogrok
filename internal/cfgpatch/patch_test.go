@@ -2559,6 +2559,131 @@ func TestRestoreInvalidTOMLDoesNotRewriteDuplicateManagedValue(t *testing.T) {
 	}
 }
 
+// TestPrepareRestorePathsAgree encodes the package's modification
+// discipline: the parse path (prepareRestoreState) and the line-scoped
+// fallback (prepareRestoreStateText) must reach the same managed-state
+// decision for the same (config, state) input. The fallback receives the
+// same config text with an unrelated half-written line appended, which makes
+// the file unparseable without touching any managed assignment. Extend the
+// fixtures when a new managed field appears.
+func TestPrepareRestorePathsAgree(t *testing.T) {
+	managedState := func() State {
+		return State{
+			Format: stateFormat, ConfigPath: "unused",
+			Models: map[string]ModelState{},
+			Features: FeatureState{
+				SectionCreated: true,
+				BackendTools:   ManagedLineState{Managed: true, Present: false, AppliedValue: "true"},
+				WebFetch:       ManagedLineState{Managed: true, Present: true, OriginalLine: "web_fetch = false", AppliedValue: "true"},
+			},
+			Subagents: SubagentState{
+				DottedLineCreated: true,
+				Enabled:           ManagedLineState{Managed: true, Present: false, AppliedValue: "true"},
+			},
+		}
+	}
+	fixtures := []struct {
+		name   string
+		config string
+	}{
+		{
+			name:   "all fields at applied values",
+			config: "subagents.enabled = true\n\n[features]\nbackend_tools = true\nweb_fetch = true\n",
+		},
+		{
+			name:   "user edited dotted subagent value",
+			config: "subagents.enabled = false\n\n[features]\nbackend_tools = true\nweb_fetch = true\n",
+		},
+		{
+			name:   "user deleted dotted subagent line",
+			config: "[features]\nbackend_tools = true\nweb_fetch = true\n",
+		},
+		{
+			name:   "user edited feature flags",
+			config: "subagents.enabled = true\n\n[features]\nbackend_tools = false\nweb_fetch = false\n",
+		},
+		{
+			name:   "features section deleted entirely",
+			config: "subagents.enabled = true\n",
+		},
+	}
+	for _, fixture := range fixtures {
+		t.Run(fixture.name, func(t *testing.T) {
+			parsed, err := prepareRestoreState([]byte(fixture.config), managedState())
+			if err != nil {
+				t.Fatalf("parse path rejected fixture: %v", err)
+			}
+			invalid := fixture.config + "broken = \"\n"
+			fallback, err := prepareRestoreStateText([]byte(invalid), managedState())
+			if err != nil {
+				t.Fatalf("text path rejected fixture: %v", err)
+			}
+			if fallback.Features != parsed.Features {
+				t.Errorf("features state diverged\nparse: %+v\ntext:  %+v", parsed.Features, fallback.Features)
+			}
+			if fallback.Subagents != parsed.Subagents {
+				t.Errorf("subagents state diverged\nparse: %+v\ntext:  %+v", parsed.Subagents, fallback.Subagents)
+			}
+		})
+	}
+}
+
+func TestRestoreKeepsUserEditedDottedSubagentLine(t *testing.T) {
+	tests := []struct {
+		name   string
+		suffix string
+	}{
+		{name: "valid TOML"},
+		{name: "invalid TOML", suffix: "broken = \"\n"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			configPath := filepath.Join(dir, "config.toml")
+			statePath := filepath.Join(dir, "state.json")
+			// hellogrok appended a root dotted subagents.enabled line; the user
+			// changed it to false while the proxy was active.
+			edited := "subagents.enabled = false\n" + test.suffix
+			if err := os.WriteFile(configPath, []byte(edited), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			canonicalPath, err := canonicalConfigPath(configPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			state := State{
+				Format: stateFormat, ConfigPath: canonicalPath,
+				Models: map[string]ModelState{},
+				Subagents: SubagentState{
+					DottedLineCreated: true,
+					Enabled:           ManagedLineState{Managed: true, Present: false, AppliedValue: "true"},
+				},
+			}
+			encoded, err := json.Marshal(state)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(statePath, encoded, 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := Restore(configPath, statePath); err != nil {
+				t.Fatal(err)
+			}
+			current, err := os.ReadFile(configPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(current) != edited {
+				t.Fatalf("restore deleted the user-edited dotted subagents line\nwant: %q\ngot:  %q", edited, current)
+			}
+			if _, err := os.Stat(statePath); !os.IsNotExist(err) {
+				t.Fatalf("rewrite state remains after preserving the user edit: %v", err)
+			}
+		})
+	}
+}
+
 func TestRestorePreservesConcurrentEditAfterOriginalFinalLine(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.toml")

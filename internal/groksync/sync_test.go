@@ -159,6 +159,35 @@ func TestParseReachableLeadersFiltersStaleAndDeduplicatesSockets(t *testing.T) {
 	}
 }
 
+func TestParseReachableLeadersKeepsLeadersWithoutStableKey(t *testing.T) {
+	raw := []byte(`[
+		{"pid":1,"classification":"Reachable","socketPath":null,"lockPath":null},
+		{"pid":2,"classification":"Reachable","socketPath":null,"lockPath":null}
+	]`)
+	leaders, err := parseReachableLeaders(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(leaders) != 2 || leaders[0].PID != 1 || leaders[1].PID != 2 {
+		t.Fatalf("leaders without socket path were collapsed: %+v", leaders)
+	}
+}
+
+func TestParseReachableLeadersDeduplicatesLockPathFallback(t *testing.T) {
+	raw := []byte(`[
+		{"pid":1,"classification":"Reachable","lockPath":"lock-a"},
+		{"pid":2,"classification":"Reachable","lockPath":"lock-a"},
+		{"pid":3,"classification":"Reachable","lockPath":"lock-b"}
+	]`)
+	leaders, err := parseReachableLeaders(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(leaders) != 2 || leaders[0].PID != 1 || leaders[1].PID != 3 {
+		t.Fatalf("leaders = %+v", leaders)
+	}
+}
+
 func TestFindGrokCandidateSupportsFallbackAndMissingExecutable(t *testing.T) {
 	dir := t.TempDir()
 	candidate := filepath.Join(dir, "grok-test")

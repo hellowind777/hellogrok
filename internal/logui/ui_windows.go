@@ -234,6 +234,12 @@ func logf(format string, args ...any) {
 	_ = f.Close()
 }
 
+// buildWindowFn and openTimeout are swapped by tests to drive Open without a
+// real window.
+var buildWindowFn = buildWindow
+
+var openTimeout = 5 * time.Second
+
 // Open shows status + live log. Closing the window does not stop the tray proxy.
 func Open(
 	path string,
@@ -274,7 +280,7 @@ func Open(
 
 	go func() {
 		runtime.LockOSThread()
-		hwnd, st, err := buildWindow(path, status, getRetention, setRetention)
+		hwnd, st, err := buildWindowFn(path, status, getRetention, setRetention)
 		if err != nil {
 			logf("buildWindow failed: %v", err)
 			ready <- readyMsg{err: err}
@@ -286,17 +292,21 @@ func Open(
 		logf("pump ended hwnd=%#x", hwnd)
 	}()
 
-	// buildWindow succeeded: openHWND is set inside buildWindow, so the build is
-	// no longer in flight. If it failed or timed out, reset building so a later
-	// click can retry.
-	openMu.Lock()
-	building = false
-	openMu.Unlock()
-
+	// Keep building set until the build finishes: a second click while the
+	// build is still in flight must be ignored, not start a second window.
+	// After ready, a successful build is deduplicated by openHWND (set inside
+	// buildWindow before ready), so resetting here is safe; a failed or timed
+	// out build leaves openHWND clear and must be retryable.
 	select {
 	case r := <-ready:
+		openMu.Lock()
+		building = false
+		openMu.Unlock()
 		return r.err
-	case <-time.After(5 * time.Second):
+	case <-time.After(openTimeout):
+		openMu.Lock()
+		building = false
+		openMu.Unlock()
 		return fmt.Errorf("创建状态与日志窗口超时，请查看 %s", path)
 	}
 }

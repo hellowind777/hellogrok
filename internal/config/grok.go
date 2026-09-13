@@ -61,6 +61,11 @@ type Model struct {
 	AbsorbRetryMaxConfigured bool
 	// AbsorbRetryBackoffCapSecs caps each absorb-layer backoff step.
 	AbsorbRetryBackoffCapSecs uint64
+	// ErrorResilience is the global [models] error-resilience tier: "" (the
+	// off default, soft-failure absorption only) or "balanced" (also absorb
+	// deterministic 4xx failures). Tolerating a relay's self-healing
+	// failures is an operator preference, not a channel property.
+	ErrorResilience string
 	// DeadChannelFailFast opts the channel into fast-failing after
 	// consecutive dial-level failures instead of burning Grok Build's retry
 	// budget on an unreachable channel.
@@ -151,6 +156,7 @@ type Route struct {
 	AbsorbRetryMaxSecs             uint64
 	AbsorbRetryMaxConfigured       bool
 	AbsorbRetryBackoffCapSecs      uint64
+	ErrorResilience                string
 	DeadChannelFailFast            bool
 	DeadChannelFailThreshold       uint64
 }
@@ -223,6 +229,13 @@ func LoadModels(path string) ([]Model, error) {
 			return nil, headerErr
 		}
 	}
+	// error_resilience is a global [models] preference: how a relay's
+	// self-healing failures are tolerated is a property of the operator's
+	// patience, not of any single channel.
+	globalErrorResilience, err := normalizeErrorResilience(str(modelsConfig["error_resilience"]))
+	if err != nil {
+		return nil, fmt.Errorf("[models].error_resilience %w", err)
+	}
 	ids := make([]string, 0, len(modelTable))
 	for id := range modelTable {
 		ids = append(ids, id)
@@ -287,6 +300,7 @@ func LoadModels(path string) ([]Model, error) {
 		if err != nil {
 			return nil, fmt.Errorf("[model.%s].absorb_retry_max_secs %w", id, err)
 		}
+		errorResilience := globalErrorResilience
 		absorbRetryBackoffCapSecs, _, err := inheritedUint64(m, provider, "absorb_retry_backoff_cap_secs")
 		if err != nil {
 			return nil, fmt.Errorf("[model.%s].absorb_retry_backoff_cap_secs %w", id, err)
@@ -378,6 +392,7 @@ func LoadModels(path string) ([]Model, error) {
 			AbsorbRetryMaxSecs:              absorbRetryMaxSecs,
 			AbsorbRetryMaxConfigured:        absorbRetryMaxConfigured,
 			AbsorbRetryBackoffCapSecs:       absorbRetryBackoffCapSecs,
+			ErrorResilience:                 errorResilience,
 			DeadChannelFailFast:             deadChannelFailFast,
 			DeadChannelFailThreshold:        deadChannelFailThreshold,
 			AuthScheme:                      upstreamAuthScheme,
@@ -655,6 +670,21 @@ func normalizeChatSearchDialect(value string) (ChatSearchDialect, error) {
 	}
 }
 
+// normalizeErrorResilience normalizes the per-channel error_resilience tier.
+// An omitted value stays "" (unconfigured); the proxy applies its balanced
+// default behavior at runtime.
+func normalizeErrorResilience(value string) (string, error) {
+	value = strings.ToLower(strings.TrimSpace(value))
+	switch value {
+	case "", "off":
+		return "", nil
+	case "balanced":
+		return value, nil
+	default:
+		return "", fmt.Errorf("must be one of %q, %q", "balanced", "off")
+	}
+}
+
 func envKeyList(v any) []string {
 	switch t := v.(type) {
 	case string:
@@ -835,6 +865,7 @@ func BuildRoutes(models []Model) ([]Route, error) {
 			AbsorbRetryMaxSecs:              m.AbsorbRetryMaxSecs,
 			AbsorbRetryMaxConfigured:        m.AbsorbRetryMaxConfigured,
 			AbsorbRetryBackoffCapSecs:       m.AbsorbRetryBackoffCapSecs,
+			ErrorResilience:                 m.ErrorResilience,
 			DeadChannelFailFast:             m.DeadChannelFailFast,
 			DeadChannelFailThreshold:        m.DeadChannelFailThreshold,
 		}

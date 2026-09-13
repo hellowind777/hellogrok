@@ -5,6 +5,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"net"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -101,8 +102,32 @@ func isHardUpstreamError(err error) bool {
 	if errors.Is(err, syscall.ECONNREFUSED) {
 		return true
 	}
+	// TLS handshake failures never succeed on retry, so they count toward
+	// the dial-level breaker even though they surface after a connection
+	// was established.
+	var recErr tls.RecordHeaderError
+	if errors.As(err, &recErr) {
+		return true
+	}
 	var opErr *net.OpError
-	return errors.As(err, &opErr) && opErr.Op == "dial" && !opErr.Timeout()
+	if errors.As(err, &opErr) {
+		if opErr.Op == "dial" && !opErr.Timeout() {
+			return true
+		}
+		// crypto/tls wraps a received TLS alert as an OpError whose Op is
+		// the alert origin: "remote error" for a remote alert and "local
+		// error" for one we sent ourselves.
+		if (opErr.Op == "remote error" || opErr.Op == "local error") && !opErr.Timeout() {
+			return true
+		}
+	}
+	// net/http produces this fixed string when an HTTP server answers a TLS
+	// handshake. The Go versions this project targets export no error type
+	// for it, so only the message can be matched.
+	if strings.Contains(err.Error(), "server gave HTTP response to HTTPS client") {
+		return true
+	}
+	return false
 }
 
 // breakerStore holds one dead-channel breaker per channel. Failures are only

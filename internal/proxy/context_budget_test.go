@@ -189,6 +189,8 @@ func TestFacadeAdvertisesDiscoveredWindowWhenNoRetryBudgetRemains(t *testing.T) 
 	defer upstream.Close()
 
 	route := facadeRoute("context-no-budget", "responses", "wire", "key", upstream.URL)
+	// The off default keeps deterministic failures visible immediately; only
+	// the opt-in balanced tier would absorb the 400 inside the wait window.
 	server := New(log.New(io.Discard, "", 0))
 	server.SetRoutes([]config.Route{route})
 	startPathTestServer(t, server)
@@ -210,6 +212,8 @@ func TestFacadeAdvertisesStructuredWindowWithoutSpeculativeRetry(t *testing.T) {
 	defer upstream.Close()
 
 	route := facadeRoute("context-structured", "responses", "wire", "key", upstream.URL)
+	// The off default keeps deterministic failures visible immediately; only
+	// the opt-in balanced tier would absorb the 422 inside the wait window.
 	server := New(log.New(io.Discard, "", 0))
 	server.SetRoutes([]config.Route{route})
 	startPathTestServer(t, server)
@@ -231,6 +235,9 @@ func TestFacadeDoesNotLoopContextBudgetRetry(t *testing.T) {
 	defer upstream.Close()
 
 	route := facadeRoute("context-no-loop", "responses", "wire", "key", upstream.URL)
+	// The off default keeps deterministic failures visible immediately; only
+	// the opt-in balanced tier would absorb the second 400 inside the wait
+	// window.
 	server := New(log.New(io.Discard, "", 0))
 	server.SetRoutes([]config.Route{route})
 	startPathTestServer(t, server)

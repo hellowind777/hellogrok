@@ -415,6 +415,9 @@ func TestBackendSearchFlagAttemptsEveryProviderProtocolAndSurfacesUnsupportedUps
 
 			route := facadeRoute("unsupported-search", backend, "wire", "key", upstream.URL+"/v1")
 			route.SupportsBackendSearch = true
+			// The off default keeps the deterministic upstream rejection
+			// visible immediately; only the opt-in balanced tier would absorb
+			// it.
 			s := New(log.New(io.Discard, "", 0))
 			s.SetRoutes([]config.Route{route})
 			startPathTestServer(t, s)

@@ -2,13 +2,19 @@ package proxy
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"errors"
+	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -258,13 +264,16 @@ func TestTransportErrorPassesThroughWithoutAbsorb(t *testing.T) {
 	}
 }
 
-func TestDeterministicErrorSkipsAbsorb(t *testing.T) {
+// The off default passes deterministic errors straight through instead of
+// entering the absorb window; only the opt-in balanced tier absorbs them.
+func TestDeterministicErrorSkipsAbsorbInOffTier(t *testing.T) {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
 		_, _ = io.WriteString(w, `{"error":{"type":"invalid_request_error","code":"invalid_model","message":"invalid model"}}`)
 	})
 	server, calls := newBreakerTestServer(t, handler)
+	setBreakerTestRoute(t, server, func(route *config.Route) {})
 
 	_, status, header := postFacadeResponse(t, server, "breaker-channel", []byte(breakerProbeBody), "")
 	if status != http.StatusBadRequest {
@@ -274,7 +283,7 @@ func TestDeterministicErrorSkipsAbsorb(t *testing.T) {
 		t.Fatalf("deterministic failures must be non-retryable, got %q", header.Get("X-Should-Retry"))
 	}
 	if got := atomic.LoadInt64(calls); got != 1 {
-		t.Fatalf("deterministic failures must not be absorbed: calls=%d, want 1", got)
+		t.Fatalf("deterministic failures must not be absorbed in the off tier: calls=%d, want 1", got)
 	}
 }
 
@@ -422,4 +431,31 @@ func TestDeadChannelBreakerResetsOnEnable(t *testing.T) {
 
 func containsJSONType(data []byte, wanted string) bool {
 	return strings.Contains(string(data), `"`+wanted+`"`)
+}
+
+func TestIsHardUpstreamError(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"connection refused", &net.OpError{Op: "dial", Err: syscall.ECONNREFUSED}, true},
+		{"dns failure", &net.DNSError{Name: "dead.example", Err: "no such host"}, true},
+		{"tls certificate", &tls.CertificateVerificationError{Err: fmt.Errorf("bad cert")}, true},
+		{"tls unknown authority", x509.UnknownAuthorityError{Cert: nil}, true},
+		{"tls record header", tls.RecordHeaderError{Msg: "first record does not look like a TLS handshake"}, true},
+		{"tls remote alert", &net.OpError{Op: "remote error", Err: errors.New("tls: handshake failure")}, true},
+		{"tls local error", &net.OpError{Op: "local error", Err: errors.New("tls: no cipher suite in common")}, true},
+		{"tls remote alert marked timeout", &net.OpError{Op: "remote error", Err: context.DeadlineExceeded}, false},
+		{"https to http server", errors.New("http: server gave HTTP response to HTTPS client"), true},
+		{"wrapped https to http server", fmt.Errorf("round trip: %w", errors.New("http: server gave HTTP response to HTTPS client")), true},
+		{"dial timeout", &net.OpError{Op: "dial", Err: context.DeadlineExceeded}, false},
+		{"read reset", &net.OpError{Op: "read", Err: syscall.ECONNRESET}, false},
+		{"generic transport", fmt.Errorf("server closed idle connection"), false},
+	}
+	for _, test := range cases {
+		if got := isHardUpstreamError(test.err); got != test.want {
+			t.Errorf("%s: isHardUpstreamError=%v, want %v", test.name, got, test.want)
+		}
+	}
 }

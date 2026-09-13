@@ -8,7 +8,7 @@ import (
 
 const (
 	Name        = "hellogrok"
-	Version     = "0.1.28"
+	Version     = "0.1.29"
 	LogFileName = "hellogrok.log"
 )
 

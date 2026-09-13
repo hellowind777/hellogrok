@@ -174,6 +174,34 @@ func TestMiMoChatHistoryKeepsCrossTurnReasoning(t *testing.T) {
 	}
 }
 
+func TestReplayChatReasoningHistoryIgnoresChannelLabel(t *testing.T) {
+	relay := config.Route{
+		ChannelID:  "deepseek-relay",
+		WireModel:  "kimi-k3",
+		Host:       "relay.example.com",
+		OriginBase: "https://relay.example.com/v1",
+	}
+	if replayChatReasoningHistory(relay) {
+		t.Fatalf("deepseek channel label wrongly replayed cross-turn reasoning: %+v", relay)
+	}
+
+	deepseekWire := relay
+	deepseekWire.WireModel = "deepseek-chat"
+	if !replayChatReasoningHistory(deepseekWire) {
+		t.Fatalf("deepseek wire model did not replay cross-turn reasoning: %+v", deepseekWire)
+	}
+
+	official := config.Route{
+		ChannelID:  "deepseek-official",
+		WireModel:  "deepseek-chat",
+		Host:       "api.deepseek.com",
+		OriginBase: "https://api.deepseek.com",
+	}
+	if !replayChatReasoningHistory(official) {
+		t.Fatalf("official deepseek route did not replay cross-turn reasoning: %+v", official)
+	}
+}
+
 func kimiChatRoute() config.Route {
 	return config.Route{
 		ChannelID:            "Kimi-K3-ipix",

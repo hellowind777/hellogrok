@@ -125,8 +125,10 @@ func splitChatContent(value any) (text, thought string, calls []any) {
 // requires every previous-turn reasoning_content, including across user
 // turns. DeepSeek (with tools) and MiMo 400 without it. Everyone else keeps
 // intra-turn CoT and drops cross-turn plaintext; see stripChatHistoryReasoning.
+// The channel ID is a user-supplied label, not protocol evidence, so it is
+// excluded from the heuristic match.
 func replayChatReasoningHistory(route config.Route) bool {
-	blob := strings.ToLower(strings.Join([]string{route.ChannelID, route.WireModel, route.Host, route.OriginBase}, " "))
+	blob := strings.ToLower(strings.Join([]string{route.WireModel, route.Host, route.OriginBase}, " "))
 	for _, needle := range []string{"deepseek", "mimo", "xiaomimimo"} {
 		if strings.Contains(blob, needle) {
 			return true

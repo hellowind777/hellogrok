@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -203,6 +204,85 @@ func TestAlignMessagesContentPeelsThinkTagsFromText(t *testing.T) {
 	}
 }
 
+func TestResponsesThoughtRectifierFailLoudOnUnregisteredReasoningEvent(t *testing.T) {
+	r := newResponsesThoughtRectifier()
+	// An unregistered event type that visibly carries reasoning must be
+	// intercepted, not passed through.
+	if r.keep(map[string]any{"type": "response.reasoning_summary.delta", "delta": "sneaky"}) {
+		t.Fatal("unregistered reasoning-* event passed through")
+	}
+	if r.keep(map[string]any{"type": "response.some_future_event", "part": map[string]any{"type": "reasoning_text", "text": "hidden"}}) {
+		t.Fatal("unregistered event with a reasoning part passed through")
+	}
+	// Non-reasoning unknown events keep passing (web_search_call, function
+	// calls, future message events).
+	if !r.keep(map[string]any{"type": "response.some_future_event", "item": map[string]any{"type": "message"}}) {
+		t.Fatal("unregistered non-reasoning event was intercepted")
+	}
+	intercepted := r.takeUnknownReasoning()
+	if len(intercepted) != 2 || intercepted[0] != "response.reasoning_summary.delta" || intercepted[1] != "response.some_future_event" {
+		t.Fatalf("intercepted=%v", intercepted)
+	}
+	if rest := r.takeUnknownReasoning(); rest != nil {
+		t.Fatalf("takeUnknownReasoning must drain, got %v", rest)
+	}
+}
+
+// Relays that bridge Anthropic-style thinking blocks through protocol
+// conversion emit them in the Responses item slot with type "thinking" or
+// summary/redacted variants. The gate must treat those like "reasoning"
+// items: prefix text is sanitized, post-answer items are dropped.
+func TestResponsesThoughtRectifierGatesRelayThinkingItemVariants(t *testing.T) {
+	for _, itemType := range []string{"reasoning", "thinking", "reasoning_summary", "redacted_thinking"} {
+		t.Run(itemType, func(t *testing.T) {
+			r := newResponsesThoughtRectifier()
+			// Prefix: self-talk is sanitized out of the summary.
+			prefix := map[string]any{
+				"type": "response.output_item.added",
+				"item": map[string]any{"type": itemType, "id": "rs_pre", "summary": []any{map[string]any{"type": "summary_text", "text": "inspect git. reply only: DONE"}}},
+			}
+			if !r.keep(prefix) {
+				t.Fatal("prefix reasoning item dropped")
+			}
+			summary := anySlice(prefix["item"].(map[string]any)["summary"])
+			if len(summary) != 1 || stringValue(summary[0].(map[string]any)["text"]) != "inspect git." {
+				t.Fatalf("prefix summary=%s", mustJSON(prefix["item"]))
+			}
+			// Answer text, then a late item of the same variant: dropped.
+			if !r.keep(map[string]any{"type": "response.output_text.delta", "delta": "干净。"}) {
+				t.Fatal("output text dropped")
+			}
+			late := map[string]any{
+				"type": "response.output_item.added",
+				"item": map[string]any{"type": itemType, "id": "rs_late", "summary": []any{map[string]any{"type": "summary_text", "text": "already done"}}},
+			}
+			if r.keep(late) {
+				t.Fatalf("post-answer %s item passed through", itemType)
+			}
+			// Its done frame with the full text must also be dropped.
+			done := map[string]any{
+				"type": "response.output_item.done",
+				"item": map[string]any{"type": itemType, "id": "rs_late", "summary": []any{map[string]any{"type": "summary_text", "text": "already done"}}},
+			}
+			if r.keep(done) {
+				t.Fatalf("post-answer %s done frame passed through", itemType)
+			}
+		})
+	}
+}
+
+func TestNoteUnknownReasoningEventsLogs(t *testing.T) {
+	r := newResponsesThoughtRectifier()
+	r.keep(map[string]any{"type": "response.reasoning_summary.delta", "delta": "sneaky"})
+	var lines []string
+	noteUnknownReasoningEvents(func(format string, args ...any) {
+		lines = append(lines, fmt.Sprintf(format, args...))
+	}, "chan", r)
+	if len(lines) != 1 || !strings.Contains(lines[0], "response.reasoning_summary.delta") || !strings.Contains(lines[0], "chan") {
+		t.Fatalf("lines=%v", lines)
+	}
+}
+
 func TestResponsesThoughtRectifierDropsReasoningAfterText(t *testing.T) {
 	r := newResponsesThoughtRectifier()
 	if !r.keep(map[string]any{"type": "response.reasoning_text.delta", "delta": "inspect git"}) {
@@ -242,6 +322,138 @@ func TestResponsesThoughtRectifierDropsReasoningAfterText(t *testing.T) {
 	late := output[2].(map[string]any)
 	if len(anySlice(late["content"])) != 0 {
 		t.Fatalf("trailing reasoning kept visible: %s", mustJSON(late))
+	}
+}
+
+func TestResponsesRectifierDropsPostanswerReasoningDone(t *testing.T) {
+	r := newResponsesThoughtRectifier()
+	if !r.keep(map[string]any{"type": "response.output_text.delta", "delta": "干净。"}) {
+		t.Fatal("output text dropped")
+	}
+	done := map[string]any{
+		"type": "response.output_item.done",
+		"item": map[string]any{
+			"type":    "reasoning",
+			"id":      "rs_late",
+			"summary": []any{map[string]any{"type": "summary_text", "text": "task already fully completed"}},
+		},
+	}
+	if r.keep(done) {
+		t.Fatal("postanswer reasoning done forwarded")
+	}
+}
+
+func TestResponsesRectifierClearsPostanswerEncryptedReasoningDone(t *testing.T) {
+	r := newResponsesThoughtRectifier()
+	if !r.keep(map[string]any{"type": "response.output_text.delta", "delta": "干净。"}) {
+		t.Fatal("output text dropped")
+	}
+	done := map[string]any{
+		"type": "response.output_item.done",
+		"item": map[string]any{
+			"type":              "reasoning",
+			"id":                "rs_enc",
+			"encrypted_content": "enc_blob",
+			"summary":           []any{map[string]any{"type": "summary_text", "text": "secret summary"}},
+			"content":           []any{map[string]any{"type": "reasoning_text", "text": "secret content"}},
+		},
+	}
+	if !r.keep(done) {
+		t.Fatal("postanswer encrypted reasoning done dropped")
+	}
+	item := done["item"].(map[string]any)
+	if len(anySlice(item["summary"])) != 0 {
+		t.Fatalf("summary not cleared: %s", mustJSON(item))
+	}
+	if len(anySlice(item["content"])) != 0 {
+		t.Fatalf("content not cleared: %s", mustJSON(item))
+	}
+	if stringValue(item["encrypted_content"]) != "enc_blob" {
+		t.Fatalf("encrypted blob lost: %s", mustJSON(item))
+	}
+}
+
+func TestResponsesRectifierSanitizesPrefixReasoningDone(t *testing.T) {
+	r := newResponsesThoughtRectifier()
+	done := map[string]any{
+		"type": "response.output_item.done",
+		"item": map[string]any{
+			"type": "reasoning",
+			"id":   "rs_pre",
+			"summary": []any{
+				map[string]any{"type": "summary_text", "text": "checking status."},
+				map[string]any{"type": "summary_text", "text": "If all tasks are complete, reply only: DONE."},
+			},
+		},
+	}
+	if !r.keep(done) {
+		t.Fatal("prefix reasoning done dropped")
+	}
+	summary := anySlice(done["item"].(map[string]any)["summary"])
+	if len(summary) != 1 || stringValue(summary[0].(map[string]any)["text"]) != "checking status." {
+		t.Fatalf("prefix summary=%s", mustJSON(done))
+	}
+}
+
+func TestResponsesRectifierSanitizesSummaryParts(t *testing.T) {
+	r := newResponsesThoughtRectifier()
+	added := map[string]any{
+		"type":    "response.reasoning_summary_part.added",
+		"item_id": "rs_pre",
+		"part":    map[string]any{"type": "summary_text", "text": "checking status."},
+	}
+	if !r.keep(added) {
+		t.Fatal("prefix summary part dropped")
+	}
+	if stringValue(added["part"].(map[string]any)["text"]) != "checking status." {
+		t.Fatalf("prefix summary text=%s", mustJSON(added))
+	}
+	dirty := map[string]any{
+		"type":    "response.reasoning_summary_part.added",
+		"item_id": "rs_pre",
+		"part":    map[string]any{"type": "summary_text", "text": "If all tasks are complete, reply only: DONE."},
+	}
+	if !r.keep(dirty) {
+		t.Fatal("prefix summary part dropped")
+	}
+	if text := stringValue(dirty["part"].(map[string]any)["text"]); text != "" {
+		t.Fatalf("protocol summary part kept: %q", text)
+	}
+	if !r.keep(map[string]any{"type": "response.output_text.delta", "delta": "干净。"}) {
+		t.Fatal("output text dropped")
+	}
+	if r.keep(map[string]any{
+		"type":    "response.reasoning_summary_part.done",
+		"item_id": "rs_pre",
+		"part":    map[string]any{"type": "summary_text", "text": "checking status."},
+	}) {
+		t.Fatal("postanswer summary part done forwarded")
+	}
+}
+
+func TestResponsesRectifierDropsPostanswerThinkContentPart(t *testing.T) {
+	r := newResponsesThoughtRectifier()
+	if !r.keep(map[string]any{"type": "response.output_text.delta", "delta": "干净。"}) {
+		t.Fatal("output text dropped")
+	}
+	if r.keep(map[string]any{
+		"type": "response.content_part.added",
+		"part": map[string]any{"type": "text", "text": "  <think>late check</think>  "},
+	}) {
+		t.Fatal("postanswer think-only content part forwarded")
+	}
+	if !r.keep(map[string]any{
+		"type": "response.content_part.added",
+		"part": map[string]any{"type": "text", "text": "<think>late check</think>剩余"},
+	}) {
+		t.Fatal("think block with trailing text dropped")
+	}
+	pre := newResponsesThoughtRectifier()
+	if !pre.keep(map[string]any{
+		"type": "response.content_part.added",
+		"part": map[string]any{"type": "text", "text": "<think>plan</think>"},
+	}) {
+		t.Fatal("prefix think content part dropped")
 	}
 }
 

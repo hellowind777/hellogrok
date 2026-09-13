@@ -1,6 +1,9 @@
 package proxy
 
-import "strings"
+import (
+	"sort"
+	"strings"
+)
 
 // thoughtGate enforces Grok Build's conversation order [Reasoning, Assistant]
 // for every third-party channel and wire format. The TUI finishes the Thought
@@ -353,10 +356,184 @@ func alignMessagesContentThoughts(content []any) []any {
 type responsesThoughtRectifier struct {
 	gate         thoughtGate
 	droppedItems map[string]struct{}
+	// unknownReasoning collects the distinct event types intercepted by the
+	// fail-loud default so the caller logs each once per stream, not once
+	// per frame of a chatty unregistered delta.
+	unknownReasoning map[string]struct{}
 }
 
 func newResponsesThoughtRectifier() *responsesThoughtRectifier {
-	return &responsesThoughtRectifier{droppedItems: map[string]struct{}{}}
+	return &responsesThoughtRectifier{
+		droppedItems:     map[string]struct{}{},
+		unknownReasoning: map[string]struct{}{},
+	}
+}
+
+// The Responses thought gate is table-driven: every event type the gate
+// understands has exactly one rule, and an event carrying visible reasoning
+// that has no rule is intercepted (fail-loud) rather than passed through
+// (fail-open). A missing rule costs one log line and a missing thought; a
+// missing gate costs a second Thought rendered under the user's reply, which
+// is the regression this component exists to prevent. Register every new
+// Responses reasoning event type here when it appears in the wild.
+type responsesThoughtRule struct {
+	// visibleReasoning reports whether an event of this type can carry
+	// reasoning text the user could see. Only such events participate in
+	// droppedItems filtering and the fail-loud default.
+	visibleReasoning bool
+	// apply mutates the event in place and reports whether it may pass.
+	apply func(r *responsesThoughtRectifier, event map[string]any) bool
+}
+
+// isReasoningItemType reports whether a Responses output item or content
+// part type carries visible reasoning. The official type is "reasoning";
+// relays that bridge Anthropic-style blocks through protocol conversion emit
+// "thinking" and summary/redacted variants in the same slot, and those must
+// pass through the same gate instead of leaking ungated.
+func isReasoningItemType(typ string) bool {
+	switch typ {
+	case "reasoning", "thinking", "reasoning_summary", "redacted_thinking":
+		return true
+	default:
+		return false
+	}
+}
+
+func reasoningItemEvent(itemKey string, markDropped bool) responsesThoughtRule {
+	return responsesThoughtRule{
+		visibleReasoning: true,
+		apply: func(r *responsesThoughtRectifier, event map[string]any) bool {
+			item, _ := event[itemKey].(map[string]any)
+			if !isReasoningItemType(stringValue(item["type"])) {
+				return true
+			}
+			if r.gate.sawText {
+				if markDropped {
+					if id := stringValue(item["id"]); id != "" {
+						r.droppedItems[id] = struct{}{}
+					}
+				}
+				if stringValue(item["encrypted_content"]) == "" {
+					return false
+				}
+				item["summary"] = []any{}
+				if _, exists := item["content"]; exists {
+					item["content"] = []any{}
+				}
+				return true
+			}
+			sanitizeResponsesReasoningItem(item)
+			return true
+		},
+	}
+}
+
+func reasoningTextEvent(field string, isDelta bool) responsesThoughtRule {
+	return responsesThoughtRule{
+		visibleReasoning: true,
+		apply: func(r *responsesThoughtRectifier, event map[string]any) bool {
+			cleaned, ok := r.gate.accept(stringValue(event[field]))
+			if !ok {
+				if isDelta {
+					return false
+				}
+				event[field] = ""
+				return !r.gate.sawText
+			}
+			event[field] = cleaned
+			return true
+		},
+	}
+}
+
+func outputTextEvent(field string) responsesThoughtRule {
+	return responsesThoughtRule{
+		apply: func(r *responsesThoughtRectifier, event map[string]any) bool {
+			r.gate.noteText(stringValue(event[field]))
+			return true
+		},
+	}
+}
+
+func reasoningSummaryPartEvent() responsesThoughtRule {
+	return responsesThoughtRule{
+		visibleReasoning: true,
+		apply: func(r *responsesThoughtRectifier, event map[string]any) bool {
+			part, _ := event["part"].(map[string]any)
+			if r.gate.sawText {
+				return false
+			}
+			if text := stringValue(part["text"]); text != "" {
+				if cleaned, ok := r.gate.accept(text); ok {
+					part["text"] = cleaned
+				} else {
+					part["text"] = ""
+				}
+			}
+			return true
+		},
+	}
+}
+
+func contentPartEvent() responsesThoughtRule {
+	return responsesThoughtRule{
+		apply: func(r *responsesThoughtRectifier, event map[string]any) bool {
+			part, _ := event["part"].(map[string]any)
+			partType := stringValue(part["type"])
+			if partType == "text" && r.gate.sawText {
+				// A post-answer content part that is entirely a <think> block
+				// is late reasoning in disguise; drop it. A part mixing
+				// visible text with a think block keeps the text.
+				if _, rest, ok := splitLeadingThinkBlock(stringValue(part["text"])); ok && rest == "" {
+					return false
+				}
+				return true
+			}
+			if partType != "reasoning_text" && !isReasoningItemType(partType) {
+				return true
+			}
+			if r.gate.sawText {
+				return false
+			}
+			if text := stringValue(part["text"]); text != "" {
+				if cleaned, ok := r.gate.accept(text); ok {
+					part["text"] = cleaned
+				} else {
+					part["text"] = ""
+				}
+			}
+			return true
+		},
+	}
+}
+
+func terminalResponseEvent() responsesThoughtRule {
+	return responsesThoughtRule{
+		apply: func(r *responsesThoughtRectifier, event map[string]any) bool {
+			if response, _ := event["response"].(map[string]any); response != nil {
+				alignResponsesOutputThoughts(response)
+			}
+			return true
+		},
+	}
+}
+
+var responsesThoughtRules = map[string]responsesThoughtRule{
+	"response.output_text.delta":            outputTextEvent("delta"),
+	"response.output_text.done":             outputTextEvent("text"),
+	"response.output_item.added":            reasoningItemEvent("item", true),
+	"response.output_item.done":             reasoningItemEvent("item", false),
+	"response.reasoning_text.delta":         reasoningTextEvent("delta", true),
+	"response.reasoning_summary_text.delta": reasoningTextEvent("delta", true),
+	"response.reasoning_text.done":          reasoningTextEvent("text", false),
+	"response.reasoning_summary_text.done":  reasoningTextEvent("text", false),
+	"response.reasoning_summary_part.added": reasoningSummaryPartEvent(),
+	"response.reasoning_summary_part.done":  reasoningSummaryPartEvent(),
+	"response.content_part.added":           contentPartEvent(),
+	"response.content_part.done":            contentPartEvent(),
+	"response.completed":                    terminalResponseEvent(),
+	"response.incomplete":                   terminalResponseEvent(),
+	"response.failed":                       terminalResponseEvent(),
 }
 
 func (r *responsesThoughtRectifier) keep(event map[string]any) bool {
@@ -364,79 +541,66 @@ func (r *responsesThoughtRectifier) keep(event map[string]any) bool {
 		return true
 	}
 	typ := stringValue(event["type"])
-	itemID := firstString(event, "item_id")
-	if itemID != "" {
-		if _, dropped := r.droppedItems[itemID]; dropped && isResponsesVisibleReasoningEvent(typ) {
+	rule, known := responsesThoughtRules[typ]
+	if !known {
+		if looksLikeReasoningEvent(event) {
+			// Fail-loud: an unregistered reasoning carrier is intercepted and
+			// reported instead of leaking a second Thought under the reply.
+			r.unknownReasoning[typ] = struct{}{}
 			return false
 		}
+		return true
 	}
-	switch typ {
-	case "response.output_text.delta":
-		r.gate.noteText(stringValue(event["delta"]))
-	case "response.output_text.done":
-		r.gate.noteText(stringValue(event["text"]))
-	case "response.output_item.added":
-		item, _ := event["item"].(map[string]any)
-		if stringValue(item["type"]) != "reasoning" {
-			break
-		}
-		sanitizeResponsesReasoningItem(item)
-		if r.gate.sawText {
-			if id := stringValue(item["id"]); id != "" {
-				r.droppedItems[id] = struct{}{}
-			}
-			if stringValue(item["encrypted_content"]) == "" {
+	if rule.visibleReasoning {
+		if itemID := firstString(event, "item_id"); itemID != "" {
+			if _, dropped := r.droppedItems[itemID]; dropped {
 				return false
 			}
-			item["summary"] = []any{}
-			if _, exists := item["content"]; exists {
-				item["content"] = []any{}
-			}
-		}
-	case "response.reasoning_text.delta", "response.reasoning_summary_text.delta":
-		cleaned, ok := r.gate.accept(stringValue(event["delta"]))
-		if !ok {
-			return false
-		}
-		event["delta"] = cleaned
-	case "response.reasoning_text.done", "response.reasoning_summary_text.done":
-		cleaned, ok := r.gate.accept(stringValue(event["text"]))
-		if !ok {
-			event["text"] = ""
-			if r.gate.sawText {
-				return false
-			}
-			break
-		}
-		event["text"] = cleaned
-	case "response.content_part.added", "response.content_part.done":
-		part, _ := event["part"].(map[string]any)
-		if stringValue(part["type"]) == "reasoning_text" && r.gate.sawText {
-			return false
-		}
-		if text := stringValue(part["text"]); text != "" && stringValue(part["type"]) == "reasoning_text" {
-			if cleaned, ok := r.gate.accept(text); ok {
-				part["text"] = cleaned
-			} else {
-				part["text"] = ""
-			}
-		}
-	case "response.completed", "response.incomplete", "response.failed":
-		if response, _ := event["response"].(map[string]any); response != nil {
-			alignResponsesOutputThoughts(response)
 		}
 	}
-	return true
+	return rule.apply(r, event)
 }
 
-func isResponsesVisibleReasoningEvent(typ string) bool {
-	switch typ {
-	case "response.reasoning_text.delta", "response.reasoning_text.done",
-		"response.reasoning_summary_text.delta", "response.reasoning_summary_text.done",
-		"response.reasoning_summary_part.added", "response.reasoning_summary_part.done":
+// looksLikeReasoningEvent reports whether an unregistered event type plausibly
+// carries visible reasoning: a reasoning-* type, or an item/part whose own
+// type marker names reasoning or thinking.
+func looksLikeReasoningEvent(event map[string]any) bool {
+	typ := stringValue(event["type"])
+	if strings.Contains(typ, "reasoning") || strings.Contains(typ, "thinking") {
 		return true
-	default:
-		return false
+	}
+	for _, key := range []string{"item", "part", "delta", "content_block"} {
+		nested, _ := event[key].(map[string]any)
+		nestedType := stringValue(nested["type"])
+		if isReasoningItemType(nestedType) || strings.Contains(nestedType, "reasoning") || strings.Contains(nestedType, "thinking") {
+			return true
+		}
+	}
+	return false
+}
+
+// takeUnknownReasoning drains the intercepted event types for one log line
+// at end of stream.
+func (r *responsesThoughtRectifier) takeUnknownReasoning() []string {
+	if r == nil || len(r.unknownReasoning) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(r.unknownReasoning))
+	for typ := range r.unknownReasoning {
+		out = append(out, typ)
+	}
+	sort.Strings(out)
+	clear(r.unknownReasoning)
+	return out
+}
+
+// noteUnknownReasoningEvents logs the fail-loud interceptions of one stream.
+func noteUnknownReasoningEvents(logf func(string, ...any), channel string, rectifier *responsesThoughtRectifier) {
+	if logf == nil {
+		return
+	}
+	for _, typ := range rectifier.takeUnknownReasoning() {
+		logf("UP channel=%s intercepted unregistered reasoning event type %q; register it in responsesThoughtRules", channel, typ)
 	}
 }
 
@@ -501,8 +665,13 @@ func alignResponsesOutputThoughts(root map[string]any) {
 		if item == nil {
 			continue
 		}
-		switch stringValue(item["type"]) {
-		case "reasoning":
+		itemType := stringValue(item["type"])
+		switch {
+		case isReasoningItemType(itemType):
+			// Relay thinking variants ride the same output slot as official
+			// reasoning; the terminal frame must apply the same sanitize and
+			// post-answer clearing as the streamed frames did, or a dropped
+			// late thought reappears in full here.
 			sanitizeResponsesReasoningItem(item)
 			if gate.sawText {
 				item["summary"] = []any{}
@@ -510,7 +679,7 @@ func alignResponsesOutputThoughts(root map[string]any) {
 					item["content"] = []any{}
 				}
 			}
-		case "message":
+		case itemType == "message":
 			for _, rawPart := range anySlice(item["content"]) {
 				part, _ := rawPart.(map[string]any)
 				if typ := stringValue(part["type"]); typ == "output_text" || typ == "text" {

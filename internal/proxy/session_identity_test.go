@@ -16,9 +16,9 @@ import (
 func TestGrokBuildClientHeadersReplaceHelloGrokUserAgent(t *testing.T) {
 	header := http.Header{"User-Agent": []string{"hellogrok/0.1.23"}}
 	incoming := http.Header{
-		"User-Agent":                 []string{"grok-shell/1.2.3 (windows; x86_64)"},
-		"X-Grok-Client-Identifier":   []string{"grok-shell"},
-		"X-Grok-Client-Version":      []string{"1.2.3"},
+		"User-Agent":               []string{"grok-shell/1.2.3 (windows; x86_64)"},
+		"X-Grok-Client-Identifier": []string{"grok-shell"},
+		"X-Grok-Client-Version":    []string{"1.2.3"},
 	}
 	applyGrokBuildClientHeaders(header, incoming)
 	if header.Get("User-Agent") != "grok-shell/1.2.3 (windows; x86_64)" {
@@ -134,6 +134,9 @@ func TestOpenCodeStandaloneSearchHeadersAndRetries(t *testing.T) {
 				route := facadeRoute("search", backend, "wire", "key", "https://opencode.ai"+path)
 				route.SupportsBackendSearch = false
 				route.ChatSearchDialect = config.ChatSearchDialectWebSearchOptions
+				// The off default lets the deterministic 400 pass through
+				// after the busy 500 is absorbed; only the opt-in balanced
+				// tier would absorb the 400 as well.
 				s := New(log.New(io.Discard, "", 0))
 				defer s.Stop()
 				s.absorbSleep = func(context.Context, time.Duration) bool { return true }

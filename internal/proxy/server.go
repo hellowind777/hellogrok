@@ -696,6 +696,7 @@ func (s *Server) streamResponsesSSE(w http.ResponseWriter, response *http.Respon
 	if itemIDs.remapped > 0 {
 		s.log.Printf("UP channel=%s remapped %d duplicate upstream item id(s) to keep the stream alive", channel, itemIDs.remapped)
 	}
+	noteUnknownReasoningEvents(s.log.Printf, channel, responsesThought)
 	s.log.Printf("UP channel=%s SSE done events=%d heartbeats=%d terminal=%s %s", channel, events, heartbeats, terminal, time.Since(started).Round(time.Millisecond))
 	s.logSearchEvidence(channel, request, evidence)
 	if terminal == "" {

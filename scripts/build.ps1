@@ -32,7 +32,9 @@ foreach ($artifact in $artifacts) {
 # The repository includes architecture-specific Windows resources generated from
 # cmd/hellogrok/icon.ico, so normal builds need only Go.
 go build -trimpath -ldflags "-s -w -H windowsgui" -o dist/hellogrok.exe ./cmd/hellogrok
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 go build -trimpath -ldflags "-s -w" -o dist/hellogrok-cli.exe ./cmd/hellogrok
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 Write-Host "OK: $root\dist\hellogrok.exe"
 Write-Host "OK: $root\dist\hellogrok-cli.exe"
 Get-ChildItem dist | Sort-Object Name | Format-Table Name, Length

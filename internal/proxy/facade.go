@@ -146,30 +146,29 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 	}
 
 	var response *http.Response
-	var contextOutputLimit uint64
 	var discoveredContextWindow uint64
-	contextBudgetRetried := false
+	decider := newRecoveryDecider(route, absorb, upstreamContext, s.isEnabled, s.reasoning, body)
 	for {
 		response, err = doRequest(request.Body)
 		if err != nil {
 			detail := safeUpstreamError(err)
 			s.log.Printf("UP channel=%s request failed: %s", route.ChannelID, detail)
-			if isUpstreamTimeout(err) {
-				if absorb.wait(upstreamContext, 0) {
-					s.logAbsorbWait(route.ChannelID, absorb, "response header timeout", 0)
-					continue
+			plan, reason := decider.onRequestError(err, request.Body)
+			switch plan {
+			case planRetryRequest:
+				s.logAbsorbWait(route.ChannelID, absorb, decider.absorbReason, decider.absorbStatus)
+				request.Body = decider.retryBody
+				continue
+			case planAbortSilent:
+				s.log.Printf("UP channel=%s %s", route.ChannelID, reason)
+				return
+			case planWriteError:
+				if decider.dialFailure {
+					s.logBreakerTransition(route.ChannelID, s.breakers.recordFailure(route.ChannelID, deadChannelBreakerParams(route.DeadChannelFailFast, route.DeadChannelFailThreshold)))
 				}
-				if upstreamContext.Err() != nil {
-					return
-				}
-				writeRetryableJSONError(w, http.StatusGatewayTimeout, "upstream timed out before returning response headers")
+				writeTypedJSONError(w, decider.errStatus, decider.errMessage, decider.errType, decider.errRetryable)
 				return
 			}
-			if isHardUpstreamError(err) {
-				s.logBreakerTransition(route.ChannelID, s.breakers.recordFailure(route.ChannelID, deadChannelBreakerParams(route.DeadChannelFailFast, route.DeadChannelFailThreshold)))
-			}
-			writeRetryableJSONError(w, http.StatusBadGateway, "upstream: "+detail)
-			return
 		}
 		if s.breakers.recordSuccess(route.ChannelID) {
 			s.log.Printf("UP breaker channel=%s closed after upstream response", route.ChannelID)
@@ -198,31 +197,18 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 					}
 					return
 				}
-				if surrogate, retryable, wrapped := wrappedUpstreamError(data); wrapped {
-					// The relay reported a failure with a success status. Give
-					// it the failure path: transient envelopes are absorbed
-					// and retried here, deterministic ones pass through with
-					// the provider's explanation instead of an opaque
-					// envelope-validation rejection.
-					response.Header.Set("X-Should-Retry", fmt.Sprintf("%t", retryable))
-					if absorbEligible(surrogate, retryable) && absorb.wait(upstreamContext, retryAfterSeconds(response.Header)) {
-						s.logAbsorbWait(route.ChannelID, absorb, "wrapped 2xx upstream error", surrogate)
-						continue
-					}
-					if upstreamContext.Err() != nil {
-						return
-					}
-					s.log.Printf("UP channel=%s wrapped 2xx error surrogate=%d retryable=%t", route.ChannelID, surrogate, retryable)
-					mergeGrokModelHeaders(w.Header(), response.Header)
-					if !positiveModelHeader(w.Header().Get(grokContextWindowHeader), 64) && discoveredContextWindow > 0 {
-						w.Header().Set(grokContextWindowHeader, fmt.Sprintf("%d", discoveredContextWindow))
-					}
-					copySafeResponseHeaders(w.Header(), response.Header)
-					if retryable && surrogate >= http.StatusInternalServerError && retryAfterSeconds(w.Header()) == 0 {
-						w.Header().Set("Retry-After", strconv.Itoa(synthesizedRetryAfterSeconds))
-					}
-					w.WriteHeader(surrogate)
-					_, _ = w.Write(data)
+				plan, reason := decider.onSuccessEnvelope(response, data, request.Body)
+				switch plan {
+				case planRetryRequest:
+					s.logAbsorbWait(route.ChannelID, absorb, decider.absorbReason, decider.absorbStatus)
+					request.Body = decider.retryBody
+					continue
+				case planAbortSilent:
+					s.log.Printf("UP channel=%s %s", route.ChannelID, reason)
+					return
+				case planPassThrough:
+					s.log.Printf("UP channel=%s %s", route.ChannelID, reason)
+					writeRecoveryPassthrough(w, response, data, decider, discoveredContextWindow)
 					return
 				}
 				response.Body = io.NopCloser(bytes.NewReader(data))
@@ -263,89 +249,37 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 		if observedContextBudget && discoveredContextWindow == 0 {
 			discoveredContextWindow = observation.MaximumTokens
 		}
-		if !contextBudgetRetried && observedContextBudget {
-			if retry, ok := clampCompletionForContextError(observation, request.Body, request.Protocol); ok {
-				contextBudgetRetried = true
-				contextOutputLimit = retry.AvailableOutput
-				request.Body = retry.Body
-				s.log.Printf("UP channel=%s context budget retry once maximum=%d messages=%d completion_before=%d completion_after=%d",
-					route.ChannelID, retry.MaximumTokens, retry.MessageTokens,
-					retry.OriginalOutput, retry.AvailableOutput)
+		if retry, reason := decider.onErrorResponse(response, data, request, observation, observedContextBudget); retry {
+			if decider.reasoningRetried {
+				s.log.Printf("UP channel=%s %s", route.ChannelID, reason)
+				request = decider.retryRequest
 				saveLastRequestMeta(logTarget, route.WireModel, len(request.Body), tools, webSearch, hostedSearch, functionSearch, xSearch, request)
 				continue
 			}
-		}
-
-		reasoningRejected := isOpaqueReasoningRejection(response.StatusCode, data)
-		keptOpaqueReasoning := request.Reasoning.Opaque - request.Reasoning.Dropped
-		if reasoningRejected && keptOpaqueReasoning > 0 && !request.ReasoningRecovery {
-			retryRequest, retryErr := adaptFacadeRequestWithReasoning(body, route, incomingProtocol, s.reasoning, dropAllOpaqueReasoning)
-			if retryErr == nil && retryRequest.Reasoning.Dropped > request.Reasoning.Dropped {
-				if contextOutputLimit > 0 {
-					adjusted, ok := setCompletionLimit(retryRequest.Body, retryRequest.Protocol, contextOutputLimit)
-					if !ok {
-						retryErr = fmt.Errorf("preserve context output limit")
-					} else {
-						retryRequest.Body = adjusted
-					}
-				}
-			}
-			if retryErr == nil && retryRequest.Reasoning.Dropped > request.Reasoning.Dropped {
-				s.log.Printf("UP channel=%s reasoning recovery retry once removed=%d after status=%d",
-					route.ChannelID, retryRequest.Reasoning.Dropped, response.StatusCode)
-				request = retryRequest
-				saveLastRequestMeta(logTarget, route.WireModel, len(request.Body), tools, webSearch, hostedSearch, functionSearch, xSearch, request)
-				continue
-			}
-			if retryErr != nil {
-				s.log.Printf("UP channel=%s reasoning recovery request failed: %v", route.ChannelID, retryErr)
-			}
-		}
-
-		// Decide the retry disposition on the upstream header first: the
-		// absorb layer may swallow this failure, in which case nothing has
-		// been written to the client yet and the loop re-sends the request.
-		retryable := setRetryDisposition(response.Header, response.StatusCode, data)
-		if reasoningRejected {
-			response.Header.Set("X-Should-Retry", "false")
-			retryable = false
-		}
-		if !reasoningRejected && isCloudflareChallenge(response.Header, data, response.StatusCode) {
-			// A shield challenge in front of the relay is transient: it clears
-			// or the relay routes around it. 403 would classify terminal in
-			// Grok Build, so present the challenge as a retryable 503 and let
-			// the absorb layer hide short challenges.
-			if response.StatusCode == http.StatusForbidden {
-				response.StatusCode = http.StatusServiceUnavailable
-			}
-			response.Header.Set("X-Should-Retry", "true")
-			retryable = true
-		}
-		if absorbEligible(response.StatusCode, retryable) && absorb.wait(upstreamContext, retryAfterSeconds(response.Header)) {
-			reason := "retryable upstream error"
-			if !retryable {
-				reason = "origin-TLS upstream error"
-			}
-			s.logAbsorbWait(route.ChannelID, absorb, reason, response.StatusCode)
+			s.log.Printf("UP channel=%s %s", route.ChannelID, reason)
+			request.Body = decider.retryBody
+			saveLastRequestMeta(logTarget, route.WireModel, len(request.Body), tools, webSearch, hostedSearch, functionSearch, xSearch, request)
 			continue
 		}
-		if upstreamContext.Err() != nil {
+		if decider.reasoningRetryErr != nil {
+			s.log.Printf("UP channel=%s reasoning recovery request failed: %v", route.ChannelID, decider.reasoningRetryErr)
+		}
+		plan, reason := decider.onDisposition(response, data, request.Body)
+		switch plan {
+		case planRetryRequest:
+			s.logAbsorbWait(route.ChannelID, absorb, decider.absorbReason, decider.absorbStatus)
+			request.Body = decider.retryBody
+			continue
+		case planAbortSilent:
+			s.log.Printf("UP channel=%s %s", route.ChannelID, reason)
+			return
+		case planPassThrough:
+			if reason != "" {
+				s.log.Printf("UP channel=%s %s", route.ChannelID, reason)
+			}
+			writeRecoveryPassthrough(w, response, data, decider, discoveredContextWindow)
 			return
 		}
-		mergeGrokModelHeaders(w.Header(), response.Header)
-		if !positiveModelHeader(w.Header().Get(grokContextWindowHeader), 64) && discoveredContextWindow > 0 {
-			w.Header().Set(grokContextWindowHeader, fmt.Sprintf("%d", discoveredContextWindow))
-		}
-		copySafeResponseHeaders(w.Header(), response.Header)
-		if reasoningRejected {
-			w.Header().Set("X-Should-Retry", "false")
-		}
-		if retryable && response.StatusCode >= http.StatusInternalServerError && retryAfterSeconds(w.Header()) == 0 {
-			w.Header().Set("Retry-After", strconv.Itoa(synthesizedRetryAfterSeconds))
-		}
-		w.WriteHeader(response.StatusCode)
-		_, _ = w.Write(data)
-		return
 	}
 	defer response.Body.Close()
 	mergeGrokModelHeaders(w.Header(), response.Header)
@@ -571,6 +505,16 @@ func setRetryDisposition(header http.Header, status int, body []byte) bool {
 	if classified, value := classifyStructuredRetry(body); classified {
 		retry = value
 	}
+	if status == http.StatusRequestTimeout {
+		// An upstream 408 can never be an RFC client timeout in the
+		// proxy↔upstream leg (there is no client-idle concept between two
+		// servers), so it is an edge/gateway timeout page — the semantic of
+		// a 504. Cloudflare/relay edges emit 408 for edge-side timeouts and
+		// Grok Build's transient_retry_eligible pins 408 as terminal, so
+		// the proxy must classify it retryable and remap the status on the
+		// way out (see passthroughStatus).
+		retry = true
+	}
 	header.Set("X-Should-Retry", fmt.Sprintf("%t", retry))
 	return retry
 }
@@ -578,9 +522,87 @@ func setRetryDisposition(header http.Header, status int, body []byte) bool {
 // absorbEligible reports whether the absorb layer may retry this failure
 // inside the proxy: everything Grok Build would retry, plus the origin-TLS
 // statuses Grok Build treats as terminal but which routinely clear on
-// relays within the absorb window.
-func absorbEligible(status int, retryable bool) bool {
-	return retryable || status == statusOriginTLSHandshake || status == statusOriginTLSCertificate
+// relays within the absorb window, plus 408s (remapped to a retryable 504 at
+// passthrough). Only the opt-in balanced tier additionally absorbs
+// deterministic 4xx failures, whose replays are side-effect free and which
+// routinely clear while the window lasts (token rotation, permission fixes,
+// provider config changes); the off default and the reasoning-rejection veto
+// keep those visible immediately.
+func absorbEligible(status int, retryable bool, resilience errorResilience) bool {
+	if retryable {
+		return true
+	}
+	if status == statusOriginTLSHandshake || status == statusOriginTLSCertificate {
+		return true
+	}
+	if status == http.StatusRequestTimeout {
+		return true
+	}
+	return resilience == resilienceBalanced &&
+		status >= http.StatusBadRequest && status < http.StatusInternalServerError
+}
+
+// passthroughStatus rewrites an upstream 408 to 504 on its way to the
+// client. Between proxy and upstream there is no client-idle concept, so a
+// 408 is an edge/relay timeout page, semantically a 504; remapping keeps
+// Grok Build's native retry of an edge-side timeout instead of its terminal
+// 408 classification.
+func passthroughStatus(status int) int {
+	if status == http.StatusRequestTimeout {
+		return http.StatusGatewayTimeout
+	}
+	return status
+}
+
+// absorbedFailureDelay reports how long the absorb layer kept this failure
+// from the client, or zero when the window was too short to mention. Callers
+// use it before WriteHeader to stamp X-Hellogrok-Absorb-Delay and to decide
+// whether the error body needs a staleness note.
+func absorbedFailureDelay(absorb *absorbState) time.Duration {
+	if absorb == nil || absorb.attempt == 0 {
+		return 0
+	}
+	elapsed := absorb.elapsed().Round(time.Second)
+	if elapsed < 5*time.Second {
+		return 0
+	}
+	return elapsed
+}
+
+// markAbsorbedFailureHeader stamps the absorb delay on a passthrough error.
+// It must run before WriteHeader: the error the client receives is the last
+// attempt's snapshot, not a live one, and the user deserves to see that.
+func markAbsorbedFailureHeader(header http.Header, absorb *absorbState) {
+	if elapsed := absorbedFailureDelay(absorb); elapsed > 0 {
+		header.Set("X-Hellogrok-Absorb-Delay", strconv.Itoa(int(elapsed.Seconds())))
+	}
+}
+
+// markAbsorbedFailureBody prefixes a one-line staleness note onto a
+// structured JSON error envelope whose message can be extended without
+// inventing a new error shape; anything else passes through byte-for-byte.
+func markAbsorbedFailureBody(body []byte, absorb *absorbState) []byte {
+	elapsed := absorbedFailureDelay(absorb)
+	if elapsed == 0 {
+		return body
+	}
+	root, err := decodeJSONMap(body)
+	if err != nil {
+		return body
+	}
+	errorBody, _ := root["error"].(map[string]any)
+	message := strings.TrimSpace(firstString(errorBody, "message"))
+	if message == "" || strings.HasPrefix(message, "[hellogrok:") {
+		return body
+	}
+	note := fmt.Sprintf("[hellogrok: upstream stayed failing for %s across %d absorbed retries before this response; the error below is the latest attempt, not a live one] ",
+		elapsed, absorb.attempt)
+	errorBody["message"] = note + message
+	encoded, err := json.Marshal(root)
+	if err != nil {
+		return body
+	}
+	return encoded
 }
 
 // wrappedUpstreamError detects relays that answer a failure with HTTP 200

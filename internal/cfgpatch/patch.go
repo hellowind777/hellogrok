@@ -1,3 +1,14 @@
+// Package cfgpatch rewrites Grok Build's config.toml while the local proxy
+// is active and restores it byte-for-byte on stop.
+//
+// Modification discipline (learned from a real data-loss bug): restore
+// semantics live on TWO paths that must stay symmetric — the parse path
+// (prepareRestoreState, valid TOML) and the line-scoped fallback
+// (prepareRestoreStateText, invalid TOML). Any change to what a managed
+// field restores, deletes, or preserves must be made on BOTH paths, and must
+// add a test pair proving the two paths agree for the same (config, state)
+// input. TestPrepareRestorePathsAgree encodes this invariant for the
+// existing field set; extend its fixtures when a new managed field appears.
 package cfgpatch
 
 import (
@@ -1670,6 +1681,13 @@ func prepareRestoreStateText(raw []byte, state State) (State, error) {
 	if block := namedSectionBlock(lines, structural, "features"); block != nil {
 		state.Features.BackendTools = managedStateForText(block, "backend_tools", backendToolsAnyLine, state.Features.BackendTools)
 		state.Features.WebFetch = managedStateForText(block, "web_fetch", webFetchAnyLine, state.Features.WebFetch)
+	} else {
+		// The section is gone, so every managed assignment inside it is gone
+		// too. The parse path drops management for a vanished user-edited
+		// line; the text path must agree, or a later restore would act on
+		// lines the user already deleted.
+		state.Features.BackendTools.Managed = false
+		state.Features.WebFetch.Managed = false
 	}
 	if state.Subagents.DottedLineCreated {
 		rootEnd := len(lines)
@@ -1680,6 +1698,10 @@ func prepareRestoreStateText(raw []byte, state State) (State, error) {
 			}
 		}
 		state.Subagents.Enabled = managedStateForText(lines[:rootEnd], "subagents.enabled", subagentsEnabledDottedAnyLine, state.Subagents.Enabled)
+		if !state.Subagents.Enabled.Managed {
+			// A user-edited dotted line is no longer ours to delete.
+			state.Subagents.DottedLineCreated = false
+		}
 	} else if block := namedSectionBlock(lines, structural, "subagents"); block != nil {
 		state.Subagents.Enabled = managedStateForText(block, "enabled", subagentsEnabledAnyLine, state.Subagents.Enabled)
 	}

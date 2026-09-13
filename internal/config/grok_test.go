@@ -1021,6 +1021,74 @@ func TestBuildRoutesSkipsEveryLocalFacadeLoopbackForm(t *testing.T) {
 	}
 }
 
+func TestLoadModelsErrorResilienceTiers(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	raw := `[models]
+error_resilience = "BALANCED"
+
+[model.one]
+base_url = "https://one.example/v1"
+
+[model.two]
+base_url = "https://two.example/v1"
+`
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	models, err := LoadModels(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, model := range models {
+		if model.ErrorResilience != "balanced" {
+			t.Fatalf("model %q error_resilience=%q, want the global [models] value", model.ID, model.ErrorResilience)
+		}
+	}
+
+	routes, err := BuildRoutes(models)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, route := range routes {
+		if route.ErrorResilience != "balanced" {
+			t.Fatalf("route %q lost error_resilience: %q", route.ChannelID, route.ErrorResilience)
+		}
+	}
+}
+
+func TestLoadModelsErrorResilienceDefaultsToOff(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	raw := "[model.one]\nbase_url = \"https://one.example/v1\"\n"
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	models, err := LoadModels(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(models) != 1 || models[0].ErrorResilience != "" {
+		t.Fatalf("unconfigured error_resilience=%q, want the off default", models[0].ErrorResilience)
+	}
+}
+
+func TestLoadModelsRejectsInvalidErrorResilience(t *testing.T) {
+	for _, raw := range []string{
+		"[models]\nerror_resilience = \"aggressive\"\n\n[model.one]\nbase_url = \"https://one.example/v1\"\n",
+		"[models]\nerror_resilience = \"attended\"\n\n[model.one]\nbase_url = \"https://one.example/v1\"\n",
+	} {
+		path := filepath.Join(t.TempDir(), "config.toml")
+		if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := LoadModels(path)
+		if err == nil || !strings.Contains(err.Error(), `[models].error_resilience must be one of "balanced", "off"`) {
+			t.Fatalf("invalid error_resilience error = %v", err)
+		}
+	}
+}
+
 func headerValueTest(values map[string]string, name string) string {
 	for key, value := range values {
 		if strings.EqualFold(key, name) {

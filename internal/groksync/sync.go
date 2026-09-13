@@ -120,6 +120,15 @@ func parseReachableLeaders(raw []byte) ([]leaderInfo, error) {
 		if leader.SocketPath != nil {
 			key = strings.TrimSpace(*leader.SocketPath)
 		}
+		if key == "" && leader.LockPath != nil {
+			key = "lock:" + strings.TrimSpace(*leader.LockPath)
+		}
+		if key == "" {
+			// No stable identifier to deduplicate on; collapsing unidentified
+			// leaders into one would silently skip reachable sessions.
+			reachable = append(reachable, leader)
+			continue
+		}
 		if seen[key] {
 			continue
 		}
