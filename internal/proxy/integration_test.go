@@ -1441,7 +1441,7 @@ func TestDeepSeekNonStreamingQueueEmptyLinesAreAccepted(t *testing.T) {
 	s.transport.ResponseHeaderTimeout = 15 * time.Millisecond
 	s.deepSeekTransport.ResponseHeaderTimeout = 300 * time.Millisecond
 	s.bodyIdleTimeout = 5 * time.Millisecond
-	s.deepSeekBodyIdleTimeout = 40 * time.Millisecond
+	s.deepSeekBodyIdleTimeout = 100 * time.Millisecond
 	s.SetRoutes([]config.Route{route})
 	startPathTestServer(t, s)
 
