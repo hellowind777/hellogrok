@@ -41,6 +41,14 @@ type facadeRequest struct {
 	// ToolsSanitized reports the hosted-search declaration was already reduced
 	// to a closed tool schema, making one reactive sanitize eligible.
 	ToolsSanitized bool
+	// SessionKey scopes the context usage guard to one conversation; empty
+	// disables the guard for this request.
+	SessionKey string
+	// GuardBytes is the tokenizable footprint of Body compared against
+	// provider usage reports by the context usage guard.
+	GuardBytes int64
+	// UsageGuard is the server-wide context usage guard; nil disables checks.
+	UsageGuard *contextUsageGuard
 }
 
 func channelFromPath(escapedPath string) (string, wireProtocol, bool) {

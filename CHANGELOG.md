@@ -4,6 +4,12 @@ All notable changes to this project are documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.31] — 2026-09-13
+
+### Fixed
+
+- Provider usage reports that contradict the live request context no longer inflate Grok Build's context meter or fire auto-compact above the configured threshold. Some relays double-count the cached prefix — or report session-cumulative prompt tokens — in a single response, and Grok Build feeds the reported total straight into its meter and `auto_compact_threshold_percent` check, so one bad report made a session at roughly half of its true context read as 91% full and triggered a minutes-long compaction that was never needed. hellogrok now learns a bytes-per-token ratio per conversation (keyed by channel plus the client's session identity) from the first coherent report and suppresses later reports whose prompt count overshoots what the tokenizable request body can hold; embedded base64 data URIs are excluded from that footprint because they carry image bytes at a nearly constant token cost. A suppressed report is dropped entirely, leaving Grok Build on its own byte-based estimate until the provider reports coherently again. Context rewrites (compaction, rewind, resume) relearn the baseline, conversations without a stable session identity skip the check, and billing-visible behavior for coherent providers is unchanged.
+
 ## [0.1.30] — 2026-09-13
 
 ### Added

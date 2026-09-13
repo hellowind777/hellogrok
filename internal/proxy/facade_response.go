@@ -1353,6 +1353,7 @@ func intFitsLiveContext(window uint64, counts ...int64) bool {
 }
 
 func canonicalResponse(route config.Route, request facadeRequest, result canonicalResult) map[string]any {
+	request.suppressInconsistentUsage(route.ChannelID, &result)
 	now := time.Now().Unix()
 	status := "completed"
 	var incomplete any

@@ -1296,6 +1296,10 @@ func (s *Server) streamNativeSSE(w http.ResponseWriter, response *http.Response,
 		if request.Protocol == wireChatCompletions {
 			normalizeNativeChatRequiredFields(root, route, true, chatStreamID, chatCreatedAt)
 			normalizeNativeChatUsage(root, liveContextWindow(route, response.Header))
+			s.guardNativeChatUsage(root, route, request)
+		}
+		if request.Protocol == wireResponses {
+			s.guardResponsesUsage(root, route, request)
 		}
 		setDownstreamResponseModel(root, responseModelForRoute(route))
 		restoreClientWebSearchAlias(root, request.ClientSearchAlias, request.Protocol)

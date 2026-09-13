@@ -54,12 +54,18 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	identity := extractSessionIdentity(incoming.Header, body)
+	if request.Kind == nativeSessionRequest && identity.stable {
+		request.SessionKey = identity.value
+	}
+	request.GuardBytes = tokenizableBodyBytes(request.Body)
+	request.UsageGuard = s.usageGuard
 	providerHeaders, err := openCodeRequestHeaders(route, incoming.Header, body)
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if isOpenCodeRoute(route) && !extractSessionIdentity(incoming.Header, body).stable && strings.TrimSpace(headerValue(route.ExtraHeaders, "x-opencode-session")) == "" {
+	if isOpenCodeRoute(route) && !identity.stable && strings.TrimSpace(headerValue(route.ExtraHeaders, "x-opencode-session")) == "" {
 		s.log.Printf("UP channel=%s session identity scope=operation: client supplied no conversation identity; cross-request routing continuity unavailable", route.ChannelID)
 	}
 	if completion := completionLimitFromRequest(request.Body, request.Protocol); completion > 0 {
@@ -787,11 +793,22 @@ func (s *Server) normalizeResponsesJSON(data []byte, route config.Route, request
 	if err != nil {
 		return nil, nil, fmt.Errorf("restore client search alias: %w", err)
 	}
+	root, err := decodeJSONMap(data)
+	if err != nil {
+		return nil, nil, err
+	}
+	// The patch layer projects context_details from usage, so a contradictory
+	// report must be dropped before that projection, not after validation.
+	s.guardResponsesUsage(root, route, request)
+	data, err = json.Marshal(root)
+	if err != nil {
+		return nil, nil, err
+	}
 	data, err = patch.PatchJSONBytesStrict(data, s.responsesPatchOptions(route, header))
 	if err != nil {
 		return nil, nil, err
 	}
-	root, err := decodeJSONMap(data)
+	root, err = decodeJSONMap(data)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -861,7 +878,9 @@ func (s *Server) normalizeNativeJSON(
 			return nil, nil, err
 		}
 		normalizeNativeChatUsage(root, window)
-		if hadUsage && root["usage"] == nil && window > 0 {
+		windowDiscarded := hadUsage && root["usage"] == nil
+		s.guardNativeChatUsage(root, route, request)
+		if windowDiscarded && window > 0 {
 			s.log.Printf("UP channel=%s usage discarded: live context exceeds window window=%d",
 				route.ChannelID, window)
 		}

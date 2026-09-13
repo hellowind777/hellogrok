@@ -1,19 +1,13 @@
-# 发布说明 — v0.1.30
+# 发布说明 — v0.1.31
 
-## hosted 搜索改为协商封闭 Responses schema，不再假设供应商容忍
+## 自相矛盾的渠道 usage 上报不再推高 Grok Build 上下文计量、不再提前触发自动压缩
 
-- **标准来源提示保持默认，封闭枚举用证据判定而非猜测。** 每个 Responses hosted 搜索请求仍会请求 `web_search_call.action.sources` —— 这是 OpenAI 文档化的 `include` 值，承载 Grok Build 原生站点数背后的完整被查阅 URL 列表。实现或忽略该提示的供应商保持最大保真度。`include` 为封闭枚举的供应商不再打断搜索：hellogrok 现在依据证据协商偏差，而不是依赖供应商白名单。
+- **本次修复的对象是一个被报错的数字,而不是被配错的阈值。** Grok Build 把渠道上报的 `total_tokens` 直接写入上下文计量表,并用于 `auto_compact_threshold_percent` 判定,全程不与"实际发出去的请求"做交叉校验。部分中转渠道会在某一次响应里把缓存前缀重复计入 prompt(或上报会话累计的 prompt tokens)。实测事故中,一份这样的上报把一个真实占用约 45% 的会话一步推到 91%,随即触发了一次本不该发生的自动压缩;而压缩要把整段历史发给同一慢渠道做摘要,又额外消耗了数分钟。
 
-- **已知封闭 schema 主机提前处理。** 火山方舟（`*.volces.com`）会以 `InvalidParameter` 拒收未知 `include` 值，并拒收携带封闭 tool schema 之外字段的 hosted 搜索声明（例如 Build 的 `filters` 域名过滤、`allowed_tools` 选择器形态）。对这些主机，hellogrok 省略该提示并发送净化后的声明：tool 内未知字段被剥离到文档集合（`type`、`max_keyword`、`limit`、`sources`、`user_location`），纯 hosted 搜索的 `allowed_tools` 选择折叠为等价的 `required` 选择器。此类主机的来源展示回落到响应注解中的 URL，hellogrok 本就将其归一化到 Grok Build 的两条展示路径。
+- **hellogrok 现在用物理请求体交叉校验每一份 usage 上报。** 以"渠道 + 客户端会话标识"(Grok Build 每个请求都会携带)为键,守卫从每个会话第一份自洽的上报中学习"字节/token 比率":请求体的可 tokenize 体积(编码后字节数扣除内嵌 base64 data URI——它们携带图像字节但只占近乎恒定的 token 成本)除以上报的 prompt tokens。此后任何一次上报,若 prompt tokens 超过按当前请求体推算期望值的 1.25 倍,即在构造上自相矛盾,整份 usage 被丢弃,Grok Build 回落到它自己的字节估算,直到渠道恢复自洽上报。请求体收缩超过四分之一(压缩、回退、恢复)时重新学习基线,而不是把新的更小上下文误判为超报。
 
-- **未知严格供应商一次重放自愈，不保留任何状态。** 其他任何以 `400` 自证封闭 schema 的上游（拒收 include 或拒收 tool 声明）会触发同一请求内的单次重写重放：剥离 include 列表，或净化声明，然后重发同一请求。重写按请求单次执行，不会循环；被拒请求未执行搜索，重放无副作用、不消耗计费搜索额度。不保留任何按主机、按渠道或落盘的记忆：协商是线路交换的属性，因此中转、新主机与未来供应商无需 hellogrok 更新即可收敛。
+- **校验覆盖全部线路,其余情况完全不介入。** native Chat Completions 透传(流式与缓冲)、native Responses 透传(流式与缓冲,且先于 `context_details` 投影执行,避免错误数字借投影存活)、以及两条翻译路径(Messages 与 Chat 转 Responses,流式与缓冲)都经过同一守卫。没有稳定会话标识的会话完全跳过校验,因此不提供标识的客户端行为不变;自洽的渠道永远不会被触碰——守卫只抑制"超出请求体推算期望"的上报,从不改写任何数字;上报自洽时,计费可见字段保持原样。
 
-- **省略解析器必需索引的引用条目不再导致整个响应失败。** Grok Build 的注解解析器要求 `url_citation` 条目带 `start_index`/`end_index`，而部分 Responses 供应商只返回 `url`、`title` 与元数据。缺失索引现在在全路由补 `0`，覆盖非流式响应体与流式终止事件。代价是引用高亮精度；否则代价是整个搜索响应被拒。
-
-## 对真实封闭 schema 供应商的端到端验证
-
-该协商机制已用火山方舟豆包搜索作为配置的 Grok Build `web_search` 后端实测：直连 API 以 `400 InvalidParameter` 拒收该提示与未净化声明，而协商后的请求返回 `200`，带已完成的 `web_search_call` 与注解来源（代理日志 `search evidence declared=true calls=1 completed=1 sources=5 annotations=5`）。新增测试固定每种行为：include 被拒时不带提示重放一次、tool 声明被拒时带净化声明重放一次、索引补齐适用于全路由、合规中转的 include 条目与选择器保持原样。
-
-所有变更都留在既有安全契约内：重写发生在 Grok Build 严格校验器看到线路之前，确定性拒绝仍不可重试，且未新增任何配置面 —— 协商自动进行，除非记录了 schema 偏差否则不可见。
+- **以测试验证,包含对事故形态的端到端复现。** 单元测试固定了基线学习、翻倍上报抑制、下一份自洽上报恢复、上下文重写后基线重学、以及按渠道/按会话隔离;两个端到端测试驱动真实 SSE 上游,令第二次调用的 prompt 计数翻倍(分别走 native Chat 与 native Responses 路径),断言下游流中 `usage` 为 null 且助手正文完整保留。全量测试通过。
 
 升级后请重启两个 hellogrok 可执行文件。

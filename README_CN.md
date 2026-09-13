@@ -6,7 +6,7 @@
 
 跨平台 Grok Build 本地代理，让自定义模型渠道兼容常见 API 格式、Build 原生 Web 工具、独立鉴权和自动配置恢复。
 
-[![Version](https://img.shields.io/badge/version-0.1.29-2f6feb.svg)](./internal/appinfo/appinfo.go)
+[![Version](https://img.shields.io/badge/version-0.1.31-2f6feb.svg)](./internal/appinfo/appinfo.go)
 [![Go](https://img.shields.io/badge/Go-1.26.6-00ADD8.svg)](./go.mod)
 [![CI](https://github.com/hellowind777/hellogrok/actions/workflows/ci.yml/badge.svg)](https://github.com/hellowind777/hellogrok/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
@@ -117,6 +117,7 @@ Grok Build 在本地执行文件、终端、grep、子代理、客户端 `web_se
 - 接受带或不带 BOM 的 UTF-8 `config.toml`。只读检查不会改写文件；代理每次成功应用、恢复或回滚配置时，都会以 UTF-8 无 BOM 原子写入。TOML 无效时会显示文件路径、行号和列号，不再只输出缺少上下文的解析器错误。应用与恢复在原子重命名前会重新读取文件：更新期间的外部修改会让本次写入以可重试错误中止并原样保留该修改；重命名后还会刷新目录项，断电不会丢失已提交的写入。
 - 根据每个自定义模型的有效上下文窗口和最大输出分别计算自动压缩预算；只临时降低不安全的阈值，不会提高用户设置的较低值，停止代理时恢复全部受管值。
 - 只转发能放入已知 `context_window` 的实时上下文用量。hosted search 的累计计费总量以及其他大于窗口的测量会变成 `usage: null`，让 Grok Build 保留原基线，而不是按不可能的计数去压缩。
+- 在用量进入 Grok Build 上下文计量表之前，用物理请求交叉校验每一份供应商上报。以会话（渠道 + 客户端会话标识）为键，守卫从第一份自洽上报学习“字节/token”比率——请求体的可 tokenize 体积（编码字节数扣除内嵌 base64 data URI）除以上报的 prompt tokens——此后任何 prompt 计数超过当前请求体推算值 1.25 倍的上报都会被整份丢弃。这类上报通常把缓存前缀重复计入或携带会话累计总量，否则会把计量表一步推高、在远超配置阈值的位置触发自动压缩。丢弃后 Grok Build 回落到自身的字节估算，直到渠道恢复自洽上报；请求体收缩超过四分之一（压缩、回退、恢复）时重新学习基线；没有稳定会话标识的会话完全跳过该校验。
 - 正常停止、退出托盘、Ctrl+C、SIGTERM 或启动失败时恢复未被用户改动的临时值，并通过字段级三方合并保留代理运行期间的用户修改。无关修改使整份 TOML 无效但文件仍是有效 UTF-8 时，逐行恢复仍会撤销可独立解析的受管字段，并保留用户写入的无效 TOML 文本。
 - 托盘“退出”始终会在尝试清理后结束进程。若文件无法访问或仍有不属于原事务结构的本地路由，恢复事务会留在磁盘供下次启动处理，不会把用户困在托盘程序中。
 - 普通停止代理后保留诊断监听，让旧会话收到结构化、不可重试的 `proxy_stopped` 错误，并提示用户重新选择模型。托盘“退出”会关闭该监听并释放端口，即使配置清理需要推迟也不例外。
@@ -574,6 +575,8 @@ DeepSeek 的 1M 上下文是输入与生成输出共享的总预算，Responses 
 如果一个已经结束或恢复的会话在有效阈值之上，下一次用户输入会先触发 Grok Build 的采样前自动压缩，然后才向供应商发请求。hellogrok 的进程级测试已覆盖 Responses、Messages 与 Chat Completions 的恢复会话路径。活动轮次中的大工具结果仍可能在两次检查之间越过阈值；随后同一工具循环的下一道保护会压缩当前活动上下文。
 
 常规 DeepSeek 请求的完整输入/输出用量可以精确更新上述基线。服务端 Web Search 可能返回多步累计计费量而不是最终活动 prompt。当输入或输出计数超过已知 `context_window` 时，hellogrok 会丢弃该次测量（`usage: null`），而不是让 Grok Build 按不可能的实时上下文去压缩。窗口内的可信计数，以及自身也落在窗口内的供应商 `context_details`，仍会更新基线。非 DeepSeek 渠道使用同一条护栏。完全不返回用量时只能保留基线并近似增长。此检查需要显式配置 `context_window`。
+
+对称的故障是计量表一步跳到远超配置阈值的位置。Grok Build 把上报的 `total_tokens` 直接写入上下文计量表，因此某一次中转响应把缓存前缀重复计入（或上报会话累计的 prompt tokens）时，一个实际只用到一半的会话会被直接推过自动压缩阈值，而对话本身并没有增长。hellogrok 现在按会话把每一份用量上报与请求体的可 tokenize 体积交叉校验，丢弃 prompt 计数超出请求体推算期望 25% 以上的上报，让 Grok Build 回落到自身的字节估算，直到渠道恢复自洽上报。若压缩仍在离谱的百分比触发，请对照代理日志中的 `usage suppressed` 行与请求体大小：被抑制的上报是渠道报错，而不是阈值配置错误。
 
 ### Grok Build 整个窗口无法点击
 

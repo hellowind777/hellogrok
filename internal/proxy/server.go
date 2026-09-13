@@ -57,6 +57,7 @@ type Server struct {
 	probedMu         sync.Mutex
 	probed           map[string]bool
 	reasoning        *reasoningProvenanceStore
+	usageGuard       *contextUsageGuard
 	capacityObserver func(string, capacity.Observation)
 }
 
@@ -110,6 +111,7 @@ func newServer(logger *log.Logger, reasoningPath string) *Server {
 		requestCancel:           requestCancel,
 		probed:                  map[string]bool{},
 		reasoning:               reasoning,
+		usageGuard:              newContextUsageGuard(logger.Printf),
 	}
 }
 
@@ -592,6 +594,9 @@ func (s *Server) streamResponsesSSE(w http.ResponseWriter, response *http.Respon
 		}
 		modelObserver.observe(rawEvent, false)
 		evidence.observeJSON(restored)
+		// The patch below projects context_details from usage, so a
+		// contradictory report must be dropped before that projection.
+		s.guardResponsesUsage(rawEvent, route, request)
 		if err := itemIDs.normalize(rawEvent); err != nil {
 			return err
 		}
