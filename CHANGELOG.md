@@ -4,6 +4,20 @@ All notable changes to this project are documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.34] — 2026-09-14
+
+### Added
+
+- Responses absorb window for retryable `response.failed` SSE terminals. While nothing has been written to the client, a Responses stream whose only terminal is a retryable failure (rate limit, concurrency, overload) is withheld — response headers and early frames stay buffered up to 32 frames — and replayed inside the absorb window with the same backoff and `Retry-After` handling as HTTP soft failures. Grok Build keeps its full retry budget; an exhausted window passes the failure through retryable. `absorb_retry_max_secs = 0` streams the failed event immediately; deterministic `response.failed` events pass through without retry.
+- Structured upstream error summaries for HTTP errors and Responses `response.failed`/`error` events (`type`, `code`, `message`), with bearer tokens, key assignments, and `sk-` values redacted and long messages truncated. An official Grok catalog name (for example `grok-4.6`) observed on a non-xAI custom channel is logged with body size, tool count, and session presence to aid `/resume` diagnosis; first-party `api.x.ai` routes and custom IDs without the `grok-` prefix are excluded.
+- Explicit non-retryable `502` responses for stream-shape mismatches: an SSE body answered to a non-streaming request, or a streaming body answered to Grok Build's fixed non-streaming WebSearchClient request.
+
+### Fixed
+
+- Concurrency-limit rejections (`concurrency`, `concurrency limit`, and the corresponding Chinese phrases) classify as transient, and error envelopes nested under `response.error` are recognized the same as top-level `error` objects.
+- Client disconnects no longer surface as upstream stream failures. Messages, Chat Completions, native, and Responses streams log a client abort and emit no `proxy_stream_error` when the client write fails or the request context is canceled; truly truncated upstream streams still emit the error.
+- Benign upstream-model mismatches log once per channel/protocol/configured/upstream pair (bounded to 256 keys); conflicting and invalid declarations always log. Responses SSE headers are sent only after the hold decision, so an absorbed retry never emits partial headers.
+
 ## [0.1.33] — 2026-09-14
 
 ### Fixed
@@ -453,7 +467,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - CC Switch compatibility detection and conflict warnings.
 - Builds for Windows, Linux, and macOS on amd64 and arm64.
 
-[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.28...HEAD
+[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.34...HEAD
+[0.1.34]: https://github.com/hellowind777/hellogrok/compare/v0.1.33...v0.1.34
+[0.1.33]: https://github.com/hellowind777/hellogrok/compare/v0.1.32...v0.1.33
+[0.1.32]: https://github.com/hellowind777/hellogrok/compare/v0.1.31...v0.1.32
+[0.1.31]: https://github.com/hellowind777/hellogrok/compare/v0.1.30...v0.1.31
+[0.1.30]: https://github.com/hellowind777/hellogrok/compare/v0.1.29...v0.1.30
+[0.1.29]: https://github.com/hellowind777/hellogrok/compare/v0.1.28...v0.1.29
 [0.1.28]: https://github.com/hellowind777/hellogrok/compare/v0.1.27...v0.1.28
 [0.1.27]: https://github.com/hellowind777/hellogrok/compare/v0.1.26...v0.1.27
 [0.1.26]: https://github.com/hellowind777/hellogrok/compare/v0.1.25...v0.1.26

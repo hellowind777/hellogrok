@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -480,20 +481,15 @@ func (s *Server) probeOnce(channel string, sample []byte, isSSELine bool) {
 	s.log.Printf("schema probe channel=%s: filled %s", channel, strings.Join(missing, "; "))
 }
 
-func (s *Server) streamResponsesSSE(w http.ResponseWriter, response *http.Response, route config.Route, request facadeRequest, options patch.Options, started time.Time) {
+func (s *Server) streamResponsesSSE(w http.ResponseWriter, response *http.Response, route config.Route, request facadeRequest, options patch.Options, started time.Time, discoveredContextWindow uint64, absorb *absorbState) *responsesHoldResult {
 	channel := route.ChannelID
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeJSONError(w, http.StatusInternalServerError, "stream unsupported")
-		return
+		return nil
 	}
 	modelObserver := newUpstreamModelObserver(request.Protocol)
 	defer modelObserver.log(s.log, route)
-	copySafeResponseHeaders(w.Header(), response.Header)
-	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.WriteHeader(response.StatusCode)
-	flusher.Flush()
 
 	scanner := bufio.NewScanner(response.Body)
 	scanner.Buffer(make([]byte, 64*1024), 16<<20)
@@ -643,6 +639,9 @@ func (s *Server) streamResponsesSSE(w http.ResponseWriter, response *http.Respon
 		}
 
 		eventType := stringValue(event["type"])
+		if eventType == "response.failed" || (eventType == "error" && stringValue(event["code"]) != "proxy_stream_error") {
+			s.logUpstreamErrorObject(channel, eventType, response.StatusCode, event)
+		}
 		if eventType == "response.completed" || eventType == "response.incomplete" || eventType == "response.failed" {
 			responseBody, _ := event["response"].(map[string]any)
 			if responseBody != nil {
@@ -673,19 +672,98 @@ func (s *Server) streamResponsesSSE(w http.ResponseWriter, response *http.Respon
 		return writeJSONFrame(lines, event)
 	}
 
+	released := false
+	var pending [][]string
+	var hold *responsesHoldResult
+	releaseStream := func() error {
+		if released {
+			return nil
+		}
+		released = true
+		mergeGrokModelHeaders(w.Header(), response.Header)
+		if !positiveModelHeader(w.Header().Get(grokContextWindowHeader), 64) && discoveredContextWindow > 0 {
+			w.Header().Set(grokContextWindowHeader, fmt.Sprintf("%d", discoveredContextWindow))
+		}
+		copySafeResponseHeaders(w.Header(), response.Header)
+		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.WriteHeader(response.StatusCode)
+		flusher.Flush()
+		for _, lines := range pending {
+			if err := writeFrame(lines); err != nil {
+				return err
+			}
+			if terminal != "" {
+				break
+			}
+		}
+		pending = nil
+		return nil
+	}
+	bufferOrWrite := func(lines []string) error {
+		if released {
+			return writeFrame(lines)
+		}
+		payload, hasData := sseFramePayload(lines)
+		if isPrivateSSEHeartbeat(lines, payload) || !hasData || strings.TrimSpace(payload) == "" {
+			if len(pending) >= maxResponsesHoldFrames {
+				if err := releaseStream(); err != nil {
+					return err
+				}
+				return writeFrame(lines)
+			}
+			pending = append(pending, append([]string(nil), lines...))
+			return nil
+		}
+		event, err := decodeJSONMap([]byte(payload))
+		if err != nil {
+			if err := releaseStream(); err != nil {
+				return err
+			}
+			return writeFrame(lines)
+		}
+		switch classifyResponsesHoldEvent(event) {
+		case responsesHoldAbsorb:
+			if shouldAbsorbResponsesFailure(event, absorb) {
+				status, retryAfter, body, ok := retryableResponsesStreamFailure(event)
+				if ok {
+					s.logUpstreamErrorObject(channel, stringValue(event["type"]), response.StatusCode, event)
+					s.log.Printf("UP channel=%s SSE withheld retryable %s status=%d for absorb", channel, stringValue(event["type"]), status)
+					hold = &responsesHoldResult{absorb: true, status: status, body: body, retryAfter: retryAfter}
+					return errResponsesHoldAbsorb
+				}
+			}
+			fallthrough
+		case responsesHoldRelease:
+			if err := releaseStream(); err != nil {
+				return err
+			}
+			return writeFrame(lines)
+		default:
+			if len(pending) >= maxResponsesHoldFrames {
+				if err := releaseStream(); err != nil {
+					return err
+				}
+				return writeFrame(lines)
+			}
+			pending = append(pending, append([]string(nil), lines...))
+			return nil
+		}
+	}
+
 	frame := make([]string, 0, 4)
 	frameBytes := 0
 	var streamErr error
 	for scanner.Scan() {
 		line := strings.TrimSuffix(scanner.Text(), "\r")
 		if line == "" {
-			if err := writeFrame(frame); err != nil {
+			if err := bufferOrWrite(frame); err != nil {
 				streamErr = err
 				break
 			}
 			frame = frame[:0]
 			frameBytes = 0
-			if terminal != "" {
+			if terminal != "" || hold != nil {
 				break
 			}
 			continue
@@ -701,9 +779,26 @@ func (s *Server) streamResponsesSSE(w http.ResponseWriter, response *http.Respon
 		streamErr = scanner.Err()
 	}
 	if streamErr == nil && len(frame) > 0 {
-		streamErr = writeFrame(frame)
+		streamErr = bufferOrWrite(frame)
 	}
-	if streamErr != nil {
+	if errors.Is(streamErr, errResponsesHoldAbsorb) {
+		streamErr = nil
+	}
+	if hold != nil && hold.absorb {
+		return hold
+	}
+	aborted := isClientStreamAbort(streamErr, clientWriteFailed, response)
+	if !released && aborted {
+		s.log.Printf("UP channel=%s SSE aborted by client events=%d", channel, events)
+		return &responsesHoldResult{abort: true}
+	}
+	if !released {
+		if err := releaseStream(); err != nil {
+			streamErr = err
+			aborted = isClientStreamAbort(streamErr, clientWriteFailed, response)
+		}
+	}
+	if streamErr != nil && !aborted {
 		s.log.Printf("UP channel=%s SSE read error: %v", channel, streamErr)
 	}
 	if itemIDs.remapped > 0 {
@@ -711,7 +806,7 @@ func (s *Server) streamResponsesSSE(w http.ResponseWriter, response *http.Respon
 	}
 	noteUnknownReasoningEvents(s.log.Printf, channel, responsesThought)
 	s.logSearchEvidence(channel, request, evidence)
-	if terminal == "" && streamErr == nil {
+	if terminal == "" && streamErr == nil && !aborted {
 		if eventType, body, ok := assembleResponsesStreamTerminal(lastResponse, outputItems, streamedText.String()); ok {
 			if body != nil {
 				backfillResponseSearchSources(body, request.HostedWebSearch, request.SearchQuery)
@@ -742,17 +837,25 @@ func (s *Server) streamResponsesSSE(w http.ResponseWriter, response *http.Respon
 			}
 		}
 	}
+	if !aborted {
+		aborted = isClientStreamAbort(streamErr, clientWriteFailed, response)
+	}
 	s.log.Printf("UP channel=%s SSE done events=%d heartbeats=%d terminal=%s %s", channel, events, heartbeats, terminal, time.Since(started).Round(time.Millisecond))
 	if terminal == "" {
-		s.log.Printf("UP channel=%s SSE ended without a Responses terminal event", channel)
-		if !clientWriteFailed {
-			message := "upstream Responses stream ended without a terminal event"
-			if streamErr != nil {
-				message = upstreamStreamFailureMessage("Responses", streamErr)
+		if aborted {
+			s.log.Printf("UP channel=%s SSE aborted by client events=%d", channel, events)
+		} else {
+			s.log.Printf("UP channel=%s SSE ended without a Responses terminal event", channel)
+			if !clientWriteFailed {
+				message := "upstream Responses stream ended without a terminal event"
+				if streamErr != nil {
+					message = upstreamStreamFailureMessage("Responses", streamErr)
+				}
+				writeResponsesStreamError(w, flusher, events, message)
 			}
-			writeResponsesStreamError(w, flusher, events, message)
 		}
 	}
+	return nil
 }
 
 func writeResponsesStreamError(w http.ResponseWriter, flusher http.Flusher, sequence int, message string) {

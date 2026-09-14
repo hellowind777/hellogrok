@@ -105,6 +105,14 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 	saveLastRequestMeta(logTarget, route.WireModel, len(request.Body), tools, webSearch, hostedSearch, functionSearch, xSearch, request)
 	if incomingModel := extractModel(body); incomingModel != "" && incomingModel != route.WireModel {
 		s.log.Printf("UP model isolated channel=%s: %s -> %s", route.ChannelID, incomingModel, route.WireModel)
+		if isOfficialGrokCatalogID(incomingModel) && !isOfficialXAIRoute(route) {
+			session := "present"
+			if !identity.stable {
+				session = "missing"
+			}
+			s.log.Printf("UP official model name on custom channel channel=%s incoming=%q wire=%q body=%dB tools=%d session=%s",
+				route.ChannelID, incomingModel, route.WireModel, len(request.Body), tools, session)
+		}
 	}
 	if hasIncomingCredential(incoming.Header) {
 		if _, ok := incomingProviderCredential(route, incoming.Header); ok {
@@ -218,6 +226,45 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 					return
 				}
 				response.Body = io.NopCloser(bytes.NewReader(data))
+			} else if request.IncomingProtocol == wireResponses && request.Protocol == wireResponses {
+				if !request.Stream {
+					_ = response.Body.Close()
+					writeJSONError(w, http.StatusBadGateway, "upstream ignored stream=false; cannot return an event stream")
+					return
+				}
+				if request.Kind == clientSearchRequest {
+					_ = response.Body.Close()
+					writeJSONError(w, http.StatusBadGateway, "WebSearchClient requires one non-streaming Responses response")
+					return
+				}
+				hold := s.streamResponsesSSE(w, response, route, request, s.responsesPatchOptions(route, response.Header), started, discoveredContextWindow, absorb)
+				if hold != nil && hold.abort {
+					_ = response.Body.Close()
+					return
+				}
+				if hold != nil && hold.absorb {
+					_ = response.Body.Close()
+					fake := syntheticAbsorbResponse(hold.status, hold.retryAfter)
+					plan, reason := decider.onDisposition(fake, hold.body, request.Body)
+					switch plan {
+					case planRetryRequest:
+						s.logAbsorbWait(route.ChannelID, absorb, decider.absorbReason, decider.absorbStatus)
+						request.Body = decider.retryBody
+						continue
+					case planAbortSilent:
+						s.log.Printf("UP channel=%s %s", route.ChannelID, reason)
+						return
+					case planPassThrough:
+						if reason != "" {
+							s.log.Printf("UP channel=%s %s", route.ChannelID, reason)
+						}
+						writeRecoveryPassthrough(w, fake, hold.body, decider, discoveredContextWindow)
+						return
+					}
+					return
+				}
+				_ = response.Body.Close()
+				return
 			}
 			break
 		}
@@ -239,6 +286,7 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 			}
 			return
 		}
+		s.logUpstreamError(route.ChannelID, "http", response.StatusCode, data)
 
 		observation, observedContextBudget := inspectContextBudgetError(response.StatusCode, data)
 		if observedContextBudget {
@@ -314,7 +362,10 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 		}
 		switch request.Protocol {
 		case wireResponses:
-			s.streamResponsesSSE(w, response, route, request, s.responsesPatchOptions(route, response.Header), started)
+			hold := s.streamResponsesSSE(w, response, route, request, s.responsesPatchOptions(route, response.Header), started, discoveredContextWindow, absorb)
+			if hold != nil && hold.absorb {
+				writeRecoveryPassthrough(w, syntheticAbsorbResponse(hold.status, hold.retryAfter), hold.body, decider, discoveredContextWindow)
+			}
 		case wireMessages:
 			s.streamMessagesSSE(w, response, route, request, started)
 		case wireChatCompletions:
@@ -680,6 +731,11 @@ func classifyStructuredRetry(body []byte) (bool, bool) {
 		return false, false
 	}
 	errorBody, _ := root["error"].(map[string]any)
+	if errorBody == nil {
+		if nested, _ := root["response"].(map[string]any); nested != nil {
+			errorBody, _ = nested["error"].(map[string]any)
+		}
+	}
 	identifiers := []string{
 		firstString(errorBody, "code"),
 		firstString(errorBody, "type"),
@@ -704,6 +760,7 @@ func classifyStructuredRetry(body []byte) (bool, bool) {
 		if hasErrorIdentifier(normalized,
 			"rate_limit", "too_many_requests", "overloaded", "temporarily_unavailable",
 			"temporary_unavailable", "service_unavailable", "timeout", "timed_out",
+			"concurrency",
 		) {
 			transient = true
 		}
@@ -727,8 +784,8 @@ func classifyStructuredRetry(body []byte) (bool, bool) {
 	}
 	if containsErrorPhrase(message,
 		"rate limit", "too many requests", "temporarily unavailable", "temporary unavailable",
-		"service unavailable", "overloaded", "timed out", "timeout", "请求过于频繁",
-		"服务暂时不可用", "服务不可用", "超时",
+		"service unavailable", "overloaded", "timed out", "timeout", "concurrency limit",
+		"请求过于频繁", "服务暂时不可用", "服务不可用", "超时", "并发限制", "并发超限",
 	) {
 		return true, true
 	}

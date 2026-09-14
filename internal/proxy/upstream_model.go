@@ -2,9 +2,18 @@ package proxy
 
 import (
 	"log"
+	"net"
 	"strings"
+	"sync"
 
 	"github.com/hellowind777/hellogrok/internal/config"
+)
+
+const maxResponseModelSilenceKeys = 256
+
+var (
+	responseModelSilenceMu sync.Mutex
+	responseModelSilence   = map[string]struct{}{}
 )
 
 type upstreamModelObserver struct {
@@ -65,15 +74,69 @@ func (observer *upstreamModelObserver) mismatch(configured string) bool {
 }
 
 func (observer *upstreamModelObserver) log(logger *log.Logger, route config.Route) {
+	if logger == nil {
+		return
+	}
 	actual, source := observer.actual()
 	expected := upstreamResponseModelForRoute(route)
 	configured, ok := validObservedUpstreamModel(expected)
 	if !ok {
 		configured = "<invalid>"
 	}
+	mismatch := observer.mismatch(expected)
+	if mismatch && !observer.conflict && observer.invalid == 0 &&
+		!noteResponseModelMismatch(route.ChannelID, string(observer.protocol), configured, actual) {
+		return
+	}
 	logger.Printf("UP channel=%s response_model upstream=%q configured=%q protocol=%s source=%s mismatch=%t conflict=%t declarations=%d invalid=%d",
-		route.ChannelID, actual, configured, observer.protocol, source, observer.mismatch(expected),
+		route.ChannelID, actual, configured, observer.protocol, source, mismatch,
 		observer.conflict, observer.declarations, observer.invalid)
+}
+
+// noteResponseModelMismatch records a benign mismatch pair. It returns true
+// the first time this process sees the pair so the line is logged, and false
+// for repeats. Conflicts and invalid declarations skip this gate.
+func noteResponseModelMismatch(channel, protocol, configured, upstream string) bool {
+	key := strings.ToLower(strings.TrimSpace(channel)) + "\x1f" +
+		strings.ToLower(strings.TrimSpace(protocol)) + "\x1f" +
+		strings.ToLower(strings.TrimSpace(configured)) + "\x1f" +
+		strings.ToLower(strings.TrimSpace(upstream))
+	responseModelSilenceMu.Lock()
+	defer responseModelSilenceMu.Unlock()
+	if _, seen := responseModelSilence[key]; seen {
+		return false
+	}
+	if len(responseModelSilence) >= maxResponseModelSilenceKeys {
+		return true
+	}
+	responseModelSilence[key] = struct{}{}
+	return true
+}
+
+func resetResponseModelSilenceForTest() {
+	responseModelSilenceMu.Lock()
+	defer responseModelSilenceMu.Unlock()
+	responseModelSilence = map[string]struct{}{}
+}
+
+// isOfficialGrokCatalogID reports whether name looks like a first-party Grok
+// Build catalog ID (grok-4.6, grok-code-fast-1). Custom channel IDs in this
+// project use grok4.6-sevnx without the hyphen after "grok".
+func isOfficialGrokCatalogID(model string) bool {
+	value := strings.ToLower(strings.TrimSpace(model))
+	return strings.HasPrefix(value, "grok-") && len(value) > len("grok-")
+}
+
+func isOfficialXAIRoute(route config.Route) bool {
+	return officialHost(route.Host) == "api.x.ai"
+}
+
+func officialHost(host string) string {
+	host = strings.ToLower(strings.TrimSpace(host))
+	if parsed, _, err := net.SplitHostPort(host); err == nil {
+		host = parsed
+	}
+	return strings.Trim(host, "[]")
 }
 
 func declaredUpstreamModel(protocol wireProtocol, root map[string]any) (any, bool) {

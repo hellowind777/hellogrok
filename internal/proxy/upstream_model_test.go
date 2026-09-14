@@ -80,7 +80,142 @@ func TestUpstreamModelObserverHandlesCaseAndMissingValues(t *testing.T) {
 	}
 }
 
+func TestOfficialGrokCatalogID(t *testing.T) {
+	tests := []struct {
+		name string
+		id   string
+		want bool
+	}{
+		{name: "grok-4.6", id: "grok-4.6", want: true},
+		{name: "Grok-4.6 case", id: "Grok-4.6", want: true},
+		{name: "grok-code-fast-1", id: "grok-code-fast-1", want: true},
+		{name: "custom sevnx id", id: "grok4.6-sevnx", want: false},
+		{name: "muse", id: "muse-spark-1.3-contributor", want: false},
+		{name: "empty", id: "", want: false},
+		{name: "bare grok-", id: "grok-", want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := isOfficialGrokCatalogID(test.id); got != test.want {
+				t.Fatalf("isOfficialGrokCatalogID(%q)=%t want %t", test.id, got, test.want)
+			}
+		})
+	}
+	if isOfficialXAIRoute(config.Route{Host: "api.x.ai"}) != true {
+		t.Fatal("api.x.ai must be treated as first-party")
+	}
+	if isOfficialXAIRoute(config.Route{Host: "opencode.ai"}) {
+		t.Fatal("opencode.ai must not be treated as first-party xAI")
+	}
+}
+
+func TestBenignMismatchLogsOncePerChannelPair(t *testing.T) {
+	resetResponseModelSilenceForTest()
+	t.Cleanup(resetResponseModelSilenceForTest)
+
+	observer := newUpstreamModelObserver(wireResponses)
+	observer.observeJSON([]byte(`{"type":"response.completed","response":{"model":"grok-4.6-build"}}`), false)
+	route := config.Route{ChannelID: "sevnx", WireModel: "grok-4.6"}
+
+	var first bytes.Buffer
+	observer.log(log.New(&first, "", 0), route)
+	if !strings.Contains(first.String(), "mismatch=true") {
+		t.Fatalf("first mismatch was not logged: %s", first.String())
+	}
+
+	var second bytes.Buffer
+	observer.log(log.New(&second, "", 0), route)
+	if second.Len() != 0 {
+		t.Fatalf("repeat benign mismatch must stay quiet: %s", second.String())
+	}
+
+	conflicted := newUpstreamModelObserver(wireResponses)
+	conflicted.observeJSON([]byte(`{"type":"response.created","response":{"model":"grok-4.6-build"}}`), false)
+	conflicted.observeJSON([]byte(`{"type":"response.completed","response":{"model":"other-model"}}`), false)
+	var conflictLog bytes.Buffer
+	conflicted.log(log.New(&conflictLog, "", 0), route)
+	if !strings.Contains(conflictLog.String(), "conflict=true") {
+		t.Fatalf("conflicting declarations must still log: %s", conflictLog.String())
+	}
+}
+
+func TestOfficialModelNameOnCustomChannelIsWarned(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, nativeSuccessBody("responses", "muse-spark-1.3-contributor", "OK"))
+	}))
+	defer upstream.Close()
+
+	var logs bytes.Buffer
+	route := facadeRoute("muse-warn", "responses", "muse-spark-1.3-contributor", "key", upstream.URL)
+	s := New(log.New(&logs, "", 0))
+	s.SetRoutes([]config.Route{route})
+	startPathTestServer(t, s)
+	body := []byte(`{"model":"grok-4.6","input":"hi","max_output_tokens":16,"stream":false}`)
+	data, status := postFacade(t, s, route.ChannelID, body, "")
+	if status != http.StatusOK {
+		t.Fatalf("status=%d body=%s", status, data)
+	}
+	out := logs.String()
+	if !strings.Contains(out, `UP official model name on custom channel channel=muse-warn incoming="grok-4.6" wire="muse-spark-1.3-contributor"`) {
+		t.Fatalf("missing official-model warning: %s", out)
+	}
+	if !strings.Contains(out, "session=missing") {
+		t.Fatalf("warning omitted session state: %s", out)
+	}
+	if !strings.Contains(out, "UP model isolated channel=muse-warn: grok-4.6 -> muse-spark-1.3-contributor") {
+		t.Fatalf("model isolation was skipped: %s", out)
+	}
+}
+
+func TestOfficialModelNameOnXAIRouteIsNotWarned(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, nativeSuccessBody("responses", "grok-4.6-build", "OK"))
+	}))
+	defer upstream.Close()
+
+	var logs bytes.Buffer
+	route := facadeRoute("xai-official", "responses", "grok-4.6-build", "key", upstream.URL)
+	route.Host = "api.x.ai"
+	s := New(log.New(&logs, "", 0))
+	s.SetRoutes([]config.Route{route})
+	startPathTestServer(t, s)
+	body := []byte(`{"model":"grok-4.6","input":"hi","max_output_tokens":16,"stream":false}`)
+	data, status := postFacade(t, s, route.ChannelID, body, "")
+	if status != http.StatusOK {
+		t.Fatalf("status=%d body=%s", status, data)
+	}
+	if strings.Contains(logs.String(), "official model name on custom channel") {
+		t.Fatalf("first-party xAI route was warned: %s", logs.String())
+	}
+}
+
+func TestCustomGrokChannelIDIsNotWarned(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, nativeSuccessBody("responses", "grok-4.6", "OK"))
+	}))
+	defer upstream.Close()
+
+	var logs bytes.Buffer
+	route := facadeRoute("grok4.6-sevnx", "responses", "grok-4.6", "key", upstream.URL)
+	s := New(log.New(&logs, "", 0))
+	s.SetRoutes([]config.Route{route})
+	startPathTestServer(t, s)
+	body := []byte(`{"model":"grok4.6-sevnx","input":"hi","max_output_tokens":16,"stream":false}`)
+	data, status := postFacade(t, s, route.ChannelID, body, "")
+	if status != http.StatusOK {
+		t.Fatalf("status=%d body=%s", status, data)
+	}
+	if strings.Contains(logs.String(), "official model name on custom channel") {
+		t.Fatalf("custom channel id was treated as a catalog model: %s", logs.String())
+	}
+}
+
 func TestNonStreamingResponsesLogActualUpstreamModelBeforeNormalization(t *testing.T) {
+	resetResponseModelSilenceForTest()
+	t.Cleanup(resetResponseModelSilenceForTest)
 	for _, backend := range []string{"responses", "messages", "chat_completions"} {
 		t.Run(backend, func(t *testing.T) {
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {

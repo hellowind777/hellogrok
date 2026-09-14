@@ -11,10 +11,12 @@ import (
 )
 
 // The absorb layer hides transient upstream soft failures from Grok Build by
-// waiting and retrying inside the proxy while the upstream response headers
-// have not been sent. Replaying the request at that point is side-effect
-// free: the upstream has either rejected the request outright or never
-// completed it. The client's own retry budget (15 attempts, ~5.5 minutes) is
+// waiting and retrying inside the proxy while nothing has been written to the
+// client. That includes HTTP errors before response headers, and a Responses
+// SSE whose only terminal so far is a retryable response.failed (rate limit,
+// concurrency, overload) — those frames are withheld so the retry is not a
+// second stream. Replaying at that point is side-effect free: the upstream
+// has either rejected the request outright or never completed it. The client's own retry budget (15 attempts, ~5.5 minutes) is
 // never consumed while the window lasts; when the window is exhausted the
 // original failure passes through as retryable and the client keeps its full
 // budget. Soft failures include busy/overloaded 5xx statuses, 429s, and

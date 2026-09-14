@@ -6,7 +6,7 @@
 
 跨平台 Grok Build 本地代理，让自定义模型渠道兼容常见 API 格式、Build 原生 Web 工具、独立鉴权和自动配置恢复。
 
-[![Version](https://img.shields.io/badge/version-0.1.33-2f6feb.svg)](./internal/appinfo/appinfo.go)
+[![Version](https://img.shields.io/badge/version-0.1.34-2f6feb.svg)](./internal/appinfo/appinfo.go)
 [![Go](https://img.shields.io/badge/Go-1.26.6-00ADD8.svg)](./go.mod)
 [![CI](https://github.com/hellowind777/hellogrok/actions/workflows/ci.yml/badge.svg)](https://github.com/hellowind777/hellogrok/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
@@ -64,14 +64,16 @@ hellogrok 为这些自定义渠道提供统一的本地兼容层。运行时准�
 - 转发前校验各协议的工具历史：Responses 调用必须有匹配的 `function_call_output`，Messages 的 `tool_use` 必须由紧邻的下一条 user 消息中的 `tool_result` 完整配对，Chat 工具调用必须有匹配的 tool 消息。确定性错误返回不可重试的 `400`，不会进入 Grok Build 重试循环。
 - 在私有 `keepalive`、`keep-alive`、`keep_alive`、`heartbeat`、`ping` 帧到达 Grok Build 前将其转换为标准 SSE 注释，不占用 Responses 事件序号；收到各协议的终止事件后立即关闭上游流。终态判定按协议、不按渠道或模型：Chat Completions 看 `finish_reason`，Messages 看 `stop_reason`/`message_stop`，Responses 看 `status` completed/failed/incomplete 或已收集的 output item。中转随后省略 `[DONE]`、`message_stop` 或 `response.completed` 并干净关闭时，代理会补发对应终态帧，而不是写成会让 Grok Build 把已完成轮次重试 15 次的 `proxy_stream_error`。
 - 普通渠道的上游响应头等待及所有响应正文的两次读取间隔最多为 601 秒，比 Grok Build shell 默认的 600 秒多一秒；`api.deepseek.com` 官方路由使用 660 秒，以覆盖服务商记录的最长十分钟排队。请求没有总时限，非流式排队空行或规范化心跳等任意上游字节都会刷新空闲时限。
-- 在 Grok Build 看到之前吸收上游瞬态软故障。上游响应头尚未发出时，可重试失败（busy/过载 `503`、`429`、可重试 `5xx` 或响应头超时）会在代理内以指数退避（2s 至 30s，尊重上游 `Retry-After`，上限 60s）自动重试，默认最多等待 90 秒。上游返回的 `408` 在服务器之间不可能是 RFC 语义的"客户端超时"，一律视为边缘/网关超时页（等价 `504`）：同样进入吸收窗口，窗口耗尽后改写为可重试的 `504` 透传，而不是触发 Grok Build 对 408 的终局判定。Cloudflare 源站 TLS 失败（`525`、`526`）也按同样方式吸收，尽管 Grok Build 把它们归为终止类：中转源站重启或证书轮换通常会在窗口内恢复，而在边缘与源站 TLS 握手阶段失败的请求根本没有到达源站应用，重放没有副作用；窗口耗尽后按 Grok Build 预期的终止判定透传。窗口期内 Grok Build 自己的 15 次重试预算完全不动：只有窗口耗尽后客户端才会看到失败，且该失败仍以可重试形式透传，客户端原生预算分毫不少。传输错误不做吸收，因为 Grok Build 首次重试时的 HTTP/1.1 客户端重建比代理内重放更擅长处理；响应头发送后的流式失败不受影响。`absorb_retry_max_secs = 0` 可按渠道关闭该窗口。
+- 在 Grok Build 看到之前吸收上游瞬态软故障。上游响应头尚未发出时，可重试失败（busy/过载 `503`、`429`、可重试 `5xx` 或响应头超时）会在代理内以指数退避（2s 至 30s，尊重上游 `Retry-After`，上限 60s）自动重试，默认最多等待 90 秒。Responses SSE 若到目前为止的唯一终态是可重试的 `response.failed`（限流、并发、过载），也会按同样方式暂扣——响应头和早期帧先缓冲（最多 32 帧），重试不会变成第二条流——并在同一窗口内重放；`absorb_retry_max_secs = 0` 则直接透传该失败事件。上游返回的 `408` 在服务器之间不可能是 RFC 语义的"客户端超时"，一律视为边缘/网关超时页（等价 `504`）：同样进入吸收窗口，窗口耗尽后改写为可重试的 `504` 透传，而不是触发 Grok Build 对 408 的终局判定。Cloudflare 源站 TLS 失败（`525`、`526`）也按同样方式吸收，尽管 Grok Build 把它们归为终止类：中转源站重启或证书轮换通常会在窗口内恢复，而在边缘与源站 TLS 握手阶段失败的请求根本没有到达源站应用，重放没有副作用；窗口耗尽后按 Grok Build 预期的终止判定透传。窗口期内 Grok Build 自己的 15 次重试预算完全不动：只有窗口耗尽后客户端才会看到失败，且该失败仍以可重试形式透传，客户端原生预算分毫不少。传输错误不做吸收，因为 Grok Build 首次重试时的 HTTP/1.1 客户端重建比代理内重放更擅长处理；响应头发送后的流式失败不受影响。`absorb_retry_max_secs = 0` 可按渠道关闭该窗口。
 - 对软故障永不缩短 Grok Build 的原生重试预算。只有重试必然无果的确定性错误（鉴权、权限、账单、额度、无效请求或模型）才收到 `X-Should-Retry: false`，让 Grok Build 直接显示供应商的真实解释，而不是用反复重试掩盖。默认透传判定与 Grok Build 的边缘客户端策略一致——除源站 TLS 两个状态码外，`429` 和所有 `5xx` 都可重试——因此瞬态 Cloudflare 边缘页（`520`–`524`、`529`、`530`）不会因代理加盖的请求头而失去客户端原生重试。可重试的 busy/过载 `503` 透传时若上游未带 `Retry-After`，代理会补充 30 秒的 `Retry-After`，让 Grok Build 的重试节奏更合理。
 - 软故障吸收对所有渠道始终生效：可重试 `5xx`、`429`、上游 `408` 边缘超时页、Cloudflare 源站 TLS `525`/`526` 和响应头超时一律在窗口内重试——它们会自行恢复，交给 Grok Build 重试只是空耗时间。全局 `[models]` 的 `error_resilience` 设置只控制确定性 4xx 错误（鉴权、权限、无效请求或模型）：默认（`off`）立即透传供应商原始解释并标记 `X-Should-Retry: false`，因为重试不可能成功；可选的 `balanced` 值额外把它们纳入吸收窗口，按固定 30 秒后 60 秒的节奏等待——中转侧此类故障经常自行恢复（令牌轮换、权限修复、配置热加载、短暂部署），无人值守的任务因此能挺过数分钟级的中断而不是在第一次响应即告失败。推理历史被拒绝在任何档位下都不吸收：它报告的是用户必须看到的异源会话状态，隐藏只会拖延恢复。
 - 按渠道提供可选的死渠道熔断器（`dead_channel_fail_fast = true`，默认关闭）。只有拨号级失败——连接被拒、DNS 失败、TLS 握手失败——才会计数，因为这类失败重试永远不可能成功；busy `503`、`429`、超时和传输重置一律不计数。连续 6 次拨号级失败（可用 `dead_channel_fail_threshold` 调整）后，代理返回不可重试的 `503 proxy_circuit_open`（`X-Should-Retry: false`）。熔断后每 5 分钟放行一次探测请求：上游返回任何状态的响应都会自动合闸，探测失败则重新计时。
 - 识别以 HTTP 200 加错误信封回复失败的中转（newapi/sub2api 常见缺陷）。瞬态信封（限流、过载、超时）进入吸收窗口并在代理内重试；确定性信封（鉴权、账单、无效请求）带着供应商的真实解释透传，而不是变成不透明的信封校验拒绝。自带 error 成员的 Responses 终止响应仍走原生失败路径，不受影响。
 - 把中转前面的 Cloudflare 盾质询视为瞬态故障：`cf-mitigated: challenge` 头或 Cloudflare 下发的质询页会在重试窗口内被吸收；超出窗口的质询以可重试的 `503` 透传，因为裸 `403` 在 Grok Build 中属终止类，会让可自行清除的盾质询直接杀死本轮。不带 Cloudflare 标记的真实源站 `403` 不受影响。
 - 中转在完整终止响应上省略 Responses 信封簿记（`id`、`object`、`status`）时，为其合成缺失标记，而不是拒绝这一可修复的省略；字段存在但取值错误、或 `output` 缺失/畸形，仍然按错误拒绝。探测若始终没有报告结果——调用方中途断开，或探测的响应头超时——2 分钟租约到期即视为丢失，后续请求可以重新探测，不会把渠道永久锁死在断开状态。
-- 在规范化前记录原始上游响应声明的模型，支持终止帧优先、大小写不敏感的不一致判断和多帧冲突标记，不改变路由或响应数据。
+- 在规范化前记录原始上游响应声明的模型，支持终止帧优先、大小写不敏感的不一致判断和多帧冲突标记，不改变路由或响应数据。良性不一致按渠道/协议/配置模型/上游模型组合只记录一次；冲突与无效声明每次都记录。当 Grok Build 在非 xAI 自定义渠道上发送 `grok-4.6` 这类官方目录名时，代理会额外记录一条警告（含请求体大小、工具数量和会话状态），便于诊断 `/resume` 选路，且不改变路由。
+- 显式拒绝协议形态不匹配：非流式请求收到 SSE 响应，或 Grok Build 固定的非流式 WebSearchClient 请求收到流式响应时，返回不可重试的 `502` 并说明不匹配原因，而不是转发无法解码的正文。
+- 上游失败按结构化摘要（`type`、`code`、`message`）记录，覆盖 HTTP 错误与 Responses `response.failed`/`error` 事件；bearer 令牌、key 赋值和 `sk-` 值会被脱敏，超长消息会被截断，因此诊断日志不会落盘凭据。因 Grok Build 断开而结束的流只记录为客户端中止，不会产生 `proxy_stream_error`。
 - Messages 的 `thinking` 起始块缺少空 `signature` 时补齐该字段，同时保留供应商随后发送的真实 `signature_delta`，使 Messages 兼容中转可被 Grok Build 的严格原生解码器消费。
 - 在供应商边界保留每个渠道配置的上游 URL 路径和上游模型标识。
 - 使用前准备所有显式自定义渠道，避免通过 `/model` 切换后首次请求失败。
@@ -113,7 +115,7 @@ Grok Build 在本地执行文件、终端、grep、子代理、客户端 `web_se
 - 加载配置时校验渠道请求头名称和值；请求分帧、内容和连接请求头仍由代理控制。
 - 代理启动时检查并临时补全 Grok 必需设置。
 - `reasoning_effort`、`reasoning_efforts` 和 `supports_reasoning_effort` 完全归用户或 Grok Build 管理，hellogrok 不会创建、迁移、重排或替换这些字段。`supports_backend_search` 等代理临时管理的设置在重复应用时保持稳定，停止时只恢复当前事务管理的值。
-- 保留上游错误状态和正文，并根据结构化错误代码判断是否重试。鉴权、权限、账单、余额或额度不足、无效请求和无效模型错误不可重试；限流、超时、过载和临时服务错误仍可重试。上游显式返回的 `X-Should-Retry` 始终优先。
+- 保留上游错误状态和正文，并根据结构化错误代码判断是否重试。鉴权、权限、账单、余额或额度不足、无效请求和无效模型错误不可重试；限流、超时、过载、并发限制拒绝（含嵌套 `response.error` 信封）和临时服务错误仍可重试。上游显式返回的 `X-Should-Retry` 始终优先。
 - 接受带或不带 BOM 的 UTF-8 `config.toml`。只读检查不会改写文件；代理每次成功应用、恢复或回滚配置时，都会以 UTF-8 无 BOM 原子写入。TOML 无效时会显示文件路径、行号和列号，不再只输出缺少上下文的解析器错误。应用与恢复在原子重命名前会重新读取文件：更新期间的外部修改会让本次写入以可重试错误中止并原样保留该修改；重命名后还会刷新目录项，断电不会丢失已提交的写入。
 - 根据每个自定义模型的有效上下文窗口和最大输出分别计算自动压缩预算；只临时降低不安全的阈值，不会提高用户设置的较低值，停止代理时恢复全部受管值。
 - 只转发能放入已知 `context_window` 的实时上下文用量。hosted search 的累计计费总量以及其他大于窗口的测量会变成 `usage: null`，让 Grok Build 保留原基线，而不是按不可能的计数去压缩。

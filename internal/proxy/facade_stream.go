@@ -740,13 +740,20 @@ func (s *Server) streamMessagesSSE(w http.ResponseWriter, response *http.Respons
 	if errors.Is(streamErr, errSSEStreamComplete) {
 		streamErr = nil
 	}
-	if streamErr != nil {
+	aborted := isClientStreamAbort(streamErr, writer.writeFailed, response)
+	if aborted {
+		s.log.Printf("UP channel=%s Messages SSE aborted by client events=%d", route.ChannelID, writer.sequence)
+	} else if streamErr != nil {
 		s.log.Printf("UP channel=%s Messages SSE conversion error: %v", route.ChannelID, streamErr)
 		writer.emitStreamError(upstreamStreamFailureMessage("Messages", streamErr))
 	} else if !state.terminal && state.stopReason != "" {
 		if err := state.finish(); err != nil {
-			s.log.Printf("UP channel=%s Messages SSE conversion error: %v", route.ChannelID, err)
-			writer.emitStreamError(upstreamStreamFailureMessage("Messages", err))
+			if isClientStreamAbort(err, writer.writeFailed, response) {
+				s.log.Printf("UP channel=%s Messages SSE aborted by client events=%d", route.ChannelID, writer.sequence)
+			} else {
+				s.log.Printf("UP channel=%s Messages SSE conversion error: %v", route.ChannelID, err)
+				writer.emitStreamError(upstreamStreamFailureMessage("Messages", err))
+			}
 		} else {
 			s.log.Printf("UP channel=%s Messages SSE finished after stop_reason without message_stop", route.ChannelID)
 		}
@@ -1176,10 +1183,13 @@ func (s *Server) streamChatSSE(w http.ResponseWriter, response *http.Response, r
 	if errors.Is(streamErr, errSSEStreamComplete) {
 		streamErr = nil
 	}
-	if streamErr == nil && !state.terminal && state.finishReason != "" {
+	if streamErr == nil && !state.terminal && state.finishReason != "" && !isClientStreamAbort(nil, writer.writeFailed, response) {
 		streamErr = state.finish()
 	}
-	if streamErr != nil {
+	aborted := isClientStreamAbort(streamErr, writer.writeFailed, response)
+	if aborted {
+		s.log.Printf("UP channel=%s Chat Completions SSE aborted by client events=%d", route.ChannelID, writer.sequence)
+	} else if streamErr != nil {
 		s.log.Printf("UP channel=%s Chat Completions SSE conversion error: %v", route.ChannelID, streamErr)
 		writer.emitStreamError(upstreamStreamFailureMessage("Chat Completions", streamErr))
 	} else if !state.terminal {
@@ -1225,12 +1235,22 @@ func (s *Server) streamNativeSSE(w http.ResponseWriter, response *http.Response,
 		messagesThought = newMessagesThoughtRectifier()
 	}
 	evidence := newSearchEvidence()
+	clientWriteFailed := false
 	writeHeartbeat := func() error {
 		_, err := io.WriteString(w, ": keepalive\n\n")
-		if err == nil {
-			flusher.Flush()
+		if err != nil {
+			clientWriteFailed = true
+			return err
 		}
-		return err
+		flusher.Flush()
+		return nil
+	}
+	writeNativeFrame := func(lines []string, payload []byte) error {
+		if err := writeSSEPayloadFrame(w, flusher, lines, payload); err != nil {
+			clientWriteFailed = true
+			return err
+		}
+		return nil
 	}
 	writeChatFrames := func(out []map[string]any, lines []string, notes []string) error {
 		if len(notes) > 0 {
@@ -1249,7 +1269,7 @@ func (s *Server) streamNativeSSE(w http.ResponseWriter, response *http.Response,
 			if err := validateNativeSSEFrame(request.Protocol, frame); err != nil {
 				return err
 			}
-			if err := writeSSEPayloadFrame(w, flusher, lines, encoded); err != nil {
+			if err := writeNativeFrame(lines, encoded); err != nil {
 				return err
 			}
 			frames++
@@ -1276,7 +1296,7 @@ func (s *Server) streamNativeSSE(w http.ResponseWriter, response *http.Response,
 					return err
 				}
 			}
-			if err := writeSSEPayloadFrame(w, flusher, lines, []byte("[DONE]")); err != nil {
+			if err := writeNativeFrame(lines, []byte("[DONE]")); err != nil {
 				return err
 			}
 			frames++
@@ -1337,7 +1357,7 @@ func (s *Server) streamNativeSSE(w http.ResponseWriter, response *http.Response,
 		if err := validateNativeSSEFrame(request.Protocol, root); err != nil {
 			return err
 		}
-		if err := writeSSEPayloadFrame(w, flusher, lines, encoded); err != nil {
+		if err := writeNativeFrame(lines, encoded); err != nil {
 			return err
 		}
 		frames++
@@ -1363,13 +1383,20 @@ func (s *Server) streamNativeSSE(w http.ResponseWriter, response *http.Response,
 			streamErr = err
 		}
 	}
-	if streamErr != nil {
+	aborted := isClientStreamAbort(streamErr, clientWriteFailed, response)
+	if aborted {
+		s.log.Printf("UP channel=%s %s SSE aborted by client frames=%d", route.ChannelID, protocolLabel(request.Protocol), frames)
+	} else if streamErr != nil {
 		s.log.Printf("UP channel=%s %s SSE read error: %v", route.ChannelID, protocolLabel(request.Protocol), streamErr)
 		writeNativeStreamError(w, flusher, request.Protocol, upstreamStreamFailureMessage(protocolLabel(request.Protocol), streamErr))
 	} else if !terminal && protocolTerminal {
 		if err := synthesizeNativeStreamTerminal(w, flusher, request.Protocol); err != nil {
-			s.log.Printf("UP channel=%s %s SSE failed to synthesize terminal: %v", route.ChannelID, protocolLabel(request.Protocol), err)
-			writeNativeStreamError(w, flusher, request.Protocol, "upstream "+protocolLabel(request.Protocol)+" stream ended without a terminal event")
+			if isClientStreamAbort(err, true, response) {
+				s.log.Printf("UP channel=%s %s SSE aborted by client frames=%d", route.ChannelID, protocolLabel(request.Protocol), frames)
+			} else {
+				s.log.Printf("UP channel=%s %s SSE failed to synthesize terminal: %v", route.ChannelID, protocolLabel(request.Protocol), err)
+				writeNativeStreamError(w, flusher, request.Protocol, "upstream "+protocolLabel(request.Protocol)+" stream ended without a terminal event")
+			}
 		} else {
 			frames++
 			terminal = true
