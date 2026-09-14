@@ -205,6 +205,28 @@ func TestResponsesEnvelopeBookkeepingSynthesized(t *testing.T) {
 	}
 }
 
+func TestAssembleResponsesStreamTerminal(t *testing.T) {
+	if _, _, ok := assembleResponsesStreamTerminal(map[string]any{
+		"id": "resp_1", "object": "response", "status": "in_progress", "output": []any{},
+	}, nil, ""); ok {
+		t.Fatal("in-progress snapshot with no output must not look terminal")
+	}
+	eventType, body, ok := assembleResponsesStreamTerminal(map[string]any{
+		"id": "resp_1", "object": "response", "status": "in_progress", "output": []any{},
+	}, map[int]map[string]any{
+		0: {"type": "message", "id": "msg_1", "status": "completed", "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": "ok"}}},
+	}, "")
+	if !ok || eventType != "response.completed" || body["status"] != "completed" {
+		t.Fatalf("output items should complete the stream: ok=%t type=%s body=%#v", ok, eventType, body)
+	}
+	eventType, body, ok = assembleResponsesStreamTerminal(map[string]any{
+		"id": "resp_1", "object": "response", "status": "completed", "output": []any{},
+	}, nil, "")
+	if !ok || eventType != "response.completed" {
+		t.Fatalf("explicit completed status should be terminal: ok=%t type=%s body=%#v", ok, eventType, body)
+	}
+}
+
 // A relay reusing one tool_call ID across calls in a non-streaming Chat
 // response is the same repairable defect the streaming rectifier tolerates:
 // remap, do not reject.

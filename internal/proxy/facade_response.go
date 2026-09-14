@@ -424,6 +424,64 @@ func validateResponsesEnvelope(root map[string]any) error {
 	return nil
 }
 
+// assembleResponsesStreamTerminal builds a protocol terminal event for a
+// Responses stream that closed after producing output (or a snapshot already
+// marked completed/failed/incomplete) but omitted response.completed.
+// Relays do this; Grok Build itself will not complete without that event.
+func assembleResponsesStreamTerminal(lastResponse map[string]any, items map[int]map[string]any, streamedText string) (string, map[string]any, bool) {
+	snapshotOutput := anySlice(lastResponse["output"])
+	hasItems := len(items) > 0
+	hasText := strings.TrimSpace(streamedText) != ""
+	hasSnapshotOutput := len(snapshotOutput) > 0
+	status := ""
+	if lastResponse != nil {
+		status = stringValue(lastResponse["status"])
+	}
+	terminalStatus := status == "completed" || status == "failed" || status == "incomplete"
+	if !hasItems && !hasText && !hasSnapshotOutput && !terminalStatus {
+		return "", nil, false
+	}
+	body := cloneMap(lastResponse)
+	if body == nil {
+		body = map[string]any{}
+	}
+	if stringValue(body["id"]) == "" {
+		body["id"] = compatID("resp")
+	}
+	if stringValue(body["object"]) == "" {
+		body["object"] = "response"
+	}
+	output := snapshotOutput
+	if len(output) == 0 && hasItems {
+		indexes := make([]int, 0, len(items))
+		for index := range items {
+			indexes = append(indexes, index)
+		}
+		sort.Ints(indexes)
+		output = make([]any, 0, len(indexes))
+		for _, index := range indexes {
+			output = append(output, cloneMap(items[index]))
+		}
+	}
+	if len(output) == 0 && hasText {
+		output = []any{messageItem(streamedText, nil)}
+	}
+	if output == nil {
+		output = []any{}
+	}
+	body["output"] = output
+	eventType := "response.completed"
+	switch status {
+	case "failed":
+		eventType = "response.failed"
+	case "incomplete":
+		eventType = "response.incomplete"
+	default:
+		body["status"] = "completed"
+	}
+	return eventType, body, true
+}
+
 func validateMessagesEnvelope(root map[string]any) error {
 	return validateMessagesEnvelopeWith(root, validateMessagesContentBlock)
 }
@@ -955,6 +1013,9 @@ func normalizeNativeChatRequiredFields(
 			}
 			normalizeChatFinishReason(choice)
 			if stream {
+				if value, present := choice["delta"]; !present || value == nil {
+					choice["delta"] = map[string]any{}
+				}
 				continue
 			}
 			message, _ := choice["message"].(map[string]any)

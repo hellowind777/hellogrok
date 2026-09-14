@@ -4,6 +4,12 @@ All notable changes to this project are documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.33] — 2026-09-14
+
+### Fixed
+
+- Streaming terminal detection is protocol-generic and does not key off a channel, provider, or model name. A relay that produces a protocol stop signal (Chat `finish_reason`, Messages `stop_reason` / `message_stop`, Responses snapshot `status` completed/failed/incomplete or collected output items) then closes without the wire trailer Grok Build wants (`[DONE]`, `message_stop`, `response.completed`) is completed in-place: hellogrok synthesizes the missing trailer instead of injecting `proxy_stream_error`. That false error previously made Grok Build retry an already-finished turn up to 15 times and surface `Server error: Something went wrong on our side`. Chat finish chunks that omit `delta` get an empty object so the decoder accepts them. Truly truncated streams (no stop signal and no output items), idle timeouts, and read failures still emit `proxy_stream_error`.
+
 ## [0.1.32] — 2026-09-14
 
 ### Changed

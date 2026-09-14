@@ -1177,6 +1177,152 @@ func TestTruncatedNativeStreamsEmitProtocolNativeErrors(t *testing.T) {
 	}
 }
 
+func TestNativeChatFinishReasonWithoutDoneIsComplete(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w,
+			`data: {"id":"chat_1","object":"chat.completion.chunk","model":"wire","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"plan"},"finish_reason":null}]}`+"\n\n"+
+				`data: {"id":"chat_1","object":"chat.completion.chunk","model":"wire","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":null}]}`+"\n\n"+
+				`data: {"id":"chat_1","object":"chat.completion.chunk","model":"wire","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":17,"completion_tokens":8,"total_tokens":25}}`+"\n\n")
+	}))
+	defer upstream.Close()
+
+	route := facadeRoute("chat-omit-done", "chat_completions", "wire", "key", upstream.URL)
+	s := New(log.New(io.Discard, "", 0))
+	s.SetRoutes([]config.Route{route})
+	startPathTestServer(t, s)
+	data, status := postFacade(t, s, route.ChannelID, nativeRequestBody("chat_completions", true), "")
+	if status != http.StatusOK {
+		t.Fatalf("status=%d body=%s", status, data)
+	}
+	if bytes.Contains(data, []byte("proxy_stream_error")) {
+		t.Fatalf("finish_reason without [DONE] must not become a stream error: %s", data)
+	}
+	if !bytes.Contains(data, []byte(`"finish_reason":"stop"`)) || !bytes.Contains(data, []byte("data: [DONE]")) {
+		t.Fatalf("missing finish_reason or synthesized [DONE]: %s", data)
+	}
+	if !bytes.Contains(data, []byte(`"reasoning_content":"plan"`)) || !bytes.Contains(data, []byte(`"content":"ok"`)) {
+		t.Fatalf("content was dropped: %s", data)
+	}
+	if !bytes.Contains(data, []byte(`"prompt_tokens":17`)) {
+		t.Fatalf("usage chunk after finish_reason was dropped: %s", data)
+	}
+}
+
+func TestNativeChatFinishReasonWithoutDeltaIsComplete(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w,
+			`data: {"id":"chat_1","object":"chat.completion.chunk","model":"wire","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":null}]}`+"\n\n"+
+				`data: {"id":"chat_1","object":"chat.completion.chunk","model":"wire","choices":[{"index":0,"finish_reason":"stop"}]}`+"\n\n")
+	}))
+	defer upstream.Close()
+
+	route := facadeRoute("chat-finish-no-delta", "chat_completions", "wire", "key", upstream.URL)
+	s := New(log.New(io.Discard, "", 0))
+	s.SetRoutes([]config.Route{route})
+	startPathTestServer(t, s)
+	data, status := postFacade(t, s, route.ChannelID, nativeRequestBody("chat_completions", true), "")
+	if status != http.StatusOK || bytes.Contains(data, []byte("proxy_stream_error")) {
+		t.Fatalf("status=%d body=%s", status, data)
+	}
+	if !bytes.Contains(data, []byte(`"finish_reason":"stop"`)) || !bytes.Contains(data, []byte("data: [DONE]")) {
+		t.Fatalf("missing finish_reason or synthesized [DONE]: %s", data)
+	}
+}
+
+func TestNativeMessagesStopReasonWithoutMessageStopIsComplete(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w,
+			`data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"wire","usage":{"input_tokens":1,"output_tokens":0}}}`+"\n\n"+
+				`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`+"\n\n"+
+				`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}`+"\n\n"+
+				`data: {"type":"content_block_stop","index":0}`+"\n\n"+
+				`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}`+"\n\n")
+	}))
+	defer upstream.Close()
+
+	route := facadeRoute("messages-omit-stop", "messages", "wire", "key", upstream.URL)
+	s := New(log.New(io.Discard, "", 0))
+	s.SetRoutes([]config.Route{route})
+	startPathTestServer(t, s)
+	data, status := postFacade(t, s, route.ChannelID, nativeRequestBody("messages", true), "")
+	if status != http.StatusOK || bytes.Contains(data, []byte("proxy_stream_error")) {
+		t.Fatalf("status=%d body=%s", status, data)
+	}
+	if !bytes.Contains(data, []byte(`"type":"message_stop"`)) || !bytes.Contains(data, []byte(`"stop_reason":"end_turn"`)) {
+		t.Fatalf("missing synthesized message_stop or stop_reason: %s", data)
+	}
+}
+
+func TestTranslatedMessagesStopReasonWithoutMessageStopIsComplete(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w,
+			`data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"wire","usage":{"input_tokens":1,"output_tokens":0}}}`+"\n\n"+
+				`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`+"\n\n"+
+				`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}`+"\n\n"+
+				`data: {"type":"content_block_stop","index":0}`+"\n\n"+
+				`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}`+"\n\n")
+	}))
+	defer upstream.Close()
+
+	route := facadeRoute("messages-translate-omit-stop", "messages", "wire", "key", upstream.URL)
+	route.SupportsBackendSearch = true
+	s := New(log.New(io.Discard, "", 0))
+	s.SetRoutes([]config.Route{route})
+	startPathTestServer(t, s)
+	data, status := postFacade(t, s, route.ChannelID, nativeRequestBody("responses", true), "")
+	if status != http.StatusOK || bytes.Contains(data, []byte("proxy_stream_error")) {
+		t.Fatalf("status=%d body=%s", status, data)
+	}
+	if !bytes.Contains(data, []byte("response.completed")) {
+		t.Fatalf("translated Messages stream missing response.completed: %s", data)
+	}
+}
+
+func TestNativeResponsesOmitsCompletedIsComplete(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w,
+			`data: {"type":"response.created","response":{"id":"resp_1","object":"response","status":"in_progress","model":"wire","output":[]}}`+"\n\n"+
+				`data: {"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_1","status":"in_progress","role":"assistant","content":[]}}`+"\n\n"+
+				`data: {"type":"response.output_text.delta","item_id":"msg_1","output_index":0,"delta":"ok"}`+"\n\n"+
+				`data: {"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_1","status":"completed","role":"assistant","content":[{"type":"output_text","text":"ok"}]}}`+"\n\n")
+	}))
+	defer upstream.Close()
+
+	route := facadeRoute("responses-omit-completed", "responses", "wire", "key", upstream.URL)
+	s := New(log.New(io.Discard, "", 0))
+	s.SetRoutes([]config.Route{route})
+	startPathTestServer(t, s)
+	data, status := postFacade(t, s, route.ChannelID, nativeRequestBody("responses", true), "")
+	if status != http.StatusOK || bytes.Contains(data, []byte("proxy_stream_error")) {
+		t.Fatalf("status=%d body=%s", status, data)
+	}
+	if !bytes.Contains(data, []byte(`"type":"response.completed"`)) || !bytes.Contains(data, []byte(`"text":"ok"`)) {
+		t.Fatalf("missing synthesized response.completed: %s", data)
+	}
+}
+
+func TestNativeResponsesCreatedOnlyStillErrors(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, `data: {"type":"response.created","response":{"id":"resp_1","object":"response","status":"in_progress","model":"wire","output":[]}}`+"\n\n")
+	}))
+	defer upstream.Close()
+
+	route := facadeRoute("responses-created-only", "responses", "wire", "key", upstream.URL)
+	s := New(log.New(io.Discard, "", 0))
+	s.SetRoutes([]config.Route{route})
+	startPathTestServer(t, s)
+	data, status := postFacade(t, s, route.ChannelID, nativeRequestBody("responses", true), "")
+	if status != http.StatusOK || !bytes.Contains(data, []byte("proxy_stream_error")) {
+		t.Fatalf("created-only truncation must stay a stream error, status=%d body=%s", status, data)
+	}
+}
+
 func TestDeepSeekNativeChatResourceFailureIsRetryable(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

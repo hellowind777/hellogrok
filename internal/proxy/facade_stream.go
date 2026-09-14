@@ -743,6 +743,13 @@ func (s *Server) streamMessagesSSE(w http.ResponseWriter, response *http.Respons
 	if streamErr != nil {
 		s.log.Printf("UP channel=%s Messages SSE conversion error: %v", route.ChannelID, streamErr)
 		writer.emitStreamError(upstreamStreamFailureMessage("Messages", streamErr))
+	} else if !state.terminal && state.stopReason != "" {
+		if err := state.finish(); err != nil {
+			s.log.Printf("UP channel=%s Messages SSE conversion error: %v", route.ChannelID, err)
+			writer.emitStreamError(upstreamStreamFailureMessage("Messages", err))
+		} else {
+			s.log.Printf("UP channel=%s Messages SSE finished after stop_reason without message_stop", route.ChannelID)
+		}
 	} else if !state.terminal {
 		s.log.Printf("UP channel=%s Messages SSE ended without message_stop", route.ChannelID)
 		writer.emitStreamError("upstream Messages stream ended without message_stop")
@@ -1203,6 +1210,12 @@ func (s *Server) streamNativeSSE(w http.ResponseWriter, response *http.Response,
 	chatStreamID := compatID("chatcmpl")
 	chatCreatedAt := time.Now().Unix()
 	chatRectifier := (*chatToolRectifier)(nil)
+	// Chat Completions terminal is finish_reason; Messages terminal is
+	// message_stop or a message_delta stop_reason. Relays often close after
+	// those without [DONE]/message_stop; Grok Build itself treats a closed
+	// stream as complete. Injecting proxy_stream_error here makes Grok
+	// Build retry the already-finished turn 15 times as a generic Server error.
+	protocolTerminal := false
 	if request.Protocol == wireChatCompletions {
 		chatRectifier = newChatToolRectifier(request.AdvertisedTools, request.ClientSearchAlias)
 	}
@@ -1240,6 +1253,9 @@ func (s *Server) streamNativeSSE(w http.ResponseWriter, response *http.Response,
 				return err
 			}
 			frames++
+			if isUpstreamTerminalFrame(request.Protocol, frame) {
+				protocolTerminal = true
+			}
 			if request.Protocol == wireChatCompletions && frame["error"] != nil {
 				terminal = true
 				return errSSEStreamComplete
@@ -1273,6 +1289,9 @@ func (s *Server) streamNativeSSE(w http.ResponseWriter, response *http.Response,
 		}
 		modelObserver.observe(root, false)
 		evidence.observeJSON(payload)
+		if isUpstreamTerminalFrame(request.Protocol, root) {
+			protocolTerminal = true
+		}
 		if deepSeekChatInsufficientSystemResource(root, route, request.Protocol) {
 			writeNativeChatStreamError(
 				w,
@@ -1347,6 +1366,15 @@ func (s *Server) streamNativeSSE(w http.ResponseWriter, response *http.Response,
 	if streamErr != nil {
 		s.log.Printf("UP channel=%s %s SSE read error: %v", route.ChannelID, protocolLabel(request.Protocol), streamErr)
 		writeNativeStreamError(w, flusher, request.Protocol, upstreamStreamFailureMessage(protocolLabel(request.Protocol), streamErr))
+	} else if !terminal && protocolTerminal {
+		if err := synthesizeNativeStreamTerminal(w, flusher, request.Protocol); err != nil {
+			s.log.Printf("UP channel=%s %s SSE failed to synthesize terminal: %v", route.ChannelID, protocolLabel(request.Protocol), err)
+			writeNativeStreamError(w, flusher, request.Protocol, "upstream "+protocolLabel(request.Protocol)+" stream ended without a terminal event")
+		} else {
+			frames++
+			terminal = true
+			s.log.Printf("UP channel=%s %s SSE synthesized terminal after clean close", route.ChannelID, protocolLabel(request.Protocol))
+		}
 	} else if !terminal {
 		s.log.Printf("UP channel=%s %s SSE ended without a terminal event", route.ChannelID, protocolLabel(request.Protocol))
 		writeNativeStreamError(w, flusher, request.Protocol, "upstream "+protocolLabel(request.Protocol)+" stream ended without a terminal event")
@@ -1502,6 +1530,21 @@ func writeSSEPayloadFrame(w io.Writer, flusher http.Flusher, lines []string, pay
 	}
 	flusher.Flush()
 	return nil
+}
+
+func synthesizeNativeStreamTerminal(w io.Writer, flusher http.Flusher, protocol wireProtocol) error {
+	switch protocol {
+	case wireChatCompletions:
+		return writeSSEPayloadFrame(w, flusher, nil, []byte("[DONE]"))
+	case wireMessages:
+		payload, err := json.Marshal(map[string]any{"type": "message_stop"})
+		if err != nil {
+			return err
+		}
+		return writeSSEPayloadFrame(w, flusher, nil, payload)
+	default:
+		return fmt.Errorf("no native terminal to synthesize for %s", protocolLabel(protocol))
+	}
 }
 
 func writeNativeStreamError(w io.Writer, flusher http.Flusher, protocol wireProtocol, message string) {

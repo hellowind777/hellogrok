@@ -510,6 +510,8 @@ func (s *Server) streamResponsesSSE(w http.ResponseWriter, response *http.Respon
 	var deferredSearchDone []deferredFrame
 	var streamedText strings.Builder
 	var streamedURLs []string
+	var lastResponse map[string]any
+	outputItems := map[int]map[string]any{}
 	itemIDs := responseIDs{}
 	responsesThought := newResponsesThoughtRectifier()
 
@@ -614,6 +616,14 @@ func (s *Server) streamResponsesSSE(w http.ResponseWriter, response *http.Respon
 		if !responsesThought.keep(event) {
 			return nil
 		}
+		if responseBody, _ := event["response"].(map[string]any); responseBody != nil {
+			lastResponse = cloneMap(responseBody)
+		}
+		if item, _ := event["item"].(map[string]any); item != nil {
+			if _, present, valid := optionalCanonicalToken(event, "output_index"); present && valid {
+				outputItems[numberInt(event["output_index"])] = cloneMap(item)
+			}
+		}
 		s.captureReasoningProvenance(route, event)
 		streamedURLs = mergeUniqueStrings(streamedURLs, urlsFromJSON(event)...)
 		switch stringValue(event["type"]) {
@@ -695,20 +705,52 @@ func (s *Server) streamResponsesSSE(w http.ResponseWriter, response *http.Respon
 	}
 	if streamErr != nil {
 		s.log.Printf("UP channel=%s SSE read error: %v", channel, streamErr)
-		if !clientWriteFailed {
-			writeResponsesStreamError(w, flusher, events, upstreamStreamFailureMessage("Responses", streamErr))
-		}
 	}
 	if itemIDs.remapped > 0 {
 		s.log.Printf("UP channel=%s remapped %d duplicate upstream item id(s) to keep the stream alive", channel, itemIDs.remapped)
 	}
 	noteUnknownReasoningEvents(s.log.Printf, channel, responsesThought)
-	s.log.Printf("UP channel=%s SSE done events=%d heartbeats=%d terminal=%s %s", channel, events, heartbeats, terminal, time.Since(started).Round(time.Millisecond))
 	s.logSearchEvidence(channel, request, evidence)
+	if terminal == "" && streamErr == nil {
+		if eventType, body, ok := assembleResponsesStreamTerminal(lastResponse, outputItems, streamedText.String()); ok {
+			if body != nil {
+				backfillResponseSearchSources(body, request.HostedWebSearch, request.SearchQuery)
+				sanitizeArkCitationAnnotations(body)
+				streamedURLs = mergeUniqueStrings(streamedURLs, urlsFromText(streamedText.String())...)
+				mergeResponseSearchURLs(body, streamedURLs)
+			}
+			for index, deferred := range deferredSearchDone {
+				item, _ := deferred.event["item"].(map[string]any)
+				if replacement := findOutputItem(body, stringValue(item["id"])); replacement != nil {
+					deferred.event["item"] = cloneMap(replacement)
+				} else if index == len(deferredSearchDone)-1 {
+					mergeWebSearchSources(item, urlsToSources(streamedURLs))
+				}
+				if err := writeJSONFrame(deferred.lines, deferred.event); err != nil {
+					streamErr = err
+					break
+				}
+			}
+			deferredSearchDone = nil
+			if streamErr == nil {
+				if err := writeJSONFrame([]string{"data:"}, map[string]any{"type": eventType, "response": body}); err != nil {
+					streamErr = err
+				} else {
+					terminal = eventType
+					s.log.Printf("UP channel=%s Responses SSE synthesized %s after clean close without a terminal event", channel, eventType)
+				}
+			}
+		}
+	}
+	s.log.Printf("UP channel=%s SSE done events=%d heartbeats=%d terminal=%s %s", channel, events, heartbeats, terminal, time.Since(started).Round(time.Millisecond))
 	if terminal == "" {
 		s.log.Printf("UP channel=%s SSE ended without a Responses terminal event", channel)
-		if streamErr == nil {
-			writeResponsesStreamError(w, flusher, events, "upstream Responses stream ended without a terminal event")
+		if !clientWriteFailed {
+			message := "upstream Responses stream ended without a terminal event"
+			if streamErr != nil {
+				message = upstreamStreamFailureMessage("Responses", streamErr)
+			}
+			writeResponsesStreamError(w, flusher, events, message)
 		}
 	}
 }

@@ -6,7 +6,7 @@
 
 跨平台 Grok Build 本地代理，让自定义模型渠道兼容常见 API 格式、Build 原生 Web 工具、独立鉴权和自动配置恢复。
 
-[![Version](https://img.shields.io/badge/version-0.1.32-2f6feb.svg)](./internal/appinfo/appinfo.go)
+[![Version](https://img.shields.io/badge/version-0.1.33-2f6feb.svg)](./internal/appinfo/appinfo.go)
 [![Go](https://img.shields.io/badge/Go-1.26.6-00ADD8.svg)](./go.mod)
 [![CI](https://github.com/hellowind777/hellogrok/actions/workflows/ci.yml/badge.svg)](https://github.com/hellowind777/hellogrok/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
@@ -62,7 +62,7 @@ hellogrok 为这些自定义渠道提供统一的本地兼容层。运行时准�
 - 当 `supports_backend_search = false` 时，Grok Build 保持使用配置的原生消费者，其客户端 `web_search` 依次使用 `[models].web_search`、`GROK_WEB_SEARCH_MODEL` 或已登录官方账号的回退路径。字段缺省时对所有供应商（包括 DeepSeek）一律保留 Grok Build 模型目录行为：DeepSeek 已下线其 hosted 搜索（Responses API 现在忽略 `web_search` 工具），缺省因此改用客户端搜索。显式 false 关闭该能力，除非该自定义渠道被选为默认搜索模型；显式 true 仍按声明尊重。
 - 提供渠道隔离的 `/responses`、`/messages` 和 `/chat/completions` 路由，并在代理停止时逐字节恢复原始 `api_backend`。
 - 转发前校验各协议的工具历史：Responses 调用必须有匹配的 `function_call_output`，Messages 的 `tool_use` 必须由紧邻的下一条 user 消息中的 `tool_result` 完整配对，Chat 工具调用必须有匹配的 tool 消息。确定性错误返回不可重试的 `400`，不会进入 Grok Build 重试循环。
-- 在私有 `keepalive`、`keep-alive`、`keep_alive`、`heartbeat`、`ping` 帧到达 Grok Build 前将其转换为标准 SSE 注释，不占用 Responses 事件序号；收到各协议的终止事件后立即关闭上游流。
+- 在私有 `keepalive`、`keep-alive`、`keep_alive`、`heartbeat`、`ping` 帧到达 Grok Build 前将其转换为标准 SSE 注释，不占用 Responses 事件序号；收到各协议的终止事件后立即关闭上游流。终态判定按协议、不按渠道或模型：Chat Completions 看 `finish_reason`，Messages 看 `stop_reason`/`message_stop`，Responses 看 `status` completed/failed/incomplete 或已收集的 output item。中转随后省略 `[DONE]`、`message_stop` 或 `response.completed` 并干净关闭时，代理会补发对应终态帧，而不是写成会让 Grok Build 把已完成轮次重试 15 次的 `proxy_stream_error`。
 - 普通渠道的上游响应头等待及所有响应正文的两次读取间隔最多为 601 秒，比 Grok Build shell 默认的 600 秒多一秒；`api.deepseek.com` 官方路由使用 660 秒，以覆盖服务商记录的最长十分钟排队。请求没有总时限，非流式排队空行或规范化心跳等任意上游字节都会刷新空闲时限。
 - 在 Grok Build 看到之前吸收上游瞬态软故障。上游响应头尚未发出时，可重试失败（busy/过载 `503`、`429`、可重试 `5xx` 或响应头超时）会在代理内以指数退避（2s 至 30s，尊重上游 `Retry-After`，上限 60s）自动重试，默认最多等待 90 秒。上游返回的 `408` 在服务器之间不可能是 RFC 语义的"客户端超时"，一律视为边缘/网关超时页（等价 `504`）：同样进入吸收窗口，窗口耗尽后改写为可重试的 `504` 透传，而不是触发 Grok Build 对 408 的终局判定。Cloudflare 源站 TLS 失败（`525`、`526`）也按同样方式吸收，尽管 Grok Build 把它们归为终止类：中转源站重启或证书轮换通常会在窗口内恢复，而在边缘与源站 TLS 握手阶段失败的请求根本没有到达源站应用，重放没有副作用；窗口耗尽后按 Grok Build 预期的终止判定透传。窗口期内 Grok Build 自己的 15 次重试预算完全不动：只有窗口耗尽后客户端才会看到失败，且该失败仍以可重试形式透传，客户端原生预算分毫不少。传输错误不做吸收，因为 Grok Build 首次重试时的 HTTP/1.1 客户端重建比代理内重放更擅长处理；响应头发送后的流式失败不受影响。`absorb_retry_max_secs = 0` 可按渠道关闭该窗口。
 - 对软故障永不缩短 Grok Build 的原生重试预算。只有重试必然无果的确定性错误（鉴权、权限、账单、额度、无效请求或模型）才收到 `X-Should-Retry: false`，让 Grok Build 直接显示供应商的真实解释，而不是用反复重试掩盖。默认透传判定与 Grok Build 的边缘客户端策略一致——除源站 TLS 两个状态码外，`429` 和所有 `5xx` 都可重试——因此瞬态 Cloudflare 边缘页（`520`–`524`、`529`、`530`）不会因代理加盖的请求头而失去客户端原生重试。可重试的 busy/过载 `503` 透传时若上游未带 `Retry-After`，代理会补充 30 秒的 `Retry-After`，让 Grok Build 的重试节奏更合理。
@@ -548,7 +548,7 @@ Chat 或 Messages 响应中缺失的 ID 会在交给 Grok Build 前补齐；Resp
 
 ### 出现 `unknown variant keepalive` 或持续 `Waiting for response...`
 
-请把两个 hellogrok 可执行文件升级到相同的当前发布版或构建版，然后重启代理。部分中转会向 SSE 流注入私有 `keepalive`、`keep-alive`、`keep_alive`、`heartbeat` 或 `ping` 事件；Grok Build 严格的 Responses 反序列化器会拒绝这些 JSON 事件，即使上游仍在生成。hellogrok 会从 SSE `event:` 字段、JSON `type`/`event` 字段、裸数据载荷以及空数据心跳帧中吸收这些名称，再输出标准的 `: keepalive` 注释。收到 Responses 完成事件、Messages `message_stop` 或 Chat Completions `[DONE]` 后，也会立即关闭上游请求，不再等待服务商套接字。
+请把两个 hellogrok 可执行文件升级到相同的当前发布版或构建版，然后重启代理。部分中转会向 SSE 流注入私有 `keepalive`、`keep-alive`、`keep_alive`、`heartbeat` 或 `ping` 事件；Grok Build 严格的 Responses 反序列化器会拒绝这些 JSON 事件，即使上游仍在生成。hellogrok 会从 SSE `event:` 字段、JSON `type`/`event` 字段、裸数据载荷以及空数据心跳帧中吸收这些名称，再输出标准的 `: keepalive` 注释。收到 Responses 完成事件、Messages `message_stop` 或 Chat Completions `[DONE]` 后，也会立即关闭上游请求，不再等待服务商套接字。各协议在停止信号之后干净关闭但省略尾帧时（Chat Completions 的 `finish_reason`、Messages 的 `stop_reason`、Responses 的 output item 或已 completed 的 `status`），代理会补发对应的终态帧（`[DONE]`、`message_stop` 或 `response.completed`），不会改写成 `proxy_stream_error`。
 
 流结束日志会包含 `heartbeats=<数量>`。若仍出现同一错误且该计数始终为零，请用 `hellogrok routes` 确认 Grok Build 确实经过当前代理；此时服务商很可能使用了其他私有事件名，应根据不含凭据的流抓取结果诊断，而不是添加模型专用绕过逻辑。
 

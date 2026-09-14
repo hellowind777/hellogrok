@@ -121,6 +121,9 @@ func isUpstreamTerminalFrame(protocol wireProtocol, root map[string]any) bool {
 		switch stringValue(root["type"]) {
 		case "message_stop", "error":
 			return true
+		case "message_delta":
+			delta, _ := root["delta"].(map[string]any)
+			return strings.TrimSpace(stringValue(delta["stop_reason"])) != ""
 		}
 	case wireChatCompletions:
 		if root["error"] != nil {
