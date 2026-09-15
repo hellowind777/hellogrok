@@ -1234,6 +1234,14 @@ func (s *Server) streamNativeSSE(w http.ResponseWriter, response *http.Response,
 	if request.Protocol == wireMessages {
 		messagesThought = newMessagesThoughtRectifier()
 	}
+	messagesTool := (*messagesToolRectifier)(nil)
+	if request.Protocol == wireMessages {
+		messagesTool = newMessagesToolRectifier(request.AdvertisedTools)
+	}
+	responsesTool := (*responsesToolRectifier)(nil)
+	if request.Protocol == wireResponses {
+		responsesTool = newResponsesToolRectifier(request.AdvertisedTools)
+	}
 	evidence := newSearchEvidence()
 	clientWriteFailed := false
 	writeHeartbeat := func() error {
@@ -1253,8 +1261,19 @@ func (s *Server) streamNativeSSE(w http.ResponseWriter, response *http.Response,
 		return nil
 	}
 	writeChatFrames := func(out []map[string]any, lines []string, notes []string) error {
-		if len(notes) > 0 {
-			s.log.Printf("UP channel=%s tool identity adapted %s", route.ChannelID, strings.Join(notes, ","))
+		var adapted, late []string
+		for _, note := range notes {
+			if strings.HasPrefix(note, "late-tool-deltas-discarded") {
+				late = append(late, note)
+			} else {
+				adapted = append(adapted, note)
+			}
+		}
+		if len(adapted) > 0 {
+			s.log.Printf("UP channel=%s tool identity adapted %s", route.ChannelID, strings.Join(adapted, ","))
+		}
+		if len(late) > 0 {
+			s.log.Printf("UP channel=%s %s", route.ChannelID, strings.Join(late, ","))
 		}
 		for _, frame := range out {
 			if frame == nil {
@@ -1346,31 +1365,38 @@ func (s *Server) streamNativeSSE(w http.ResponseWriter, response *http.Response,
 			out, notes := chatRectifier.ingest(root)
 			return writeChatFrames(out, lines, notes)
 		}
-		if notes := adaptGrokBuildToolIdentity(root, request.Protocol, request.AdvertisedTools); len(notes) > 0 {
-			s.log.Printf("UP channel=%s tool identity adapted %s", route.ChannelID, strings.Join(notes, ","))
+		outFrames := []map[string]any{root}
+		if messagesTool != nil {
+			outFrames = messagesTool.ingest(root)
+		} else if responsesTool != nil {
+			outFrames = responsesTool.ingest(root)
 		}
-		s.captureReasoningProvenance(route, root)
-		encoded, err := json.Marshal(root)
-		if err != nil {
-			return err
-		}
-		if err := validateNativeSSEFrame(request.Protocol, root); err != nil {
-			return err
-		}
-		if err := writeNativeFrame(lines, encoded); err != nil {
-			return err
-		}
-		frames++
-		if request.Protocol == wireMessages {
-			typ := stringValue(root["type"])
-			if typ == "message_stop" || typ == "error" {
-				terminal = true
-				return errSSEStreamComplete
+		for _, frame := range outFrames {
+			if frame == nil {
+				continue
 			}
-		}
-		if request.Protocol == wireChatCompletions && root["error"] != nil {
-			terminal = true
-			return errSSEStreamComplete
+			if notes := adaptGrokBuildToolIdentity(frame, request.Protocol, request.AdvertisedTools); len(notes) > 0 {
+				s.log.Printf("UP channel=%s tool identity adapted %s", route.ChannelID, strings.Join(notes, ","))
+			}
+			s.captureReasoningProvenance(route, frame)
+			encoded, err := json.Marshal(frame)
+			if err != nil {
+				return err
+			}
+			if err := validateNativeSSEFrame(request.Protocol, frame); err != nil {
+				return err
+			}
+			if err := writeNativeFrame(lines, encoded); err != nil {
+				return err
+			}
+			frames++
+			if request.Protocol == wireMessages {
+				typ := stringValue(frame["type"])
+				if typ == "message_stop" || typ == "error" {
+					terminal = true
+					return errSSEStreamComplete
+				}
+			}
 		}
 		return nil
 	})

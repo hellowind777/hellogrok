@@ -1,24 +1,21 @@
-# 发布说明 — v0.1.34
+# 发布说明 — v0.1.35
 
-## 可重试的 Responses `response.failed` 事件现在会被吸收，而不是直接透传
+## 丢失首个流式增量的工具调用现在会被修复，而不是报错
 
-- **你看到的现象。** 中转在限流或并发压力下返回的 Responses SSE，其唯一终态是可重试的 `response.failed`（`rate_limit_exceeded`、`Concurrency limit exceeded`、过载）。此前 hellogrok 会立即把该失败透传给 Grok Build，本轮直接失败——而几秒后重试本可成功；重试还会为同一请求再开一条流。
-- **本次变更。** 在尚未向客户端写入任何内容时，这类“只有失败终态”的 SSE 现在进入吸收窗口：响应头和早期帧先缓冲（最多 32 帧），并按与 HTTP 软故障相同的指数退避与 `Retry-After` 规则在代理内重放。Grok Build 的重试预算分毫不动；只有窗口耗尽后才以可重试形式透传。`absorb_retry_max_secs = 0` 则直接透传该失败事件。确定性 `response.failed`（鉴权、无效请求或模型）仍直接透传，不重试。
-- **重试分类放宽。** 并发限制拒绝（`concurrency`、`concurrency limit` 及对应中文“并发限制/并发超限”）现在归为瞬态故障；嵌套在 `response.error` 下的错误信封与顶层 `error` 同等识别。
+- **你看到的现象。** 部分第三方中继会间歇性丢掉工具调用的第一个流式增量——携带 `function.name` 与参数开头 `{"` 的那一帧。Grok Build 随后以空工具名和缺开头的参数进行分发，报出 `Agent tried calling a tool that doesn't exist`，并把解析错误回喂给模型、消耗一轮重试（在经中继的 GLM 系渠道上反复出现）。
+- **本次变化。** hellogrok 在共享的工具兼容层修复这类损坏，覆盖三种上游协议（`chat_completions`、`messages`、`responses`）及流式与非流式：
+  - 参数缺开头时，补 `{"`（或 `{`）后若能解析为恰好一个完整 JSON 对象，则恢复前缀。
+  - 空名称按该请求已声明工具的参数键集合推断；`command`+`description` 这一同时匹配 `run_terminal_command` 与 `monitor` 的共享形状确定性地解析为 `run_terminal_command`。仍无法判定时保持不修复，不做猜测。
+  - 后续请求回放的已持久化历史（含 `/resume`）接受同样的修复，修复后的名称回填到对应 tool result 消息，损坏记录不再原样送达上游。
 
-## 客户端断开不再被记为流错误
+## 乱序与缺名工具块扣留到可解析为止
 
-- **你看到的现象。** 在流式传输中途关闭 Grok Build 会话，日志或迟到的读取者可能看到 `proxy_stream_error`，像是上游出了故障，而实际只是客户端已离开。
-- **本次变更。** Messages、Chat Completions、原生与 Responses 流现在区分客户端中止（客户端写入失败、请求上下文取消）与上游故障：中止只记录为 `aborted by client`，不产生流错误。上游真正截断的流仍会产生 `proxy_stream_error`。
+- **Chat Completions。** 工具帧改在流终止（`[DONE]`、流末或错误帧）发出，而非 `finish_reason` 时刻。Grok Build 的 chat 累加器读取整条流、不依赖 chunk 顺序，因此中继在 `finish_reason` 之后补发的参数片段会并入完整参数，而不是被静默丢弃留下尾部截断。持有中的行内推理仍在 `finish_reason` 时发出，思考与正文的可见延迟不变。
+- **Messages。** `tool_use` 块在 `content_block_start` 与 `content_block_stop` 之间扣留；累积的 input JSON 先解析名称（并修复前缀），再以"开始帧 + 单条完整 `input_json_delta` + stop"重发。未闭合块在 `message_stop`/`error` 时冲刷。
+- **Responses。** `function_call` 项在 `response.output_item.added` 与 `response.output_item.done` 之间扣留；done 帧的完整 item 同时作为名称与参数的第二来源，截断的流上参数让位于完整的终止 item。未闭合项在 `response.completed`/`incomplete`/`failed` 时冲刷。
 
-## 流形态不匹配现在明确报错
+## 诊断
 
-- 非流式请求收到 SSE 响应，或 Grok Build 固定的非流式 WebSearchClient 请求收到流式响应时，返回不可重试的 `502` 并说明不匹配原因，不再转发无法解码的正文。
-
-## 更安静、更安全的诊断日志
-
-- 上游 HTTP 错误与 Responses `response.failed`/`error` 事件按结构化摘要（`type`、`code`、`message`）记录；bearer 令牌、key 赋值和 `sk-` 值会被脱敏，超长消息会被截断。
-- 良性上游模型不一致按渠道/协议/配置模型/上游模型组合只记录一次；冲突与无效声明每次都记录。
-- 当 Grok Build 在非 xAI 自定义渠道上发送 `grok-4.6` 这类官方目录名时，代理会记录一条警告（含请求体大小、工具数量和会话状态），便于诊断 `/resume` 选路。官方 `api.x.ai` 路由与 `grok4.6-sevnx` 这类自定义 ID 不在警告范围内。
+- 提前 flush（错误终止）之后到达、因而被丢弃的工具调用增量，按调用索引记录为 `late-tool-deltas-discarded(index=N)`。中继在最后一个参数片段之前发出 `finish_reason` 的缺陷由此在代理日志中可见，而不是只表现为 Grok Build 的解析失败。
 
 升级后请重启两个 hellogrok 可执行文件。

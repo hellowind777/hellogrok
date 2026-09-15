@@ -4,6 +4,19 @@ All notable changes to this project are documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.35] — 2026-09-15
+
+### Added
+
+- Head-truncation repair for tool calls whose first stream delta was lost in transit: arguments missing their opening `{"` are restored when the prefixed payload parses as exactly one complete JSON object, and empty function names are inferred from the argument key set against the tools declared on the request (the shared `command`+`description` shape resolves deterministically to `run_terminal_command`; remaining ties stay unrepaired). Applied in the shared tool-compatibility layer across `chat_completions`, `messages`, and `responses`, streaming and non-streaming, and on persisted history replayed in later requests, with the repaired name backfilled onto the matching tool-result message.
+- Stream-terminal emission of Chat tool frames: the chat rectifier holds tool frames until `[DONE]`, stream end, or an error frame instead of flushing at `finish_reason`, so argument fragments a relay emits after `finish_reason` merge into complete arguments instead of being discarded tail-truncated. Held inline reasoning still flushes at `finish_reason`.
+- Hold rectifiers for name-less tool blocks: Messages `tool_use` blocks are held between `content_block_start` and `content_block_stop` and re-emitted as start (resolved name) + one complete `input_json_delta` + stop; Responses `function_call` items are held between `response.output_item.added` and `response.output_item.done`, with the done frame's complete item as a second source for name and arguments. Unclosed blocks and items flush at their protocol terminals.
+- `late-tool-deltas-discarded(index=N)` proxy log note for tool-call deltas discarded after an early flush, making relays that emit `finish_reason` before their last argument fragments diagnosable.
+
+### Fixed
+
+- Third-party relays that drop a tool call's first streamed delta no longer surface as `Agent tried calling a tool that doesn't exist` with head-truncated arguments; the damage is repaired before Grok Build dispatch, and broken records persisted in earlier turns are repaired on replay instead of reaching the upstream verbatim.
+
 ## [0.1.34] — 2026-09-14
 
 ### Added
@@ -467,7 +480,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - CC Switch compatibility detection and conflict warnings.
 - Builds for Windows, Linux, and macOS on amd64 and arm64.
 
-[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.34...HEAD
+[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.35...HEAD
+[0.1.35]: https://github.com/hellowind777/hellogrok/compare/v0.1.34...v0.1.35
 [0.1.34]: https://github.com/hellowind777/hellogrok/compare/v0.1.33...v0.1.34
 [0.1.33]: https://github.com/hellowind777/hellogrok/compare/v0.1.32...v0.1.33
 [0.1.32]: https://github.com/hellowind777/hellogrok/compare/v0.1.31...v0.1.32

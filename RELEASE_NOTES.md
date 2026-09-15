@@ -1,24 +1,21 @@
-# Release Notes — v0.1.34
+# Release Notes — v0.1.35
 
-## Retryable Responses `response.failed` events are now absorbed instead of streamed
+## Tool calls whose first stream delta was lost are repaired instead of failing
 
-- **What you saw.** A relay under rate-limit or concurrency pressure returned a Responses SSE whose only terminal was a retryable `response.failed` (`rate_limit_exceeded`, `Concurrency limit exceeded`, overload). hellogrok streamed that failure to Grok Build immediately, so the turn failed even though a retry seconds later would have succeeded — and the retry then opened a second stream for the same request.
-- **What changed.** While nothing has been written to the client, such a failed-only SSE is now withheld inside the absorb window (response headers and early frames stay buffered, up to 32 frames) and replayed with the same exponential backoff and `Retry-After` handling as HTTP soft failures. Grok Build keeps its full retry budget; only an exhausted window passes the failure through, still retryable. `absorb_retry_max_secs = 0` streams the failed event immediately. Deterministic `response.failed` events (authentication, invalid request/model) still stream through without retry.
-- **Retry classification widened.** Concurrency-limit rejections (`concurrency`, `concurrency limit`, plus the corresponding Chinese phrases) now classify as transient, and error envelopes nested under `response.error` are recognized the same as top-level `error` objects.
+- **What you saw.** Some third-party relays intermittently omit a tool call's first streamed delta — the frame carrying `function.name` and the opening `{"` of the arguments. Grok Build then dispatched an empty tool name with head-truncated arguments and reported `Agent tried calling a tool that doesn't exist`, feeding a parse error back into the model and burning a retry round (observed repeatedly on GLM-family channels through relays).
+- **What changed.** hellogrok now repairs that damage in its shared tool-compatibility layer, for all three upstream protocols (`chat_completions`, `messages`, `responses`), streaming and non-streaming alike:
+  - Arguments truncated at the head are restored when prefixing `{"` (or `{`) yields exactly one complete JSON object.
+  - Empty names are inferred from the argument key set against the tools declared on that request; the shared `command`+`description` shape, which matches both `run_terminal_command` and `monitor`, resolves deterministically to `run_terminal_command`. Anything still ambiguous is left unrepaired rather than guessed.
+  - Persisted history replayed in later requests (including `/resume`) receives the same repair, and the repaired name is backfilled onto the matching tool-result message, so broken records no longer reach the upstream verbatim.
 
-## Client disconnects no longer become stream errors
+## Out-of-order and name-less tool blocks are held until they can be resolved
 
-- **What you saw.** Closing a Grok Build session mid-stream could leave a `proxy_stream_error` in the log or on a late reader, suggesting an upstream failure that never happened.
-- **What changed.** Messages, Chat Completions, native, and Responses streams now distinguish a client abort (failed client write, canceled request context) from an upstream failure: aborts are logged as `aborted by client` and emit no stream error. Truly truncated upstream streams still emit `proxy_stream_error`.
+- **Chat Completions.** Tool frames are now emitted at the stream terminal (`[DONE]`, stream end, or error frame) instead of at `finish_reason`. Grok Build's chat accumulator reads the whole stream regardless of chunk order, so argument fragments a relay sends after `finish_reason` are merged into complete arguments instead of being silently dropped with tail-truncated parameters. Held inline reasoning still flushes at `finish_reason`, so visible latency of thought and text is unchanged.
+- **Messages.** `tool_use` blocks are held between `content_block_start` and `content_block_stop`; the accumulated input JSON resolves the name (and repairs its prefix) before the block is re-emitted as start + one complete `input_json_delta` + stop. Unclosed blocks flush at `message_stop`/`error`.
+- **Responses.** `function_call` items are held between `response.output_item.added` and `response.output_item.done`; the done frame's complete item additionally serves as a second source for name and arguments, so a truncated argument stream loses to a complete terminal item. Unclosed items flush at `response.completed`/`incomplete`/`failed`.
 
-## Strict errors for stream-shape mismatches
+## Diagnostics
 
-- An SSE response to a non-streaming request, or a streaming response to Grok Build's fixed non-streaming WebSearchClient request, now returns a non-retryable `502` naming the mismatch instead of forwarding an undecodable body.
-
-## Quieter, safer diagnostics
-
-- Upstream HTTP errors and Responses `response.failed`/`error` events are logged as structured summaries (`type`, `code`, `message`) with bearer tokens, key assignments, and `sk-` values redacted and long messages truncated.
-- Benign upstream-model mismatches log once per channel/protocol/configured/upstream pair; conflicts and invalid declarations always log.
-- When Grok Build sends an official catalog name such as `grok-4.6` on a non-xAI custom channel, the proxy logs a warning with body size, tool count, and session presence to aid `/resume` diagnosis. First-party `api.x.ai` routes and custom IDs such as `grok4.6-sevnx` are excluded.
+- Tool-call deltas that arrive after an early flush (error terminals) and are therefore discarded are logged per call index as `late-tool-deltas-discarded(index=N)`, making a relay that emits `finish_reason` before its last argument fragments visible in the proxy log instead of surfacing only as a Grok Build parse failure.
 
 Restart both hellogrok executables after upgrading.

@@ -6,7 +6,7 @@
 
 跨平台 Grok Build 本地代理，让自定义模型渠道兼容常见 API 格式、Build 原生 Web 工具、独立鉴权和自动配置恢复。
 
-[![Version](https://img.shields.io/badge/version-0.1.34-2f6feb.svg)](./internal/appinfo/appinfo.go)
+[![Version](https://img.shields.io/badge/version-0.1.35-2f6feb.svg)](./internal/appinfo/appinfo.go)
 [![Go](https://img.shields.io/badge/Go-1.26.6-00ADD8.svg)](./go.mod)
 [![CI](https://github.com/hellowind777/hellogrok/actions/workflows/ci.yml/badge.svg)](https://github.com/hellowind777/hellogrok/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
@@ -80,6 +80,7 @@ hellogrok 为这些自定义渠道提供统一的本地兼容层。运行时准�
 - 热切换模型时保留可移植的会话历史，只排除已知属于不同渠道、协议、线上模型或上游端点的加密推理。
 - 在原生 Chat 和 Messages 响应交给客户端前补齐缺失的本地工具调用 ID；Responses 流在不同事件间保持输出项和函数调用身份一致，上游把同一个 ID 复用到不同输出槽或 Chat 工具调用时，为冲突槽位改写一个保留类型前缀的新唯一 ID 而不是掐断流，同一槽位内的真实冲突仍然拒绝；Chat Completions 并行工具调用复用同一 `tool_call` ID 时，流式与非流式响应都同样唯一化处理；Chat JSON 转 SSE 时为并行工具调用分配独立索引。已有 Chat 历史仅在一个缺失调用 ID 能与唯一结果关联时修复，有歧义的历史仍会报错。
 - 在 Grok Build 的 last-write-wins 累加器看到原生 Chat 工具调用 SSE 之前先重组：后续空 `"name"` 不会抹掉已知名称，参数片段在 JSON 完整前不做改写。空的或厂商私有的 `finish_reason` 会删除或映射到 Grok Build 的 Chat 枚举（`stop`、`length`、`tool_calls`、`content_filter`、`function_call`）。
+- 修复首帧在传输中丢失的工具调用流。Chat、Messages 或 Responses 流到达时若函数名为空且参数缺开头 `{"`，hellogrok 会在补前缀后能解析为单一完整 JSON 对象时恢复前缀，按该请求已声明工具的参数键集合推断名称（`command`+`description` 共享形状确定性地解析为 `run_terminal_command`），同一修复覆盖非流式响应与后续请求回放的已持久化历史。Chat 工具帧保留到流终止才发出，中继在 `finish_reason` 之后补发的参数片段会被合并而非丢弃；Messages `tool_use` 块与 Responses `function_call` 项同样在开始帧与停止帧之间扣留，终止帧的完整 item 作为名称与参数的第二来源。提前 flush 之后仍被丢弃的片段记录为 `late-tool-deltas-discarded`。
 - 把 Grok Build 无法反序列化的 Chat 方言收成线格式：数组 `content`、`thinking`/`reasoning`/`reasoning_details`、Gemini `functionCall`，以及答案正文里的 `<think>`…`</think>`。推理只作为前缀兄弟转发；可见正文之后的思考会丢掉，避免 TUI 在回复下面再开一块 Thought。流式 `reasoning_content` 增量按原样拼接，不按帧裁掉 BPE 词首空格。
 - Chat 历史上，DeepSeek 和 MiMo 保留上一轮 `reasoning_content`（网关缺了会 400）。其他 Chat 渠道只在当前工具循环（最后一条 user 之后）保留模型自己的 CoT，跨轮明文思考会剥掉。加密或带签名的块不删除，也不会注入 `"tool call"` 占位符。
 - 流式 Chat 请求保留 Grok Build 的 `stream_options.include_usage=true`，让终止用量块驱动自动压缩。带工具的 GLM Chat 渠道在字段缺省时补上 `tool_stream=true`。
@@ -91,7 +92,7 @@ hellogrok 为这些自定义渠道提供统一的本地兼容层。运行时准�
 Grok Build 在本地执行文件、终端、grep、子代理、客户端 `web_search`、MCP（先 `search_tool` 再 `use_tool`）和 Skill。hellogrok 通过 Responses、Messages 和 Chat Completions 转发这些声明，包括中转后的 grok-4.5/4.6 渠道。第三方渠道不会收到 xAI 专属的 `x_search`；供应商 hosted 工具仍须由上游真实支持。
 
 - 发给上游的工具表只保留 Grok Build 的 `client_name`（`list_dir`、`read_file`、`run_terminal_command`、`spawn_subagent` 等）。Claude/Codex 别名（`LS`、`Read`、`Bash`、`Task`、`Grep`、`Write`、`ToolSearch` 等）只在回来的调用上改写，不会克隆进每轮 `tools`。
-- 入站调用会改写成已声明的 `client_name` 与参数键。Chat 顶层 `name`/`arguments`、旧版 `function_call`、对象形式参数、按参数形状回收的空名称，以及常见 XML/正文 JSON 调用，都会在 Grok Build 分发前规范化。
+- 入站调用会改写成已声明的 `client_name` 与参数键。Chat 顶层 `name`/`arguments`、旧版 `function_call`、对象形式参数、按参数形状回收的空名称（含丢失首个流式增量导致的截断参数），以及常见 XML/正文 JSON 调用，都会在 Grok Build 分发前规范化。
 - 直接 MCP 名（`server__tool`、`mcp__server__tool`）在声明了 `use_tool` 时会包成该元工具。Write 整文件写入会落到 `write` 或 `search_replace`。Glob 模式会落到 `glob`、`grep` 或 `rg --files`。缺失的必填 `description` 和 `subagent_type` 会补齐。
 - 中转 grok-4.5/4.6 发出的 Grok Build 原名原样通过。历史里的 tool 结果消息会补上对应 `name`，避免思考模型在下一轮拒绝请求。
 - hellogrok 不会凭空创造当前请求未声明的工具。模型若不发出 tool call，仍然不会执行工具。
@@ -526,7 +527,7 @@ Grok Build 对可重试状态码（429、5xx）最多重试 15 次，单轮最�
 
 ### Agent tried calling a tool that doesn't exist
 
-Grok Build 按精确 `client_name` 分发（是 `list_dir`，不是 `List`）。第三方或中转模型可能发出 Claude/Codex 名称、Chat 顶层 `name`、后续 SSE 帧上的空 `function.name`、正文里的 XML，或直接 MCP 名。当前 hellogrok 会重组 Chat 工具流，把这些调用改写成该请求已声明的工具，并补修历史里的 `name`。
+Grok Build 按精确 `client_name` 分发（是 `list_dir`，不是 `List`）。第三方或中转模型可能发出 Claude/Codex 名称、Chat 顶层 `name`、后续 SSE 帧上的空 `function.name`、正文里的 XML，或直接 MCP 名；中继也可能丢掉工具调用的第一个流式增量，留下空名称和缺开头 `{"` 的参数。当前 hellogrok 会重组 Chat 工具流、把 Messages `tool_use` 块与 Responses `function_call` 项扣留到停止帧、修复截断的参数前缀、按参数形状回收空名称，把这些调用改写成该请求已声明的工具，并在实时响应与回放历史上补修 `name`。
 
 升级后请重启两个 hellogrok 可执行文件，然后 **新开一轮会话**。旧对话里可能已经存下未映射的 `List` 或空名称；修好实时响应不会改写升级前写入的历史。若日志出现 `tool identity adapted List->list_dir`（或 `->use_tool`）而 TUI 仍提示工具不存在，说明模型调用了未声明的名称——hellogrok 不会凭空创造。
 

@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"fmt"
 	"sort"
 	"strings"
 )
@@ -19,6 +20,8 @@ type chatToolRectifier struct {
 	flushed     bool
 	thoughts    thoughtGate
 	thinks      inlineThinkState
+	late        []string
+	lateSeen    map[int]bool
 }
 
 type chatToolRectState struct {
@@ -42,7 +45,7 @@ func (r *chatToolRectifier) ingest(root map[string]any) ([]map[string]any, []str
 	}
 	if root["error"] != nil {
 		frames, notes := r.flush()
-		return append(frames, root), notes
+		return append(frames, root), r.drainLate(notes)
 	}
 	r.rememberEnvelope(root)
 	passthrough := cloneMap(root)
@@ -94,24 +97,28 @@ func (r *chatToolRectifier) ingest(root map[string]any) ([]map[string]any, []str
 	}
 	prefix := r.takeReasoningPrefix(passthrough)
 	if finish {
-		frames, notes := r.flush()
+		// Tool frames stay buffered until the stream terminal: Grok Build's
+		// chat accumulator reads the whole stream and ignores chunk order, so
+		// emitting them after the stop chunk keeps relays that send
+		// finish_reason before the last argument fragments lossless.
+		frames := r.flushThinks()
 		out := append([]map[string]any{}, prefix...)
 		out = append(out, frames...)
 		if chatChunkHasClientPayload(passthrough) {
 			out = append(out, passthrough)
 		}
-		return out, notes
+		return out, r.drainLate(nil)
 	}
 	if len(prefix) > 0 {
 		if chatChunkHasClientPayload(passthrough) {
-			return append(prefix, passthrough), nil
+			return append(prefix, passthrough), r.drainLate(nil)
 		}
-		return prefix, nil
+		return prefix, r.drainLate(nil)
 	}
 	if chatChunkHasClientPayload(passthrough) {
-		return []map[string]any{passthrough}, nil
+		return []map[string]any{passthrough}, r.drainLate(nil)
 	}
-	return nil, nil
+	return nil, r.drainLate(nil)
 }
 
 // takeReasoningPrefix makes native Chat Completions match Grok Build's
@@ -222,6 +229,34 @@ func (r *chatToolRectifier) observe(choiceIndex, position int, raw any) {
 	if fragment != "" {
 		state.args.WriteString(fragment)
 	}
+	if r.flushed && (strings.TrimSpace(state.name) != "" || state.args.Len() > 0) {
+		r.noteLateDiscard(index)
+	}
+}
+
+// noteLateDiscard records tool-call deltas that arrive after the rectifier
+// already flushed at finish_reason: a relay emitting the stop signal before
+// the last argument fragments loses them here, leaving the client with
+// tail-truncated arguments. The note makes that relay defect visible in the
+// proxy log instead of surfacing only as a Grok Build parse failure.
+func (r *chatToolRectifier) noteLateDiscard(index int) {
+	if r.lateSeen[index] {
+		return
+	}
+	if r.lateSeen == nil {
+		r.lateSeen = map[int]bool{}
+	}
+	r.lateSeen[index] = true
+	r.late = append(r.late, fmt.Sprintf("late-tool-deltas-discarded(index=%d)", index))
+}
+
+func (r *chatToolRectifier) drainLate(notes []string) []string {
+	if len(r.late) == 0 {
+		return notes
+	}
+	notes = append(notes, r.late...)
+	r.late = nil
+	return notes
 }
 
 func (r *chatToolRectifier) rememberEnvelope(root map[string]any) {
@@ -236,9 +271,12 @@ func (r *chatToolRectifier) rememberEnvelope(root map[string]any) {
 	r.envelope = envelope
 }
 
-func (r *chatToolRectifier) flush() ([]map[string]any, []string) {
+// flushThinks emits any held inline-think content without touching buffered
+// tool calls. It runs at finish_reason so held reasoning/text still precedes
+// the stop chunk, while tool frames wait for the stream terminal.
+func (r *chatToolRectifier) flushThinks() []map[string]any {
 	if r == nil {
-		return nil, nil
+		return nil
 	}
 	template := r.envelope
 	if template == nil {
@@ -254,6 +292,18 @@ func (r *chatToolRectifier) flush() ([]map[string]any, []string) {
 	if text != "" {
 		r.thoughts.noteText(text)
 		frames = append(frames, r.contentFrame(template, text))
+	}
+	return frames
+}
+
+func (r *chatToolRectifier) flush() ([]map[string]any, []string) {
+	if r == nil {
+		return nil, nil
+	}
+	frames := r.flushThinks()
+	template := r.envelope
+	if template == nil {
+		template = map[string]any{"object": "chat.completion.chunk"}
 	}
 	if r.flushed || len(r.tools) == 0 {
 		return frames, nil

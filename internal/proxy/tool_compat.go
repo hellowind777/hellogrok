@@ -269,10 +269,30 @@ func uniqueShapeMatch(args map[string]any, advertised []advertisedTool) *adverti
 		}
 	}
 	if len(matches) != 1 || best == 0 {
-		return nil
+		return shapeTieBreak(matches)
 	}
 	match := matches[0]
 	return &match
+}
+
+// shapeTieBreakPriority resolves shape matches that stay ambiguous because
+// several advertised tools share every emitted property: run_terminal_command
+// and monitor both accept exactly command+description, so a name-less call
+// with that key set never matches uniquely. One-shot shell commands are the
+// dominant real-world case, so they win the tie; anything else stays
+// unrepaired instead of being guessed.
+var shapeTieBreakPriority = []string{"run_terminal_command"}
+
+func shapeTieBreak(matches []advertisedTool) *advertisedTool {
+	for _, want := range shapeTieBreakPriority {
+		compact := compactToolName(want)
+		for i := range matches {
+			if compactToolName(matches[i].Name) == compact {
+				return &matches[i]
+			}
+		}
+	}
+	return nil
 }
 
 func parseToolArguments(value any) map[string]any {
@@ -489,6 +509,25 @@ func jsonObjectComplete(arguments string) bool {
 	return true
 }
 
+// repairToolArgumentsPrefix restores the leading `{"` (or `{`) that a relay
+// dropped from the first streamed arguments fragment. Relays that omit
+// function.name on tool-call deltas sometimes truncate the opening of the
+// arguments object as well; without the prefix the accumulated arguments are
+// not parseable JSON, so name inference and argument canonicalization cannot
+// run and Grok Build reports the call as NotFound.
+func repairToolArgumentsPrefix(args string) (string, bool) {
+	trimmed := strings.TrimSpace(args)
+	if trimmed == "" || strings.HasPrefix(trimmed, "{") || jsonObjectComplete(trimmed) {
+		return args, false
+	}
+	for _, prefix := range []string{`{"`, `{`} {
+		if candidate := prefix + trimmed; jsonObjectComplete(candidate) {
+			return candidate, true
+		}
+	}
+	return args, false
+}
+
 func canonicalizeToolArguments(toolName, arguments string, advertised []advertisedTool) (string, bool) {
 	if strings.TrimSpace(arguments) != "" && !jsonObjectComplete(arguments) {
 		return arguments, false
@@ -592,11 +631,15 @@ func canonicalizeToolArguments(toolName, arguments string, advertised []advertis
 
 func adaptResolvedCall(emitted, arguments string, advertised []advertisedTool) (string, string, []string) {
 	emitted = strings.TrimSpace(emitted)
-	name := resolveAdvertisedToolName(emitted, arguments, advertised)
 	args := arguments
 	var notes []string
+	if repaired, ok := repairToolArgumentsPrefix(args); ok {
+		args = repaired
+		notes = append(notes, "args-prefix-repaired")
+	}
+	name := resolveAdvertisedToolName(emitted, args, advertised)
 	if mcp := normalizeMCPToolName(emitted); mcp != "" && compactToolName(name) == "usetool" {
-		args = wrapMCPUseToolArgs(mcp, arguments)
+		args = wrapMCPUseToolArgs(mcp, args)
 		notes = append(notes, emitted+"->use_tool")
 	} else if name != "" && name != emitted {
 		notes = append(notes, emitted+"->"+name)

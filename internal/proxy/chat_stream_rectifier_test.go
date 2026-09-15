@@ -29,6 +29,8 @@ func TestChatRectifierEmptyNameDoesNotWipeGrokAccumulator(t *testing.T) {
 	ingest(chatToolChunk(0, "call_1", "run_terminal_command", "", nil))
 	ingest(chatToolChunk(0, "call_1", "", `{"command":"git status","description":"check git"}`, nil))
 	ingest(chatFinishChunk("tool_calls"))
+	frames, _ := rectifier.flush()
+	out = append(out, frames...)
 	acc := grokBuildAccumulateChatToolCalls(out)
 	got := acc[0]
 	if got.Name != "run_terminal_command" {
@@ -58,6 +60,9 @@ func TestChatRectifierDoesNotCanonIncompleteJSON(t *testing.T) {
 	}
 	frames, notes = rectifier.ingest(chatToolChunk(0, "", "", ` status"}`, "tool_calls"))
 	out = append(out, frames...)
+	flushed, flushNotes := rectifier.flush()
+	out = append(out, flushed...)
+	notes = append(notes, flushNotes...)
 	acc := grokBuildAccumulateChatToolCalls(out)
 	got := acc[0]
 	if got.Name != "run_terminal_command" {
@@ -82,6 +87,9 @@ func TestChatRectifierResolvesBashAliasOnce(t *testing.T) {
 	out = append(out, frames...)
 	frames, notes := rectifier.ingest(chatFinishChunk("tool_calls"))
 	out = append(out, frames...)
+	flushed, flushNotes := rectifier.flush()
+	out = append(out, flushed...)
+	notes = append(notes, flushNotes...)
 	acc := grokBuildAccumulateChatToolCalls(out)
 	got := acc[0]
 	if got.Name != "run_terminal_command" {
@@ -104,6 +112,8 @@ func TestChatRectifierDeduplicatesReusedCallIDs(t *testing.T) {
 		frames, _ := rectifier.ingest(chunk)
 		out = append(out, frames...)
 	}
+	flushed, _ := rectifier.flush()
+	out = append(out, flushed...)
 	var ids []string
 	for _, frame := range out {
 		for _, raw := range anySlice(anySlice(frame["choices"])[0].(map[string]any)["delta"].(map[string]any)["tool_calls"]) {
@@ -159,6 +169,8 @@ func TestChatRectifierParallelToolsKeepIndexes(t *testing.T) {
 	out = append(out, frames...)
 	frames, _ = rectifier.ingest(chatFinishChunk("tool_calls"))
 	out = append(out, frames...)
+	flushed, _ := rectifier.flush()
+	out = append(out, flushed...)
 	acc := grokBuildAccumulateChatToolCalls(out)
 	if acc[0].Name != "list_dir" || acc[1].Name != "list_dir" {
 		t.Fatalf("parallel names: %#v", acc)
@@ -252,7 +264,9 @@ func TestChatRectifierDropsEmptyFinishReasonOnContent(t *testing.T) {
 func TestChatRectifierToolFramesOmitFinishReason(t *testing.T) {
 	rectifier := newChatToolRectifier(grokBuildTools(), "")
 	_, _ = rectifier.ingest(chatToolChunk(0, "call_1", "run_terminal_command", `{"command":"pwd"}`, nil))
-	frames, _ := rectifier.ingest(chatFinishChunk("tool_calls"))
+	finishFrames, _ := rectifier.ingest(chatFinishChunk("tool_calls"))
+	frames, _ := rectifier.flush()
+	frames = append(finishFrames, frames...)
 	foundTool := false
 	for _, frame := range frames {
 		choice := frame["choices"].([]any)[0].(map[string]any)
@@ -502,4 +516,83 @@ func grokBuildAccumulateChatToolCalls(frames []map[string]any) map[int]struct{ I
 func mustJSON(value any) string {
 	data, _ := json.Marshal(value)
 	return string(data)
+}
+
+// Relays that drop the first tool-call delta leave the stream without a
+// function name and with arguments truncated by the leading `{"`; the
+// rectifier must repair both before Grok Build sees the call.
+func TestChatRectifierRepairsLostFirstToolDelta(t *testing.T) {
+	rectifier := newChatToolRectifier(shapeTieTools(), "")
+	var out []map[string]any
+	ingest := func(root map[string]any) {
+		frames, _ := rectifier.ingest(root)
+		out = append(out, frames...)
+	}
+	ingest(chatToolChunk(0, "call_lost", "", `command":"git status`, nil))
+	ingest(chatToolChunk(0, "call_lost", "", `","description":"check git"}`, nil))
+	ingest(chatFinishChunk("tool_calls"))
+	frames, _ := rectifier.flush()
+	out = append(out, frames...)
+	acc := grokBuildAccumulateChatToolCalls(out)
+	got := acc[0]
+	if got.Name != "run_terminal_command" {
+		t.Fatalf("name=%q frames=%s", got.Name, mustJSON(out))
+	}
+	if !jsonObjectComplete(got.Arguments) {
+		t.Fatalf("arguments not repaired: %q", got.Arguments)
+	}
+	obj := parseToolArguments(got.Arguments)
+	if stringArg(obj, "command") != "git status" || stringArg(obj, "description") != "check git" {
+		t.Fatalf("arguments lost fields: %#v", obj)
+	}
+}
+
+// A relay that emits finish_reason before the last argument fragments no
+// longer loses them: tool frames are held until the stream terminal, so the
+// late fragments merge into complete arguments.
+func TestChatRectifierRecoversDeltasAfterFinish(t *testing.T) {
+	rectifier := newChatToolRectifier(shapeTieTools(), "")
+	var out []map[string]any
+	var notes []string
+	collect := func(root map[string]any) {
+		frames, n := rectifier.ingest(root)
+		out = append(out, frames...)
+		notes = append(notes, n...)
+	}
+	collect(chatToolChunk(0, "call_late", "run_terminal_command", `{"command":"git sta`, nil))
+	collect(chatFinishChunk("tool_calls"))
+	collect(chatToolChunk(0, "call_late", "", `tus"}`, nil))
+	frames, n := rectifier.flush()
+	out = append(out, frames...)
+	notes = append(notes, n...)
+	if joined := strings.Join(notes, ","); strings.Contains(joined, "late-tool-deltas-discarded") {
+		t.Fatalf("recovered stream reported a discard: %v", notes)
+	}
+	acc := grokBuildAccumulateChatToolCalls(out)
+	if !jsonObjectComplete(acc[0].Arguments) {
+		t.Fatalf("late fragment not merged: %q", acc[0].Arguments)
+	}
+	obj := parseToolArguments(acc[0].Arguments)
+	if stringArg(obj, "command") != "git status" {
+		t.Fatalf("command lost: %#v", obj)
+	}
+}
+
+// The discard note still fires for any path that flushes tool frames early
+// (error terminals) and then observes more deltas: it is the safety net that
+// makes a relay emitting finish before arguments visible in the proxy log.
+func TestChatRectifierNotesLateDeltasAfterEarlyFlush(t *testing.T) {
+	rectifier := newChatToolRectifier(shapeTieTools(), "")
+	frames, _ := rectifier.ingest(chatToolChunk(0, "call_late", "run_terminal_command", `{"command":"git sta`, nil))
+	if len(frames) != 0 {
+		t.Fatalf("tool frame leaked before flush: %s", mustJSON(frames))
+	}
+	flushed, _ := rectifier.flush()
+	if len(flushed) == 0 {
+		t.Fatal("manual flush emitted no tool frames")
+	}
+	_, notes := rectifier.ingest(chatToolChunk(0, "call_late", "", `tus"}`, nil))
+	if joined := strings.Join(notes, ","); !strings.Contains(joined, "late-tool-deltas-discarded(index=0)") {
+		t.Fatalf("late discard not noted: %v", notes)
+	}
 }

@@ -437,3 +437,103 @@ func TestCanonicalFromChatLiftsAndResolves(t *testing.T) {
 		t.Fatalf("canonical chat name=%q output=%#v", found, result.Output)
 	}
 }
+
+// shapeTieTools mirrors the production ambiguity: run_terminal_command and
+// monitor advertise the same command+description properties, so a name-less
+// call with exactly that key set never matches uniquely by shape alone.
+func shapeTieTools() []advertisedTool {
+	return []advertisedTool{
+		{Name: "run_terminal_command", Props: map[string]struct{}{"command": {}, "description": {}, "timeout": {}, "background": {}}},
+		{Name: "monitor", Props: map[string]struct{}{"command": {}, "description": {}, "persistent": {}, "timeoutms": {}}},
+		{Name: "read_file", Props: map[string]struct{}{"targetfile": {}, "offset": {}, "limit": {}}},
+	}
+}
+
+func TestRepairToolArgumentsPrefix(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+		ok   bool
+	}{
+		{in: `command":"pwd","description":"list"}`, want: `{"command":"pwd","description":"list"}`, ok: true},
+		{in: `limit":30,"offset":1660,"target_file":"a.py"}`, want: `{"limit":30,"offset":1660,"target_file":"a.py"}`, ok: true},
+		{in: `command":"git stat`, want: `command":"git stat`, ok: false},
+		{in: `{"command":"pw`, want: `{"command":"pw`, ok: false},
+		{in: `{"command":"pwd"}`, want: `{"command":"pwd"}`, ok: false},
+		{in: ``, want: ``, ok: false},
+	}
+	for _, tc := range cases {
+		got, ok := repairToolArgumentsPrefix(tc.in)
+		if ok != tc.ok || got != tc.want {
+			t.Fatalf("repair(%q) = (%q, %t), want (%q, %t)", tc.in, got, ok, tc.want, tc.ok)
+		}
+	}
+}
+
+func TestResolveAdvertisedToolNameTieBreaksToTerminal(t *testing.T) {
+	got := resolveAdvertisedToolName("", `{"command":"pwd","description":"list"}`, shapeTieTools())
+	if got != "run_terminal_command" {
+		t.Fatalf("tie not broken: %q", got)
+	}
+	// A monitor-only key set still resolves to monitor by unique shape.
+	got = resolveAdvertisedToolName("", `{"command":"npm run dev","description":"dev server","persistent":true}`, shapeTieTools())
+	if got != "monitor" {
+		t.Fatalf("monitor shape lost: %q", got)
+	}
+}
+
+func TestAdaptResolvedCallRepairsTruncatedArguments(t *testing.T) {
+	name, args, notes := adaptResolvedCall("", `command":"pwd","description":"list"}`, shapeTieTools())
+	if name != "run_terminal_command" {
+		t.Fatalf("name=%q notes=%v", name, notes)
+	}
+	if !jsonObjectComplete(args) {
+		t.Fatalf("arguments not repaired: %q", args)
+	}
+	obj := parseToolArguments(args)
+	if stringArg(obj, "command") != "pwd" {
+		t.Fatalf("command lost: %#v", obj)
+	}
+	if !strings.Contains(strings.Join(notes, ","), "args-prefix-repaired") {
+		t.Fatalf("repair not noted: %v", notes)
+	}
+}
+
+// Broken calls persisted in an earlier turn (empty name, arguments truncated
+// by the lost first delta) are replayed in every later request; the request
+// side must repair them before they reach the upstream, and propagate the
+// repaired name onto the matching tool result message.
+func TestAdaptRequestHistoryRepairsBrokenAssistantCall(t *testing.T) {
+	root := map[string]any{
+		"model": "GLM-5.3",
+		"messages": []any{
+			map[string]any{"role": "user", "content": "check git"},
+			map[string]any{
+				"role": "assistant",
+				"tool_calls": []any{map[string]any{
+					"id": "call_broken", "type": "function",
+					"function": map[string]any{
+						"name":      "",
+						"arguments": `command":"git status","description":"check git"}`,
+					},
+				}},
+			},
+			map[string]any{"role": "tool", "tool_call_id": "call_broken", "content": "failed"},
+		},
+	}
+	adaptGrokBuildToolIdentity(root, wireChatCompletions, shapeTieTools())
+	messages := anySlice(root["messages"])
+	assistant, _ := messages[1].(map[string]any)
+	call, _ := anySlice(assistant["tool_calls"])[0].(map[string]any)
+	function, _ := call["function"].(map[string]any)
+	if stringValue(function["name"]) != "run_terminal_command" {
+		t.Fatalf("history name not repaired: %#v", function)
+	}
+	if !jsonObjectComplete(stringValue(function["arguments"])) {
+		t.Fatalf("history arguments not repaired: %#v", function)
+	}
+	result, _ := messages[2].(map[string]any)
+	if stringValue(result["name"]) != "run_terminal_command" {
+		t.Fatalf("tool result name not backfilled: %#v", result)
+	}
+}
