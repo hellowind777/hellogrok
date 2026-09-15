@@ -348,10 +348,7 @@ func TestAppPreservesRuntimeUserThresholdBeforeCapacityLearning(t *testing.T) {
 	if err := app.Start(); err != nil {
 		t.Fatal(err)
 	}
-	patched, err := os.ReadFile(configPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	patched := readConfigEventually(t, configPath)
 	userEdited := strings.Replace(string(patched), "api_key = \"test-key\"", "api_key = \"test-key\"\nauto_compact_threshold_percent = 40", 1)
 	if err := os.WriteFile(configPath, []byte(userEdited), 0o600); err != nil {
 		t.Fatal(err)
@@ -361,10 +358,7 @@ func TestAppPreservesRuntimeUserThresholdBeforeCapacityLearning(t *testing.T) {
 		MaxCompletionTokens: 384_000, CompletionSource: capacity.SourceResponseHeader,
 	})
 	time.Sleep(100 * time.Millisecond)
-	current, err := os.ReadFile(configPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	current := readConfigEventually(t, configPath)
 	if !strings.Contains(string(current), "auto_compact_threshold_percent = 40") ||
 		strings.Contains(string(current), "auto_compact_threshold_percent = 58") {
 		t.Fatalf("runtime user threshold was overwritten:\n%s", current)
@@ -372,14 +366,30 @@ func TestAppPreservesRuntimeUserThresholdBeforeCapacityLearning(t *testing.T) {
 	if err := app.Stop(); err != nil {
 		t.Fatal(err)
 	}
-	restored, err := os.ReadFile(configPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	restored := readConfigEventually(t, configPath)
 	if !strings.Contains(string(restored), "base_url = \"https://one.example/v1\"") ||
 		!strings.Contains(string(restored), "auto_compact_threshold_percent = 40") {
 		t.Fatalf("runtime user threshold did not survive shutdown:\n%s", restored)
 	}
+}
+
+// readConfigEventually retries around the app's asynchronous atomic config
+// writes: on Windows a reader that lands inside the replace window gets a
+// sharing violation instead of either complete version.
+func readConfigEventually(t *testing.T, path string) []byte {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			return data
+		}
+		lastErr = err
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("read %s: %v", path, lastErr)
+	return nil
 }
 
 func TestAppUsesRequestOutputForBudgetWithoutCreatingOutputCap(t *testing.T) {
