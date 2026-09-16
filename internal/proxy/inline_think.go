@@ -34,7 +34,7 @@ func splitLeadingThinkBlock(text string) (thought, rest string, ok bool) {
 		return "", text, false
 	}
 	bodyStart := leading + len(thinkOpenTag)
-	rel := strings.Index(text[bodyStart:], thinkCloseTag)
+	rel := indexTagSkippingLiterals(text[bodyStart:], thinkCloseTag)
 	if rel < 0 {
 		return "", text, false
 	}
@@ -46,18 +46,69 @@ func splitLeadingThinkBlock(text string) (thought, rest string, ok bool) {
 
 // splitThinkSpan cuts the first balanced <think>…</think> span anywhere in
 // text, reporting the visible text that precedes it and the text after it.
+// Tags quoted with backticks or double quotes are prose about the tags, not
+// stream delimiters, and are skipped; without that, reasoning that discusses
+// the tags would terminate its own span early and leak its remainder.
 func splitThinkSpan(text string) (pre, thought, rest string, ok bool) {
-	openIdx := strings.Index(text, thinkOpenTag)
+	openIdx := indexTagSkippingLiterals(text, thinkOpenTag)
 	if openIdx < 0 {
 		return "", "", text, false
 	}
 	bodyStart := openIdx + len(thinkOpenTag)
-	rel := strings.Index(text[bodyStart:], thinkCloseTag)
+	rel := indexTagSkippingLiterals(text[bodyStart:], thinkCloseTag)
 	if rel < 0 {
 		return "", "", text, false
 	}
 	closeStart := bodyStart + rel
 	return text[:openIdx], strings.TrimSpace(text[bodyStart:closeStart]), text[closeStart+len(thinkCloseTag):], true
+}
+
+// isLiteralTag reports whether the tag occurrence at i is quoted prose rather
+// than a stream delimiter.
+func isLiteralTag(s string, i int, tag string) bool {
+	if i > 0 {
+		if c := s[i-1]; c == '`' || c == '"' {
+			return true
+		}
+	}
+	if j := i + len(tag); j < len(s) {
+		if c := s[j]; c == '`' || c == '"' {
+			return true
+		}
+	}
+	return false
+}
+
+func indexTagSkippingLiterals(s, tag string) int {
+	from := 0
+	for {
+		i := strings.Index(s[from:], tag)
+		if i < 0 {
+			return -1
+		}
+		i += from
+		if !isLiteralTag(s, i, tag) {
+			return i
+		}
+		from = i + len(tag)
+	}
+}
+
+// stripUnquotedTag removes stray closing tags while keeping quoted ones
+// visible, so a reply that cites the tag is not mangled.
+func stripUnquotedTag(s, tag string) string {
+	var b strings.Builder
+	from := 0
+	for {
+		i := indexTagSkippingLiterals(s[from:], tag)
+		if i < 0 {
+			b.WriteString(s[from:])
+			return b.String()
+		}
+		i += from
+		b.WriteString(s[from:i])
+		from = i + len(tag)
+	}
 }
 
 // heldTagSuffixLen reports how many trailing bytes of s form an incomplete
@@ -104,8 +155,8 @@ func (s *inlineThinkState) feed(delta string) (reasoning, text string, hold bool
 				s.mode = inlineThinkReasoning
 				continue
 			}
-			closeIdx := strings.Index(buffered, thinkCloseTag)
-			openIdx := strings.Index(buffered, thinkOpenTag)
+			closeIdx := indexTagSkippingLiterals(buffered, thinkCloseTag)
+			openIdx := indexTagSkippingLiterals(buffered, thinkOpenTag)
 			switch {
 			case closeIdx >= 0 && (openIdx < 0 || closeIdx < openIdx):
 				// A relay that misrouted the reasoning tail into content
@@ -142,7 +193,7 @@ func (s *inlineThinkState) feed(delta string) (reasoning, text string, hold bool
 				continue
 			}
 			if strings.Contains(buffered, thinkCloseTag) {
-				buffered = strings.ReplaceAll(buffered, thinkCloseTag, "")
+				buffered = stripUnquotedTag(buffered, thinkCloseTag)
 			}
 			keep := heldTagSuffixLen(buffered)
 			text += buffered[:len(buffered)-keep]
@@ -190,16 +241,29 @@ func peelThinkFromChatContent(obj map[string]any) {
 	var visible strings.Builder
 	leadingTrim := false
 	rest := raw
+	// A relay-misrouted reasoning tail carries only the closing tag; classify
+	// the text before it as reasoning, mirroring the streamed state machine.
+	// Complete messages only (they carry a role): streaming deltas reach the
+	// turn-level state machine, which owns mid-stream classification.
+	if _, hasRole := obj["role"]; hasRole && indexTagSkippingLiterals(rest, thinkOpenTag) < 0 {
+		if closeIdx := indexTagSkippingLiterals(rest, thinkCloseTag); closeIdx >= 0 {
+			if thought := strings.TrimSpace(rest[:closeIdx]); thought != "" {
+				thoughts = append(thoughts, thought)
+			}
+			rest = rest[closeIdx+len(thinkCloseTag):]
+			leadingTrim = true
+		}
+	}
 	for {
 		pre, thought, next, ok := splitThinkSpan(rest)
 		if !ok {
-			// A stray closing tag is stripped only once something visible
-			// precedes it in this object; at the head of a stream delta the
-			// turn-level state machine owns the classification.
-			if strings.Contains(rest, thinkCloseTag) && (visible.Len() > 0 || len(thoughts) > 0) {
-				rest = strings.ReplaceAll(rest, thinkCloseTag, "")
+			if _, hasRole := obj["role"]; hasRole {
+				// Complete message: remove stray closing tags. Streaming deltas
+				// keep them so the turn-level state machine can classify them.
+				visible.WriteString(stripUnquotedTag(rest, thinkCloseTag))
+			} else {
+				visible.WriteString(rest)
 			}
-			visible.WriteString(rest)
 			break
 		}
 		if visible.Len() == 0 && len(thoughts) == 0 && strings.TrimSpace(pre) == "" {

@@ -173,3 +173,47 @@ func TestPeelThinkFromChatContentStripsEverySpan(t *testing.T) {
 		t.Fatalf("reasoning=%q", obj["reasoning_content"])
 	}
 }
+
+// Reasoning that discusses the tags quotes them; a quoted closing tag must
+// not terminate the span early, or the remainder of the thought leaks into
+// the visible reply.
+func TestChatRectifierKeepsQuotedTagsInsideReasoningSpan(t *testing.T) {
+	rectifier := newChatToolRectifier(nil, "")
+	var out []map[string]any
+	frames, _ := rectifier.ingest(chatDeltaChunk(map[string]any{"content": "discuss the `` literal and more</think>reply"}))
+	out = append(out, frames...)
+	reasoning, text := grokBuildChatChannels(out)
+	if joined := strings.Join(reasoning, ""); !strings.Contains(joined, "``") || !strings.Contains(joined, "and more") {
+		t.Fatalf("reasoning truncated at quoted tag: %q", joined)
+	}
+	if strings.Join(text, "") != "reply" {
+		t.Fatalf("text=%q", text)
+	}
+}
+
+// Quoted tags in visible reply text are prose about the tags and must reach
+// the client intact; only unquoted stray closing tags are removed.
+func TestChatRectifierKeepsQuotedTagsInVisibleText(t *testing.T) {
+	rectifier := newChatToolRectifier(nil, "")
+	var out []map[string]any
+	frames, _ := rectifier.ingest(chatDeltaChunk(map[string]any{"content": "see `` and \"</think>\" here"}))
+	out = append(out, frames...)
+	reasoning, text := grokBuildChatChannels(out)
+	if strings.Join(reasoning, "") != "" {
+		t.Fatalf("reasoning=%q", reasoning)
+	}
+	if joined := strings.Join(text, ""); joined != "see `` and \"</think>\" here" {
+		t.Fatalf("quoted tags mangled: %q", joined)
+	}
+}
+
+func TestPeelThinkFromChatContentKeepsQuotedTags(t *testing.T) {
+	obj := map[string]any{"content": "<think>a</think>mid `` end"}
+	peelThinkFromChatContent(obj)
+	if stringValue(obj["content"]) != "mid `` end" {
+		t.Fatalf("content=%q", obj["content"])
+	}
+	if stringValue(obj["reasoning_content"]) != "a" {
+		t.Fatalf("reasoning=%q", obj["reasoning_content"])
+	}
+}
