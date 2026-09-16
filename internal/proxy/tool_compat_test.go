@@ -10,12 +10,12 @@ import (
 
 func grokBuildTools() []advertisedTool {
 	return []advertisedTool{
-		{Name: "list_dir", Props: map[string]struct{}{"targetdirectory": {}}},
-		{Name: "read_file", Props: map[string]struct{}{"targetfile": {}, "offset": {}, "limit": {}}},
-		{Name: "search_replace", Props: map[string]struct{}{"filepath": {}, "oldstring": {}, "newstring": {}}},
-		{Name: "run_terminal_command", Props: map[string]struct{}{"command": {}, "background": {}}},
-		{Name: "grep", Props: map[string]struct{}{"pattern": {}, "path": {}}},
-		{Name: "web_search", Props: map[string]struct{}{"query": {}}},
+		{Name: "list_dir", HasRequired: true, Props: map[string]struct{}{"targetdirectory": {}}},
+		{Name: "read_file", HasRequired: true, Props: map[string]struct{}{"targetfile": {}, "offset": {}, "limit": {}}},
+		{Name: "search_replace", HasRequired: true, Props: map[string]struct{}{"filepath": {}, "oldstring": {}, "newstring": {}}},
+		{Name: "run_terminal_command", HasRequired: true, Props: map[string]struct{}{"command": {}, "background": {}}},
+		{Name: "grep", HasRequired: true, Props: map[string]struct{}{"pattern": {}, "path": {}}},
+		{Name: "web_search", HasRequired: true, Props: map[string]struct{}{"query": {}}},
 	}
 }
 
@@ -225,6 +225,37 @@ func TestRewriteListDirPathArgument(t *testing.T) {
 	rewritten, changed := rewriteAdvertisedArguments(`{"path":"."}`, grokBuildTools()[0])
 	if !changed || !strings.Contains(rewritten, `"target_directory"`) {
 		t.Fatalf("path was not rewritten: changed=%t body=%s", changed, rewritten)
+	}
+}
+
+func TestRewriteTargetPathArgument(t *testing.T) {
+	byName := advertisedByName(grokBuildTools())
+	cases := []struct {
+		tool string
+		args string
+		want string
+	}{
+		{tool: "read_file", args: `{"target_path":"a.go"}`, want: `"target_file":"a.go"`},
+		{tool: "list_dir", args: `{"target_path":"."}`, want: `"target_directory":"."`},
+	}
+	for _, test := range cases {
+		rewritten, changed := rewriteAdvertisedArguments(test.args, byName[test.tool])
+		if !changed || !strings.Contains(rewritten, test.want) || strings.Contains(rewritten, `"target_path"`) {
+			t.Fatalf("%s: target_path not rewritten: changed=%t body=%s", test.tool, changed, rewritten)
+		}
+	}
+	writeTool := advertisedTool{Name: "write", Props: map[string]struct{}{"filepath": {}, "content": {}}}
+	rewritten, changed := rewriteAdvertisedArguments(`{"target_path":"a.go","content":"x"}`, writeTool)
+	if !changed || !strings.Contains(rewritten, `"file_path":"a.go"`) {
+		t.Fatalf("write: target_path not rewritten: changed=%t body=%s", changed, rewritten)
+	}
+	// Tools without an advertised path property must keep the argument untouched.
+	if rewritten, changed := rewriteAdvertisedArguments(`{"target_path":"a.go"}`, byName["grep"]); changed {
+		t.Fatalf("grep args must stay untouched: body=%s", rewritten)
+	}
+	name, args, notes := adaptResolvedCall("read_file", `{"target_path":"a.go"}`, grokBuildTools())
+	if name != "read_file" || !strings.Contains(args, `"target_file":"a.go"`) {
+		t.Fatalf("adaptResolvedCall: name=%q args=%s notes=%v", name, args, notes)
 	}
 }
 

@@ -36,6 +36,7 @@ type recoveryDecider struct {
 	contextBudgetRetried bool
 	contextOutputLimit   uint64
 	reasoningRecovered   bool
+	visionStripped       bool
 	// originalBody is the client request body as received, before any
 	// recovery rewrite; the reasoning recovery always adapts from it.
 	originalBody []byte
@@ -172,12 +173,20 @@ func (d *recoveryDecider) onSuccessEnvelope(response *http.Response, data []byte
 }
 
 // onErrorResponse decides the one-shot request-rewrite recoveries on an
-// upstream error response: the context-budget clamp and the opaque-reasoning
-// drop. It returns true when the loop must resend with retryRequest (whole
-// request, reasoning recovery) or retryBody (body-only, context clamp). The
-// caller has already observed the capacity evidence.
+// upstream error response: the vision strip, the context-budget clamp and the
+// opaque-reasoning drop. It returns true when the loop must resend with
+// retryRequest (whole request, reasoning recovery) or retryBody (body-only,
+// vision strip or context clamp). The caller has already observed the capacity
+// evidence.
 func (d *recoveryDecider) onErrorResponse(response *http.Response, data []byte, request facadeRequest, observation contextBudgetObservation, observedBudget bool) (bool, string) {
 	d.reset()
+	if !d.visionStripped && isVisionUnsupportedError(response.StatusCode, data) {
+		if stripped, removed := stripVisionContent(request.Body, request.Protocol); removed > 0 {
+			d.visionStripped = true
+			d.retryBody = stripped
+			return true, fmt.Sprintf("vision strip retry once removed=%d after status=%d", removed, response.StatusCode)
+		}
+	}
 	if !d.contextBudgetRetried && observedBudget {
 		if retry, ok := clampCompletionForContextError(observation, request.Body, request.Protocol); ok {
 			d.contextBudgetRetried = true

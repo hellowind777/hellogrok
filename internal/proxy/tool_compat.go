@@ -13,6 +13,9 @@ import (
 type advertisedTool struct {
 	Name  string
 	Props map[string]struct{}
+	// HasRequired records that the advertised schema declares at least one
+	// required property, so an empty arguments object can never deserialize.
+	HasRequired bool
 }
 
 var grokToolAliasIndex = buildGrokToolAliasIndex(map[string][]string{
@@ -51,9 +54,9 @@ var grokToolAliasIndex = buildGrokToolAliasIndex(map[string][]string{
 })
 
 var grokParamAliasIndex = map[string][]string{
-	"target_directory": {"path", "directory", "dir", "targetdir", "target_dir", "folder"},
-	"target_file":      {"path", "filepath", "file_path", "file", "filename"},
-	"file_path":        {"path", "filepath", "targetfile", "target_file", "file"},
+	"target_directory": {"path", "directory", "dir", "targetdir", "target_dir", "folder", "target_path"},
+	"target_file":      {"path", "filepath", "file_path", "file", "filename", "target_path"},
+	"file_path":        {"path", "filepath", "targetfile", "target_file", "file", "target_path"},
 	"command":          {"cmd", "script", "code", "shell"},
 	"pattern":          {"query", "regex", "search", "globpattern", "glob_pattern"},
 	"old_string":       {"oldstring", "from"},
@@ -116,9 +119,11 @@ func collectAdvertisedFunctionTools(root map[string]any, protocol wireProtocol) 
 			continue
 		}
 		seen[key] = struct{}{}
+		schema := toolSchema(tool, protocol)
 		tools = append(tools, advertisedTool{
-			Name:  name,
-			Props: schemaPropertyNames(toolSchema(tool, protocol)),
+			Name:        name,
+			Props:       schemaPropertyNames(schema),
+			HasRequired: schemaHasRequired(schema),
 		})
 	}
 	return tools
@@ -157,6 +162,14 @@ func schemaPropertyNames(schema any) map[string]struct{} {
 		}
 	}
 	return names
+}
+
+func schemaHasRequired(schema any) bool {
+	obj, _ := schema.(map[string]any)
+	if obj == nil {
+		return false
+	}
+	return len(anySlice(obj["required"])) > 0
 }
 
 func advertisedByName(tools []advertisedTool) map[string]advertisedTool {

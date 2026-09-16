@@ -340,6 +340,16 @@ func (r *chatToolRectifier) flush() ([]map[string]any, []string) {
 		if strings.TrimSpace(resolved) == "" {
 			resolved = name
 		}
+		if len(parseToolArguments(rewritten)) == 0 {
+			// A call that accumulated no argument fragments at all cannot
+			// satisfy a schema with required properties: Grok Build would
+			// dispatch it as an empty object and report a guaranteed parse
+			// failure. Drop it here and keep the defect visible in the log.
+			if tool, ok := advertisedToolNamed(r.advertised, resolved); ok && tool.HasRequired {
+				notes = append(notes, fmt.Sprintf("empty-args-discarded(name=%s)", tool.Name))
+				continue
+			}
+		}
 		frames = append(frames, r.toolFrame(template, map[string]any{
 			"index": index,
 			"id":    state.id,

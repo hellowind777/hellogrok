@@ -98,3 +98,78 @@ func TestCanonicalFromChatPeelsThinkTags(t *testing.T) {
 		t.Fatalf("text=%q", text)
 	}
 }
+
+// Thinking models emit several CoT phases per turn; a second think span that
+// starts after visible reply text must never reach the client as answer text.
+// The thought gate drops reasoning that arrives after the reply, so the span
+// is expected to disappear entirely instead of opening a second Thought.
+func TestChatRectifierStripsSecondPhaseThinkSpan(t *testing.T) {
+	rectifier := newChatToolRectifier(nil, "")
+	var out []map[string]any
+	ingest := func(delta map[string]any) {
+		frames, _ := rectifier.ingest(chatDeltaChunk(delta))
+		out = append(out, frames...)
+	}
+	ingest(map[string]any{"content": "answer one."})
+	ingest(map[string]any{"content": " <think>re-check the diff</think>done."})
+	reasoning, text := grokBuildChatChannels(out)
+	if strings.Join(reasoning, "") != "" {
+		t.Fatalf("late reasoning must be dropped, got %q", reasoning)
+	}
+	if joined := strings.Join(text, ""); joined != "answer one.done." {
+		t.Fatalf("text=%q frames=%s", joined, mustJSON(out))
+	}
+}
+
+// A relay that misroutes the reasoning tail into content leaves only the
+// closing tag there; the text before it is CoT, not reply text.
+func TestChatRectifierClassifiesUnbalancedThinkCloseAsReasoning(t *testing.T) {
+	rectifier := newChatToolRectifier(nil, "")
+	var out []map[string]any
+	frames, _ := rectifier.ingest(chatDeltaChunk(map[string]any{"content": "reasoning tail.\n</think>real reply"}))
+	out = append(out, frames...)
+	reasoning, text := grokBuildChatChannels(out)
+	if strings.Join(reasoning, "") != "reasoning tail." {
+		t.Fatalf("reasoning=%q frames=%s", reasoning, mustJSON(out))
+	}
+	if strings.Join(text, "") != "real reply" {
+		t.Fatalf("text=%q", text)
+	}
+}
+
+// A stray closing tag in already-latched reply text must never reach the
+// client verbatim, and a tag split across deltas must not leak either.
+func TestChatRectifierNeverShowsStrayOrSplitThinkTags(t *testing.T) {
+	rectifier := newChatToolRectifier(nil, "")
+	var out []map[string]any
+	ingest := func(delta map[string]any) {
+		frames, _ := rectifier.ingest(chatDeltaChunk(delta))
+		out = append(out, frames...)
+	}
+	ingest(map[string]any{"content": "hello "})
+	ingest(map[string]any{"content": "world </think> bye"})
+	ingest(map[string]any{"content": "a </thi"})
+	ingest(map[string]any{"content": "nk> b"})
+	reasoning, text := grokBuildChatChannels(out)
+	joined := strings.Join(text, "")
+	if strings.Contains(joined, "</think>") || strings.Contains(joined, "</thi") {
+		t.Fatalf("think tag leaked into text: %q", joined)
+	}
+	if joined != "hello world  byea  b" {
+		t.Fatalf("text=%q", joined)
+	}
+	if strings.Join(reasoning, "") != "" {
+		t.Fatalf("reasoning=%q", reasoning)
+	}
+}
+
+func TestPeelThinkFromChatContentStripsEverySpan(t *testing.T) {
+	obj := map[string]any{"content": "<think>a</think>mid<think>b</think>end"}
+	peelThinkFromChatContent(obj)
+	if stringValue(obj["content"]) != "midend" {
+		t.Fatalf("content=%q", obj["content"])
+	}
+	if stringValue(obj["reasoning_content"]) != "a\nb" {
+		t.Fatalf("reasoning=%q", obj["reasoning_content"])
+	}
+}

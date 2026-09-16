@@ -518,6 +518,71 @@ func mustJSON(value any) string {
 	return string(data)
 }
 
+// A relay or model glitch can emit a tool call whose argument fragments never
+// arrive at all. Forwarding it would hand Grok Build an empty arguments
+// object and a guaranteed `missing field` parse failure, so the rectifier
+// drops calls whose advertised schema requires properties.
+func TestChatRectifierDiscardsArgumentLessCallForRequiredTool(t *testing.T) {
+	rectifier := newChatToolRectifier(grokBuildTools(), "")
+	var out []map[string]any
+	var notes []string
+	collect := func(root map[string]any) {
+		frames, n := rectifier.ingest(root)
+		out = append(out, frames...)
+		notes = append(notes, n...)
+	}
+	collect(chatToolChunk(0, "call_empty", "search_replace", "", nil))
+	collect(chatToolChunk(1, "call_ok", "run_terminal_command", "", nil))
+	collect(chatToolChunk(1, "", "", `{"command":"git status","description":"check git"}`, nil))
+	frames, n := rectifier.flush()
+	out = append(out, frames...)
+	notes = append(notes, n...)
+	acc := grokBuildAccumulateChatToolCalls(out)
+	if len(acc) != 1 {
+		t.Fatalf("argument-less call reached Grok Build: %#v frames=%s", acc, mustJSON(out))
+	}
+	if acc[1].Name != "run_terminal_command" || !jsonObjectComplete(acc[1].Arguments) {
+		t.Fatalf("complete sibling call was damaged: %#v", acc)
+	}
+	if joined := strings.Join(notes, ","); !strings.Contains(joined, "empty-args-discarded(name=search_replace)") {
+		t.Fatalf("discard was not logged: %v", notes)
+	}
+}
+
+func TestChatRectifierDiscardsEmptyObjectArgumentsForRequiredTool(t *testing.T) {
+	rectifier := newChatToolRectifier(grokBuildTools(), "")
+	var out []map[string]any
+	frames, _ := rectifier.ingest(chatToolChunk(0, "call_empty", "search_replace", "{}", nil))
+	out = append(out, frames...)
+	frames, notes := rectifier.flush()
+	out = append(out, frames...)
+	acc := grokBuildAccumulateChatToolCalls(out)
+	if len(acc) != 0 {
+		t.Fatalf("empty-object call reached Grok Build: %#v", acc)
+	}
+	if joined := strings.Join(notes, ","); !strings.Contains(joined, "empty-args-discarded(name=search_replace)") {
+		t.Fatalf("discard was not logged: %v", notes)
+	}
+}
+
+// Tools whose schema has no required properties accept an empty arguments
+// object, so argument-less calls to them must still be forwarded.
+func TestChatRectifierKeepsArgumentLessCallForOptionalTool(t *testing.T) {
+	rectifier := newChatToolRectifier([]advertisedTool{{Name: "scheduler_list"}}, "")
+	var out []map[string]any
+	frames, _ := rectifier.ingest(chatToolChunk(0, "call_empty", "scheduler_list", "", nil))
+	out = append(out, frames...)
+	frames, notes := rectifier.flush()
+	out = append(out, frames...)
+	acc := grokBuildAccumulateChatToolCalls(out)
+	if len(acc) != 1 || acc[0].Name != "scheduler_list" {
+		t.Fatalf("optional-tool call was dropped: %#v", acc)
+	}
+	if joined := strings.Join(notes, ","); strings.Contains(joined, "empty-args-discarded") {
+		t.Fatalf("optional-tool call reported a discard: %v", notes)
+	}
+}
+
 // Relays that drop the first tool-call delta leave the stream without a
 // function name and with arguments truncated by the leading `{"`; the
 // rectifier must repair both before Grok Build sees the call.
