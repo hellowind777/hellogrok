@@ -4,6 +4,13 @@ All notable changes to this project are documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.37] — 2026-09-16
+
+### Fixed
+
+- Quoted think tags are prose, not span delimiters: a `<think>` or `</think>` occurrence wrapped in backticks or double quotes no longer opens or closes an inline think span. Reasoning that discusses the tags keeps its full span in the reasoning channel instead of terminating early and leaking the remainder into the visible reply, and tags quoted inside visible text reach the client intact; only unquoted stray closing tags are still removed.
+- The non-streaming content path classifies unbalanced closing-tag reasoning tails and removes stray closing tags only on complete message objects (those carrying a `role`); streaming deltas leave classification to the turn-level state machine, where a delta-level strip previously consumed a closing tag before the state machine saw it.
+
 ## [0.1.36] — 2026-09-16
 
 ### Added
@@ -14,7 +21,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Fixed
 
-- Inline reasoning no longer leaks into the visible reply. The Chat think-tag state machine strips `<think>>…</think>` spans wherever they appear in the stream instead of only at the head of the answer: text before an opening tag is emitted immediately, the span is buffered until its closing tag and routed to the reasoning channel, an unbalanced closing tag at the head of a turn classifies the preceding text as reasoning, and stray or delta-split closing tags are removed or held instead of being shown. The non-streaming content path peels every span from the answer. Reasoning arriving after visible reply text remains dropped by design.
+- Inline reasoning no longer leaks into the visible reply. The Chat think-tag state machine strips `<think>…</think>` spans wherever they appear in the stream instead of only at the head of the answer: text before an opening tag is emitted immediately, the span is buffered until its closing tag and routed to the reasoning channel, an unbalanced closing tag at the head of a turn classifies the preceding text as reasoning, and stray or delta-split closing tags are removed or held instead of being shown. The non-streaming content path peels every span from the answer. Reasoning arriving after visible reply text remains dropped by design.
 - Third-party models that emit `target_path` for Grok Build's path parameters no longer surface `Failed to parse arguments for tool …: missing field …`; relay or model glitches that emit a tool call with no argument fragments no longer burn a guaranteed-failure dispatch round.
 
 ## [0.1.35] — 2026-09-15
@@ -84,7 +91,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - The dead-channel breaker now counts every TLS handshake failure form Go actually produces — remote/local alert `net.OpError`s, `tls.RecordHeaderError`, and the HTTPS-to-plain-HTTP scheme mismatch — instead of only certificate-verification failures, so a channel with broken TLS termination fast-fails instead of burning the full client retry budget when `dead_channel_fail_fast` is enabled.
 - Requests caught mid-flight by a proxy stop now receive the structured `503 proxy_stopped` diagnostic instead of a one-off retryable `502 upstream: context canceled`, so stale sessions get the same "reselect the model" signal as fresh requests.
 - Invalid-TOML config recovery no longer deletes a user-edited root `subagents.enabled` dotted line. The line-scoped fallback path now drops the line's created marker when the value no longer matches what hellogrok applied, matching the parse path's protection.
-- Responses streams no longer leak post-answer reasoning through the `response.output_item.done` frame: the event now honors the same drop/strip rules as its `added` counterpart (non-encrypted post-answer reasoning is dropped; encrypted items pass through with visible text stripped). `reasoning_summary_part.added/done` text now goes through the protocol self-talk filter, and a post-answer `<think>`-only content part is dropped.
+- Responses streams no longer leak post-answer reasoning through the `response.output_item.done` frame: the event now honors the same drop/strip rules as its `added` counterpart (non-encrypted post-answer reasoning is dropped; encrypted items pass through with visible text stripped). `reasoning_summary_part.added/done` text now goes through the protocol self-talk filter, and a post-answer `</think>`-only content part is dropped.
 - The dead-channel breaker's TLS classification, the Status-and-logs window debounce (a build slower than the 5-second timeout could spawn a second window), and leader-list deduplication (multiple reachable leaders without a socket path were collapsed into one) are corrected.
 - Chat history reasoning replay is no longer triggered by a user-chosen channel ID that merely contains "deepseek"/"mimo"; the heuristic now keys on the wire model and endpoint evidence only.
 - `scripts/build.ps1` now aborts when `go build` fails instead of printing `OK` for a stale binary.
@@ -152,7 +159,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 - Native Chat SSE no longer lets a later empty `"name"` overwrite a known tool name, and no longer rewrites incomplete argument JSON per frame. Grok Build's last-write-wins Chat accumulator therefore keeps `list_dir` / `run_terminal_command` instead of reporting NotFound.
 - Empty or vendor `finish_reason` values (`""`, GLM `sensitive` / `network_error` / `model_context_window_exceeded`) are dropped or mapped onto Grok Build's Chat enum so serde no longer cancels the stream.
-- Reasoning is forwarded only as a prefix sibling. Thought after visible text is dropped on Chat, Messages, and Responses; `<think>` blocks are peeled out of answer text; protocol self-talk such as `reply only:` / `任务已全部完成` is stripped from prefix CoT. Streaming `reasoning_content` deltas keep leading BPE spaces.
+- Reasoning is forwarded only as a prefix sibling. Thought after visible text is dropped on Chat, Messages, and Responses; `<think>…</think>` blocks are peeled out of answer text; protocol self-talk such as `reply only:` / `任务已全部完成` is stripped from prefix CoT. Streaming `reasoning_content` deltas keep leading BPE spaces.
 - Chat history no longer replays plaintext CoT across user turns except on DeepSeek and MiMo. Intra-turn tool-loop reasoning is kept. Encrypted or signed blobs are never removed, and `"tool call"` placeholders are never injected.
 
 ### Changed
@@ -493,7 +500,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - CC Switch compatibility detection and conflict warnings.
 - Builds for Windows, Linux, and macOS on amd64 and arm64.
 
-[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.36...HEAD
+[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.37...HEAD
+[0.1.37]: https://github.com/hellowind777/hellogrok/compare/v0.1.36...v0.1.37
 [0.1.36]: https://github.com/hellowind777/hellogrok/compare/v0.1.35...v0.1.36
 [0.1.35]: https://github.com/hellowind777/hellogrok/compare/v0.1.34...v0.1.35
 [0.1.34]: https://github.com/hellowind777/hellogrok/compare/v0.1.33...v0.1.34

@@ -6,7 +6,7 @@
 
 跨平台 Grok Build 本地代理，让自定义模型渠道兼容常见 API 格式、Build 原生 Web 工具、独立鉴权和自动配置恢复。
 
-[![Version](https://img.shields.io/badge/version-0.1.36-2f6feb.svg)](./internal/appinfo/appinfo.go)
+[![Version](https://img.shields.io/badge/version-0.1.37-2f6feb.svg)](./internal/appinfo/appinfo.go)
 [![Go](https://img.shields.io/badge/Go-1.26.6-00ADD8.svg)](./go.mod)
 [![CI](https://github.com/hellowind777/hellogrok/actions/workflows/ci.yml/badge.svg)](https://github.com/hellowind777/hellogrok/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
@@ -82,7 +82,7 @@ hellogrok 为这些自定义渠道提供统一的本地兼容层。运行时准�
 - 在原生 Chat 和 Messages 响应交给客户端前补齐缺失的本地工具调用 ID；Responses 流在不同事件间保持输出项和函数调用身份一致，上游把同一个 ID 复用到不同输出槽或 Chat 工具调用时，为冲突槽位改写一个保留类型前缀的新唯一 ID 而不是掐断流，同一槽位内的真实冲突仍然拒绝；Chat Completions 并行工具调用复用同一 `tool_call` ID 时，流式与非流式响应都同样唯一化处理；Chat JSON 转 SSE 时为并行工具调用分配独立索引。已有 Chat 历史仅在一个缺失调用 ID 能与唯一结果关联时修复，有歧义的历史仍会报错。
 - 在 Grok Build 的 last-write-wins 累加器看到原生 Chat 工具调用 SSE 之前先重组：后续空 `"name"` 不会抹掉已知名称，参数片段在 JSON 完整前不做改写。空的或厂商私有的 `finish_reason` 会删除或映射到 Grok Build 的 Chat 枚举（`stop`、`length`、`tool_calls`、`content_filter`、`function_call`）。
 - 修复首帧在传输中丢失的工具调用流。Chat、Messages 或 Responses 流到达时若函数名为空且参数缺开头 `{"`，hellogrok 会在补前缀后能解析为单一完整 JSON 对象时恢复前缀，按该请求已声明工具的参数键集合推断名称（`command`+`description` 共享形状确定性地解析为 `run_terminal_command`），同一修复覆盖非流式响应与后续请求回放的已持久化历史。Chat 工具帧保留到流终止才发出，中继在 `finish_reason` 之后补发的参数片段会被合并而非丢弃；Messages `tool_use` 块与 Responses `function_call` 项同样在开始帧与停止帧之间扣留，终止帧的完整 item 作为名称与参数的第二来源。提前 flush 之后仍被丢弃的片段记录为 `late-tool-deltas-discarded`。
-- 把 Grok Build 无法反序列化的 Chat 方言收成线格式：数组 `content`、`thinking`/`reasoning`/`reasoning_details`、Gemini `functionCall`，以及答案正文里的 `<think>`…`</think>`。think span 在流中任意位置都会被剥离，而不限于开头：思考模型一个回合会产出多段 CoT，中继还可能把推理尾只带闭标签地误路由进 `content`，因此第二阶段 span、无开标签的 `</think>` 推理尾、游离闭标签和跨增量分裂的标签都会被归入推理或删除，而不是泄漏进可见回复。推理只作为前缀兄弟转发；可见正文之后的思考会丢掉，避免 TUI 在回复下面再开一块 Thought。流式 `reasoning_content` 增量按原样拼接，不按帧裁掉 BPE 词首空格。
+- 把 Grok Build 无法反序列化的 Chat 方言收成线格式：数组 `content`、`thinking`/`reasoning`/`reasoning_details`、Gemini `functionCall`，以及答案正文里的 `<think>`…`</think>`。think span 在流中任意位置都会被剥离，而不限于开头：思考模型一个回合会产出多段 CoT，中继还可能把推理尾只带闭标签地误路由进 `content`，因此第二阶段 span、无开标签的 `</think>` 推理尾、游离闭标签和跨增量分裂的标签都会被归入推理或删除，而不是泄漏进可见回复。反引号或双引号包住的标签是讨论标签的文字，不是流分隔符：谈论标签的推理会保留完整 span 在推理通道中，不会提前终止；可见正文中被引用的标签原样保留。推理只作为前缀兄弟转发；可见正文之后的思考会丢掉，避免 TUI 在回复下面再开一块 Thought。流式 `reasoning_content` 增量按原样拼接，不按帧裁掉 BPE 词首空格。
 - Chat 历史上，DeepSeek 和 MiMo 保留上一轮 `reasoning_content`（网关缺了会 400）。其他 Chat 渠道只在当前工具循环（最后一条 user 之后）保留模型自己的 CoT，跨轮明文思考会剥掉。加密或带签名的块不删除，也不会注入 `"tool call"` 占位符。
 - 流式 Chat 请求保留 Grok Build 的 `stream_options.include_usage=true`，让终止用量块驱动自动压缩。带工具的 GLM Chat 渠道在字段缺省时补上 `tool_stream=true`。
 - 从原始请求提取对话身份，为官方 OpenCode Go 和 Zen 路由补齐 `x-opencode-session`，覆盖三种协议、搜索转换及内部重试。显式渠道头优先；客户端未提供身份时，使用独立操作 ID 继续转发，并在内部重试中复用。操作 ID 不代表不同请求属于同一对话；日志会记录这一限制，但不记录身份值。
@@ -608,7 +608,7 @@ Grok Build 在第一段可见回复时关掉当前 Thought。官方 grok 把推�
 
 ### 推理文本出现在回复正文里
 
-思考模型把 CoT 包在 `<think>`…`</think>` 中，中继还可能把推理在回合中途、或只带闭标签地倒进 `content`。hellogrok 会剥离流中任意位置的 think span：第二阶段 span、无开标签的 `</think>` 推理尾、游离或跨增量分裂的闭标签，都会被归入推理通道或删除，而不是泄漏进可见回复。可见回复之后到达的推理按设计丢弃，因为 Grok Build 只把推理渲染为前缀 Thought。已存盘的气泡不会改写；升级后请重启代理并新开 session。
+思考模型把 CoT 包在 `<think>`…`</think>` 中，中继还可能把推理在回合中途、或只带闭标签地倒进 `content`。hellogrok 会剥离流中任意位置的 think span：第二阶段 span、无开标签的 `</think>` 推理尾、游离或跨增量分裂的闭标签，都会被归入推理通道或删除，而不是泄漏进可见回复。被反引号或双引号引用的标签按正文处理：谈论标签的推理不会提前结束自己的 span，回复中被引用的标签原样保留。可见回复之后到达的推理按设计丢弃，因为 Grok Build 只把推理渲染为前缀 Thought。已存盘的气泡不会改写；升级后请重启代理并新开 session。
 
 ### 工具调用报 `missing field` 参数错误
 
