@@ -1,21 +1,20 @@
-# 发布说明 — v0.1.35
+# 发布说明 — v0.1.36
 
-## 丢失首个流式增量的工具调用现在会被修复，而不是报错
+## 纯文本渠道不再因 `vision_not_supported` 终结回合
 
-- **你看到的现象。** 部分第三方中继会间歇性丢掉工具调用的第一个流式增量——携带 `function.name` 与参数开头 `{"` 的那一帧。Grok Build 随后以空工具名和缺开头的参数进行分发，报出 `Agent tried calling a tool that doesn't exist`，并把解析错误回喂给模型、消耗一轮重试（在经中继的 GLM 系渠道上反复出现）。
-- **本次变化。** hellogrok 在共享的工具兼容层修复这类损坏，覆盖三种上游协议（`chat_completions`、`messages`、`responses`）及流式与非流式：
-  - 参数缺开头时，补 `{"`（或 `{`）后若能解析为恰好一个完整 JSON 对象，则恢复前缀。
-  - 空名称按该请求已声明工具的参数键集合推断；`command`+`description` 这一同时匹配 `run_terminal_command` 与 `monitor` 的共享形状确定性地解析为 `run_terminal_command`。仍无法判定时保持不修复，不做猜测。
-  - 后续请求回放的已持久化历史（含 `/resume`）接受同样的修复，修复后的名称回填到对应 tool result 消息，损坏记录不再原样送达上游。
+- **你看到的现象。** 会话一旦携带图像内容——例如 `read_file` 读取图片、Grok Build 将结果渲染为图像块——之后的每个请求都会把这些图像部分转发给上游。纯文本模型随即以 `400 vision_not_supported`（"The request model is not multimodal … does not support image input"）拒绝整个请求，回合停在红色报错上。
+- **本次变化。** hellogrok 现在能在三种上游协议上识别该拒绝（`400` 且 code 含 `vision`，或消息含 `not multimodal` / `does not support image`）：把每个图像内容部分（`image_url`、`input_image`、`image`，含 tool result 内的图像）替换为一行文本占位符（告知模型视觉载荷被省略），并重试一次请求。回合不再失败，而是不带图像继续。渠道不会被记为纯文本——判定每次都来自上游的真实拒绝，上游日后获得视觉能力时渠道无需任何改动即可恢复透传。
 
-## 乱序与缺名工具块扣留到可解析为止
+## 参数名错误或零参数的第三方工具调用在分发前被归一或丢弃
 
-- **Chat Completions。** 工具帧改在流终止（`[DONE]`、流末或错误帧）发出，而非 `finish_reason` 时刻。Grok Build 的 chat 累加器读取整条流、不依赖 chunk 顺序，因此中继在 `finish_reason` 之后补发的参数片段会并入完整参数，而不是被静默丢弃留下尾部截断。持有中的行内推理仍在 `finish_reason` 时发出，思考与正文的可见延迟不变。
-- **Messages。** `tool_use` 块在 `content_block_start` 与 `content_block_stop` 之间扣留；累积的 input JSON 先解析名称（并修复前缀），再以"开始帧 + 单条完整 `input_json_delta` + stop"重发。未闭合块在 `message_stop`/`error` 时冲刷。
-- **Responses。** `function_call` 项在 `response.output_item.added` 与 `response.output_item.done` 之间扣留；done 帧的完整 item 同时作为名称与参数的第二来源，截断的流上参数让位于完整的终止 item。未闭合项在 `response.completed`/`incomplete`/`failed` 时冲刷。
+- **你看到的现象。** 第三方模型偶尔按自身训练先验发出 Grok Build 的参数名——例如 `read_file` 写成 `target_path` 而非 `target_file`——Grok Build 的严格 schema 校验回以 `Failed to parse arguments for tool …: missing field …`，TUI 将该调用标为失败并消耗一轮往返。更罕见的中继/模型 glitch 会发出一个参数片段完全未到达的工具调用；空参数对象在同一校验下必然报 `missing field`。
+- **本次变化。**
+  - 参数别名按该请求已声明的工具归一：`target_path` 现在映射到 `target_file`、`target_directory` 或 `file_path`（取已声明 schema 实际拥有的那个），并入既有别名表。改写只作用于工具已声明的属性，无关 JSON 不受影响。
+  - 一个参数片段都未累积的流式调用，在已声明工具含必填属性时于 Grok Build 分发前丢弃——空对象永远无法满足必填字段——缺陷以 `empty-args-discarded(name=…)` 代理日志注记保持可见。无必填属性的工具保留空参数，那是合法的零参调用约定。
 
-## 诊断
+## 行内推理不再泄漏进可见回复
 
-- 提前 flush（错误终止）之后到达、因而被丢弃的工具调用增量，按调用索引记录为 `late-tool-deltas-discarded(index=N)`。中继在最后一个参数片段之前发出 `finish_reason` 的缺陷由此在代理日志中可见，而不是只表现为 Grok Build 的解析失败。
+- **你看到的现象。** 思考模型一个回合产出多段 CoT，部分中继还会把推理尾只带闭标签地误路由进 `content`。旧的 think 标签剥离器只处理答案最开头的 `<think>>…</think>` 块，于是第二阶段 span、无开标签的 `</think>` 推理尾、游离或跨增量分裂的闭标签都原样出现在回复气泡里。
+- **本次变化。** Chat think 标签状态机现在剥离流中任意位置的 span：开标签前的文本立即下发，span 缓冲到闭标签后归入推理通道；回合开头无开标签的闭标签把其前的文本判定为推理；游离或跨增量分裂的闭标签被删除或挂起而不是显示。非流式路径剥离答案内容中的每一个 span。可见回复之后到达的推理仍按设计丢弃，因为 Grok Build 只把推理渲染为前缀 Thought。
 
 升级后请重启两个 hellogrok 可执行文件。

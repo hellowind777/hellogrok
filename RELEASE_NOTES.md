@@ -1,21 +1,20 @@
-# Release Notes — v0.1.35
+# Release Notes — v0.1.36
 
-## Tool calls whose first stream delta was lost are repaired instead of failing
+## Text-only channels no longer end a turn on `vision_not_supported`
 
-- **What you saw.** Some third-party relays intermittently omit a tool call's first streamed delta — the frame carrying `function.name` and the opening `{"` of the arguments. Grok Build then dispatched an empty tool name with head-truncated arguments and reported `Agent tried calling a tool that doesn't exist`, feeding a parse error back into the model and burning a retry round (observed repeatedly on GLM-family channels through relays).
-- **What changed.** hellogrok now repairs that damage in its shared tool-compatibility layer, for all three upstream protocols (`chat_completions`, `messages`, `responses`), streaming and non-streaming alike:
-  - Arguments truncated at the head are restored when prefixing `{"` (or `{`) yields exactly one complete JSON object.
-  - Empty names are inferred from the argument key set against the tools declared on that request; the shared `command`+`description` shape, which matches both `run_terminal_command` and `monitor`, resolves deterministically to `run_terminal_command`. Anything still ambiguous is left unrepaired rather than guessed.
-  - Persisted history replayed in later requests (including `/resume`) receives the same repair, and the repaired name is backfilled onto the matching tool-result message, so broken records no longer reach the upstream verbatim.
+- **What you saw.** When a conversation carried image content — for example a `read_file` of a picture, whose result Grok Build renders as image blocks — every later request forwarded those image parts to the upstream. A text-only model then rejected the whole request with `400 vision_not_supported` ("The request model is not multimodal … does not support image input"), and the turn died on the red error.
+- **What changed.** hellogrok now recognizes that rejection (`400` with a `vision` error code, or a `not multimodal` / `does not support image` message) on any of the three upstream protocols. It replaces every image content part (`image_url`, `input_image`, `image`, including images inside tool results) with a one-line text placeholder that tells the model the visual payload was omitted, and retries the request once. The turn continues without the images instead of failing. Channels are deliberately not remembered as text-only, so the decision is re-derived from each upstream rejection and a channel whose upstream later gains vision support keeps working unchanged.
 
-## Out-of-order and name-less tool blocks are held until they can be resolved
+## Third-party tool calls with wrong or missing arguments are normalized or dropped before dispatch
 
-- **Chat Completions.** Tool frames are now emitted at the stream terminal (`[DONE]`, stream end, or error frame) instead of at `finish_reason`. Grok Build's chat accumulator reads the whole stream regardless of chunk order, so argument fragments a relay sends after `finish_reason` are merged into complete arguments instead of being silently dropped with tail-truncated parameters. Held inline reasoning still flushes at `finish_reason`, so visible latency of thought and text is unchanged.
-- **Messages.** `tool_use` blocks are held between `content_block_start` and `content_block_stop`; the accumulated input JSON resolves the name (and repairs its prefix) before the block is re-emitted as start + one complete `input_json_delta` + stop. Unclosed blocks flush at `message_stop`/`error`.
-- **Responses.** `function_call` items are held between `response.output_item.added` and `response.output_item.done`; the done frame's complete item additionally serves as a second source for name and arguments, so a truncated argument stream loses to a complete terminal item. Unclosed items flush at `response.completed`/`incomplete`/`failed`.
+- **What you saw.** Third-party models occasionally emit Grok Build parameter names from their own training prior — `read_file` called with `target_path` instead of `target_file`, for instance — and Grok Build's strict schema validation answered `Failed to parse arguments for tool …: missing field …`, marked the call failed in the TUI, and burned a round trip. Rarer relay/model glitches emit a tool call whose argument fragments never arrive at all; the empty arguments object then fails the same validation with a guaranteed `missing field` error.
+- **What changed.**
+  - Parameter aliases are normalized against the tools declared on the request: `target_path` now maps to `target_file`, `target_directory`, or `file_path` (whichever the declared schema actually has), joining the existing alias table. Rewrites only apply to properties the tool declares, so unrelated JSON is never touched.
+  - A streamed call that accumulates no argument fragments at all is discarded before Grok Build dispatch when the declared tool requires properties — an empty object can never satisfy it — and the defect stays visible as an `empty-args-discarded(name=…)` proxy log note. Calls to tools without required properties keep their empty arguments, which is the valid zero-argument convention.
 
-## Diagnostics
+## Inline reasoning no longer leaks into the visible reply
 
-- Tool-call deltas that arrive after an early flush (error terminals) and are therefore discarded are logged per call index as `late-tool-deltas-discarded(index=N)`, making a relay that emits `finish_reason` before its last argument fragments visible in the proxy log instead of surfacing only as a Grok Build parse failure.
+- **What you saw.** Thinking models emit several chain-of-thought phases per turn, and some relays misroute a reasoning tail into `content` with only the closing tag. The previous think-tag stripper only handled a `<think>>…</think>` block at the very head of the answer, so second-phase spans, unbalanced `</think>` tails, and stray or delta-split closing tags appeared verbatim in the reply bubble.
+- **What changed.** The Chat think-tag state machine now strips spans wherever they appear in the stream: text before an opening tag is emitted immediately, the span is buffered until its closing tag and routed to the reasoning channel, an unbalanced closing tag at the head of a turn classifies the text before it as reasoning, and stray or delta-split closing tags are removed or held instead of being shown. The non-streaming path peels every span from the answer content. Reasoning that arrives after visible reply text is still dropped by design, because Grok Build renders reasoning only as a prefix Thought.
 
 Restart both hellogrok executables after upgrading.

@@ -4,6 +4,19 @@ All notable changes to this project are documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.36] — 2026-09-16
+
+### Added
+
+- Vision-rejection recovery for text-only channels: a `400` whose error code contains `vision` or whose message contains `not multimodal` / `does not support image` triggers one rewrite-and-retry in which every image content part (`image_url`, `input_image`, `image`, including images inside tool results) is replaced by a text placeholder stating that the visual payload was omitted. Applied on all three upstream protocols; channels are not remembered as text-only, so each image-bearing request re-derives the decision from the upstream rejection.
+- Parameter-alias normalization against the tools declared on the request: `target_path` now maps to `target_file`, `target_directory`, or `file_path`, whichever the declared schema actually advertises, joining the existing alias table in the shared tool-compatibility layer. Rewrites apply only to properties the tool declares.
+- Discard of argument-less streamed tool calls before Grok Build dispatch: a call that accumulates no argument fragments at all is dropped when the resolved declared tool requires properties (an empty arguments object can never satisfy them), reported as an `empty-args-discarded(name=…)` proxy log note. Tools without required properties keep their empty arguments, the valid zero-argument convention.
+
+### Fixed
+
+- Inline reasoning no longer leaks into the visible reply. The Chat think-tag state machine strips `<think>>…</think>` spans wherever they appear in the stream instead of only at the head of the answer: text before an opening tag is emitted immediately, the span is buffered until its closing tag and routed to the reasoning channel, an unbalanced closing tag at the head of a turn classifies the preceding text as reasoning, and stray or delta-split closing tags are removed or held instead of being shown. The non-streaming content path peels every span from the answer. Reasoning arriving after visible reply text remains dropped by design.
+- Third-party models that emit `target_path` for Grok Build's path parameters no longer surface `Failed to parse arguments for tool …: missing field …`; relay or model glitches that emit a tool call with no argument fragments no longer burn a guaranteed-failure dispatch round.
+
 ## [0.1.35] — 2026-09-15
 
 ### Added
@@ -480,7 +493,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - CC Switch compatibility detection and conflict warnings.
 - Builds for Windows, Linux, and macOS on amd64 and arm64.
 
-[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.35...HEAD
+[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.36...HEAD
+[0.1.36]: https://github.com/hellowind777/hellogrok/compare/v0.1.35...v0.1.36
 [0.1.35]: https://github.com/hellowind777/hellogrok/compare/v0.1.34...v0.1.35
 [0.1.34]: https://github.com/hellowind777/hellogrok/compare/v0.1.33...v0.1.34
 [0.1.33]: https://github.com/hellowind777/hellogrok/compare/v0.1.32...v0.1.33

@@ -6,7 +6,7 @@
 
 跨平台 Grok Build 本地代理，让自定义模型渠道兼容常见 API 格式、Build 原生 Web 工具、独立鉴权和自动配置恢复。
 
-[![Version](https://img.shields.io/badge/version-0.1.35-2f6feb.svg)](./internal/appinfo/appinfo.go)
+[![Version](https://img.shields.io/badge/version-0.1.36-2f6feb.svg)](./internal/appinfo/appinfo.go)
 [![Go](https://img.shields.io/badge/Go-1.26.6-00ADD8.svg)](./go.mod)
 [![CI](https://github.com/hellowind777/hellogrok/actions/workflows/ci.yml/badge.svg)](https://github.com/hellowind777/hellogrok/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
@@ -69,6 +69,7 @@ hellogrok 为这些自定义渠道提供统一的本地兼容层。运行时准�
 - 软故障吸收对所有渠道始终生效：可重试 `5xx`、`429`、上游 `408` 边缘超时页、Cloudflare 源站 TLS `525`/`526` 和响应头超时一律在窗口内重试——它们会自行恢复，交给 Grok Build 重试只是空耗时间。全局 `[models]` 的 `error_resilience` 设置只控制确定性 4xx 错误（鉴权、权限、无效请求或模型）：默认（`off`）立即透传供应商原始解释并标记 `X-Should-Retry: false`，因为重试不可能成功；可选的 `balanced` 值额外把它们纳入吸收窗口，按固定 30 秒后 60 秒的节奏等待——中转侧此类故障经常自行恢复（令牌轮换、权限修复、配置热加载、短暂部署），无人值守的任务因此能挺过数分钟级的中断而不是在第一次响应即告失败。推理历史被拒绝在任何档位下都不吸收：它报告的是用户必须看到的异源会话状态，隐藏只会拖延恢复。
 - 按渠道提供可选的死渠道熔断器（`dead_channel_fail_fast = true`，默认关闭）。只有拨号级失败——连接被拒、DNS 失败、TLS 握手失败——才会计数，因为这类失败重试永远不可能成功；busy `503`、`429`、超时和传输重置一律不计数。连续 6 次拨号级失败（可用 `dead_channel_fail_threshold` 调整）后，代理返回不可重试的 `503 proxy_circuit_open`（`X-Should-Retry: false`）。熔断后每 5 分钟放行一次探测请求：上游返回任何状态的响应都会自动合闸，探测失败则重新计时。
 - 识别以 HTTP 200 加错误信封回复失败的中转（newapi/sub2api 常见缺陷）。瞬态信封（限流、过载、超时）进入吸收窗口并在代理内重试；确定性信封（鉴权、账单、无效请求）带着供应商的真实解释透传，而不是变成不透明的信封校验拒绝。自带 error 成员的 Responses 终止响应仍走原生失败路径，不受影响。
+- 从上游的视觉拒绝中恢复纯文本渠道：渠道以 `400` 加 `vision` 错误码或 `not multimodal` / `does not support image` 消息回复时，hellogrok 把每个图像内容部分（`image_url`、`input_image`、`image`，含 `read_file` 读图放进 tool result 的图像）替换为文本占位符并重试一次请求，纯文本上游因此不会再以 `vision_not_supported` 终结回合。由于不按渠道保留记忆，之后每个带图请求仍会先付一次被拒尝试，再经剥离重试成功。
 - 把中转前面的 Cloudflare 盾质询视为瞬态故障：`cf-mitigated: challenge` 头或 Cloudflare 下发的质询页会在重试窗口内被吸收；超出窗口的质询以可重试的 `503` 透传，因为裸 `403` 在 Grok Build 中属终止类，会让可自行清除的盾质询直接杀死本轮。不带 Cloudflare 标记的真实源站 `403` 不受影响。
 - 中转在完整终止响应上省略 Responses 信封簿记（`id`、`object`、`status`）时，为其合成缺失标记，而不是拒绝这一可修复的省略；字段存在但取值错误、或 `output` 缺失/畸形，仍然按错误拒绝。探测若始终没有报告结果——调用方中途断开，或探测的响应头超时——2 分钟租约到期即视为丢失，后续请求可以重新探测，不会把渠道永久锁死在断开状态。
 - 在规范化前记录原始上游响应声明的模型，支持终止帧优先、大小写不敏感的不一致判断和多帧冲突标记，不改变路由或响应数据。良性不一致按渠道/协议/配置模型/上游模型组合只记录一次；冲突与无效声明每次都记录。当 Grok Build 在非 xAI 自定义渠道上发送 `grok-4.6` 这类官方目录名时，代理会额外记录一条警告（含请求体大小、工具数量和会话状态），便于诊断 `/resume` 选路，且不改变路由。
@@ -81,7 +82,7 @@ hellogrok 为这些自定义渠道提供统一的本地兼容层。运行时准�
 - 在原生 Chat 和 Messages 响应交给客户端前补齐缺失的本地工具调用 ID；Responses 流在不同事件间保持输出项和函数调用身份一致，上游把同一个 ID 复用到不同输出槽或 Chat 工具调用时，为冲突槽位改写一个保留类型前缀的新唯一 ID 而不是掐断流，同一槽位内的真实冲突仍然拒绝；Chat Completions 并行工具调用复用同一 `tool_call` ID 时，流式与非流式响应都同样唯一化处理；Chat JSON 转 SSE 时为并行工具调用分配独立索引。已有 Chat 历史仅在一个缺失调用 ID 能与唯一结果关联时修复，有歧义的历史仍会报错。
 - 在 Grok Build 的 last-write-wins 累加器看到原生 Chat 工具调用 SSE 之前先重组：后续空 `"name"` 不会抹掉已知名称，参数片段在 JSON 完整前不做改写。空的或厂商私有的 `finish_reason` 会删除或映射到 Grok Build 的 Chat 枚举（`stop`、`length`、`tool_calls`、`content_filter`、`function_call`）。
 - 修复首帧在传输中丢失的工具调用流。Chat、Messages 或 Responses 流到达时若函数名为空且参数缺开头 `{"`，hellogrok 会在补前缀后能解析为单一完整 JSON 对象时恢复前缀，按该请求已声明工具的参数键集合推断名称（`command`+`description` 共享形状确定性地解析为 `run_terminal_command`），同一修复覆盖非流式响应与后续请求回放的已持久化历史。Chat 工具帧保留到流终止才发出，中继在 `finish_reason` 之后补发的参数片段会被合并而非丢弃；Messages `tool_use` 块与 Responses `function_call` 项同样在开始帧与停止帧之间扣留，终止帧的完整 item 作为名称与参数的第二来源。提前 flush 之后仍被丢弃的片段记录为 `late-tool-deltas-discarded`。
-- 把 Grok Build 无法反序列化的 Chat 方言收成线格式：数组 `content`、`thinking`/`reasoning`/`reasoning_details`、Gemini `functionCall`，以及答案正文里的 `<think>`…`</think>`。推理只作为前缀兄弟转发；可见正文之后的思考会丢掉，避免 TUI 在回复下面再开一块 Thought。流式 `reasoning_content` 增量按原样拼接，不按帧裁掉 BPE 词首空格。
+- 把 Grok Build 无法反序列化的 Chat 方言收成线格式：数组 `content`、`thinking`/`reasoning`/`reasoning_details`、Gemini `functionCall`，以及答案正文里的 `<think>`…`</think>`。think span 在流中任意位置都会被剥离，而不限于开头：思考模型一个回合会产出多段 CoT，中继还可能把推理尾只带闭标签地误路由进 `content`，因此第二阶段 span、无开标签的 `</think>` 推理尾、游离闭标签和跨增量分裂的标签都会被归入推理或删除，而不是泄漏进可见回复。推理只作为前缀兄弟转发；可见正文之后的思考会丢掉，避免 TUI 在回复下面再开一块 Thought。流式 `reasoning_content` 增量按原样拼接，不按帧裁掉 BPE 词首空格。
 - Chat 历史上，DeepSeek 和 MiMo 保留上一轮 `reasoning_content`（网关缺了会 400）。其他 Chat 渠道只在当前工具循环（最后一条 user 之后）保留模型自己的 CoT，跨轮明文思考会剥掉。加密或带签名的块不删除，也不会注入 `"tool call"` 占位符。
 - 流式 Chat 请求保留 Grok Build 的 `stream_options.include_usage=true`，让终止用量块驱动自动压缩。带工具的 GLM Chat 渠道在字段缺省时补上 `tool_stream=true`。
 - 从原始请求提取对话身份，为官方 OpenCode Go 和 Zen 路由补齐 `x-opencode-session`，覆盖三种协议、搜索转换及内部重试。显式渠道头优先；客户端未提供身份时，使用独立操作 ID 继续转发，并在内部重试中复用。操作 ID 不代表不同请求属于同一对话；日志会记录这一限制，但不记录身份值。
@@ -92,7 +93,7 @@ hellogrok 为这些自定义渠道提供统一的本地兼容层。运行时准�
 Grok Build 在本地执行文件、终端、grep、子代理、客户端 `web_search`、MCP（先 `search_tool` 再 `use_tool`）和 Skill。hellogrok 通过 Responses、Messages 和 Chat Completions 转发这些声明，包括中转后的 grok-4.5/4.6 渠道。第三方渠道不会收到 xAI 专属的 `x_search`；供应商 hosted 工具仍须由上游真实支持。
 
 - 发给上游的工具表只保留 Grok Build 的 `client_name`（`list_dir`、`read_file`、`run_terminal_command`、`spawn_subagent` 等）。Claude/Codex 别名（`LS`、`Read`、`Bash`、`Task`、`Grep`、`Write`、`ToolSearch` 等）只在回来的调用上改写，不会克隆进每轮 `tools`。
-- 入站调用会改写成已声明的 `client_name` 与参数键。Chat 顶层 `name`/`arguments`、旧版 `function_call`、对象形式参数、按参数形状回收的空名称（含丢失首个流式增量导致的截断参数），以及常见 XML/正文 JSON 调用，都会在 Grok Build 分发前规范化。
+- 入站调用会改写成已声明的 `client_name` 与参数键。Chat 顶层 `name`/`arguments`、旧版 `function_call`、对象形式参数、按参数形状回收的空名称（含丢失首个流式增量导致的截断参数），以及常见 XML/正文 JSON 调用，都会在 Grok Build 分发前规范化。参数别名按已声明 schema 归一（`target_path` 落到 `target_file`、`target_directory` 或 `file_path`）；一个参数片段都未累积的流式调用，在已声明工具含必填属性时会在分发前丢弃并记录 `empty-args-discarded(name=...)`——空参数对象永远无法满足必填字段，否则 Grok Build 只会报出必然的 `missing field` 解析失败。
 - 直接 MCP 名（`server__tool`、`mcp__server__tool`）在声明了 `use_tool` 时会包成该元工具。Write 整文件写入会落到 `write` 或 `search_replace`。Glob 模式会落到 `glob`、`grep` 或 `rg --files`。缺失的必填 `description` 和 `subagent_type` 会补齐。
 - 中转 grok-4.5/4.6 发出的 Grok Build 原名原样通过。历史里的 tool 结果消息会补上对应 `name`，避免思考模型在下一轮拒绝请求。
 - hellogrok 不会凭空创造当前请求未声明的工具。模型若不发出 tool call，仍然不会执行工具。
@@ -604,6 +605,22 @@ DeepSeek 的 1M 上下文是输入与生成输出共享的总预算，Responses 
 ### Thought 出现在已经写完的答案下面
 
 Grok Build 在第一段可见回复时关掉当前 Thought。官方 grok 把推理当答案的前缀兄弟；答案后再来的 `reasoning_content` / `thinking` 会在下面再开一块 Thought。hellogrok 会丢掉 Chat、Messages、Responses 上答案后的思考，并从前置 CoT 里剥掉 `reply only:` / `任务已全部完成` 这类协议自语。升级后请重启代理并新开 session；已存盘的气泡不会改写。
+
+### 推理文本出现在回复正文里
+
+思考模型把 CoT 包在 `<think>`…`</think>` 中，中继还可能把推理在回合中途、或只带闭标签地倒进 `content`。hellogrok 会剥离流中任意位置的 think span：第二阶段 span、无开标签的 `</think>` 推理尾、游离或跨增量分裂的闭标签，都会被归入推理通道或删除，而不是泄漏进可见回复。可见回复之后到达的推理按设计丢弃，因为 Grok Build 只把推理渲染为前缀 Thought。已存盘的气泡不会改写；升级后请重启代理并新开 session。
+
+### 工具调用报 `missing field` 参数错误
+
+Grok Build 按已声明 schema 校验工具参数，失败时回显原始参数。第三方模型有时发出别名参数名（`target_path` 而非 `target_file`），极少数情况下一个参数片段都不发。hellogrok 按已声明 schema 归一化已知别名，并对声明了必填属性的工具丢弃零参数调用（日志记 `empty-args-discarded`）——空参数对象永远无法满足必填字段。若仍出现该错误，回显的参数即模型实际发送的内容；失败调用会回喂模型，通常下一轮即以更正后的参数重试。
+
+### 图像输入被 `vision_not_supported` 拒绝
+
+纯文本上游会拒绝携带图像内容部分的请求，包括 `read_file` 读图放进 tool result 的图像。hellogrok 识别该拒绝（`400` 且 code 含 `vision`，或消息含 `not multimodal` / `does not support image`），把每个图像部分替换为文本占位符并重试一次请求，回合因此不带视觉载荷继续，占位符会告知模型图像被省略。渠道不会被记为纯文本，因此每个带图请求仍会先付一次被拒尝试再经剥离重试成功。
+
+### `read_file` 报 `exceeds maximum allowed tokens`
+
+这是 Grok Build 自身的单次调用上限，不是 hellogrok 的错误：单个 `read_file` 窗口限制为 25,000 估算 token（默认 1,000 行），超出上限的密集文件会整体失败而不是被截断。请用 `offset`/`limit` 分段读取，或先用 `grep` 定位区域再定向读取。红色 `Read … failed` 标记只是提示；回合会以分段重试继续。
 
 ### 模型总是把上一轮思考里的错误事实再说一遍
 
