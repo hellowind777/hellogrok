@@ -128,10 +128,6 @@ func TestTranslatedUsageRejectsPartialAndInvalidMeasurements(t *testing.T) {
 		{name: "chat total only", protocol: "chat", usage: map[string]any{"total_tokens": 7}},
 		{name: "chat prompt and total only", protocol: "chat", usage: map[string]any{"prompt_tokens": 3, "total_tokens": 7}},
 		{name: "chat fractional input", protocol: "chat", usage: map[string]any{"prompt_tokens": 1.5, "completion_tokens": 3}},
-		{name: "chat invalid detail", protocol: "chat", usage: map[string]any{
-			"prompt_tokens": 1, "completion_tokens": 3,
-			"completion_tokens_details": map[string]any{"reasoning_tokens": -1},
-		}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -670,11 +666,12 @@ func TestNormalizeNativeChatUsage(t *testing.T) {
 			wantDetail: true,
 		},
 		{
-			name:       "invalid provider field is not guessed",
+			name:       "string cache hit count is rectified and projected",
 			usage:      map[string]any{"prompt_tokens": 30, "completion_tokens": 5, "total_tokens": 35, "prompt_cache_hit_tokens": "20"},
+			wantCached: 20,
 			wantPrompt: 30,
 			wantTotal:  35,
-			wantDetail: false,
+			wantDetail: true,
 		},
 		{
 			name: "null standard container is populated from DeepSeek",
@@ -729,9 +726,9 @@ func TestNormalizeNativeChatUsage(t *testing.T) {
 		{name: "negative count", usage: map[string]any{"prompt_tokens": -1, "completion_tokens": 5, "total_tokens": 35}, wantNull: true},
 		{name: "fractional count", usage: map[string]any{"prompt_tokens": 30, "completion_tokens": 1.5, "total_tokens": 35}, wantNull: true},
 		{name: "overflowing count", usage: map[string]any{"prompt_tokens": uint64(maxCanonicalTokenCount) + 1, "completion_tokens": 5, "total_tokens": 35}, wantNull: true},
-		{name: "wrong details container", usage: map[string]any{"prompt_tokens": 30, "completion_tokens": 5, "total_tokens": 35, "prompt_tokens_details": "bad"}, wantNull: true},
-		{name: "null detail count", usage: map[string]any{"prompt_tokens": 30, "completion_tokens": 5, "total_tokens": 35, "completion_tokens_details": map[string]any{"reasoning_tokens": nil}}, wantNull: true},
-		{name: "invalid cost", usage: map[string]any{"prompt_tokens": 30, "completion_tokens": 5, "total_tokens": 35, "cost_in_usd_ticks": "1"}, wantNull: true},
+		{name: "wrong details container is dropped without dropping usage", usage: map[string]any{"prompt_tokens": 30, "completion_tokens": 5, "total_tokens": 35, "prompt_tokens_details": "bad"}, wantPrompt: 30, wantTotal: 35},
+		{name: "null detail count is dropped without dropping usage", usage: map[string]any{"prompt_tokens": 30, "completion_tokens": 5, "total_tokens": 35, "completion_tokens_details": map[string]any{"reasoning_tokens": nil}}, wantPrompt: 30, wantTotal: 35},
+		{name: "invalid cost is dropped without dropping usage", usage: map[string]any{"prompt_tokens": 30, "completion_tokens": 5, "total_tokens": 35, "cost_in_usd_ticks": "1"}, wantPrompt: 30, wantTotal: 35},
 		{name: "all-zero placeholder", usage: map[string]any{"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}, wantNull: true},
 	}
 
@@ -1100,7 +1097,11 @@ func TestNativeChatCostRejectsInvalidMeasurements(t *testing.T) {
 		}
 		root := map[string]any{"usage": usage}
 		normalizeNativeChatUsage(root, 0)
-		if root["usage"] != nil {
+		kept, _ := root["usage"].(map[string]any)
+		if kept == nil {
+			t.Fatalf("usage with a rectifiable cost defect was dropped: %#v", root)
+		}
+		if _, present := kept["cost_in_usd_ticks"]; present {
 			t.Fatalf("invalid cost measurement reached Grok Build: %#v", root)
 		}
 	}

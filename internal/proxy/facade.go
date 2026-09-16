@@ -856,6 +856,9 @@ func (s *Server) normalizeResponsesJSON(data []byte, route config.Route, request
 	}
 	// The patch layer projects context_details from usage, so a contradictory
 	// report must be dropped before that projection, not after validation.
+	if notes := rectifyResponsesUsageEnvelope(root); len(notes) > 0 {
+		s.log.Printf("UP channel=%s usage rectified %s", route.ChannelID, strings.Join(notes, ","))
+	}
 	s.guardResponsesUsage(root, route, request)
 	data, err = json.Marshal(root)
 	if err != nil {
@@ -934,7 +937,10 @@ func (s *Server) normalizeNativeJSON(
 		if err := (chatCallIDs{}).normalize(root, false); err != nil {
 			return nil, nil, err
 		}
-		normalizeNativeChatUsage(root, window)
+		usageNotes := normalizeNativeChatUsage(root, window)
+		if len(usageNotes) > 0 {
+			s.log.Printf("UP channel=%s usage rectified %s", route.ChannelID, strings.Join(usageNotes, ","))
+		}
 		windowDiscarded := hadUsage && root["usage"] == nil
 		s.guardNativeChatUsage(root, route, request)
 		if windowDiscarded && window > 0 {
@@ -946,6 +952,9 @@ func (s *Server) normalizeNativeJSON(
 		prepareGrokBuildToolWire(root, request.Protocol)
 		if content := anySlice(root["content"]); len(content) > 0 {
 			root["content"] = alignMessagesContentThoughts(content)
+		}
+		if notes := rectifyNativeMessagesUsage(root); len(notes) > 0 {
+			s.log.Printf("UP channel=%s usage rectified %s", route.ChannelID, strings.Join(notes, ","))
 		}
 	}
 	setDownstreamResponseModel(root, responseModelForRoute(route))

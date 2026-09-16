@@ -5,6 +5,25 @@ import (
 	"strings"
 )
 
+// streamFrameRectifier is the shared contract for stateful, frame-rewriting
+// stream rectifiers (chatToolRectifier, messagesToolRectifier,
+// responsesToolRectifier). Each consumes one decoded SSE frame and returns
+// the replacement frames to forward; a rectifier that holds the frame for
+// later reassembly returns nil. Notes surface relay defects in the proxy log.
+type streamFrameRectifier interface {
+	ingest(root map[string]any) ([]map[string]any, []string)
+}
+
+// rectifierNotes adapts a rectifier whose ingest does not report notes to the
+// shared contract.
+type rectifierNotes struct {
+	ingestFunc func(root map[string]any) []map[string]any
+}
+
+func (r rectifierNotes) ingest(root map[string]any) ([]map[string]any, []string) {
+	return r.ingestFunc(root), nil
+}
+
 // messagesToolRectifier holds Messages tool_use blocks between
 // content_block_start and content_block_stop. The function name only exists
 // on the start frame, so a relay that drops it leaves no recovery point in

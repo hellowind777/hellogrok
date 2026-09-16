@@ -1242,6 +1242,12 @@ func (s *Server) streamNativeSSE(w http.ResponseWriter, response *http.Response,
 	if request.Protocol == wireResponses {
 		responsesTool = newResponsesToolRectifier(request.AdvertisedTools)
 	}
+	var toolRectifier streamFrameRectifier
+	if messagesTool != nil {
+		toolRectifier = rectifierNotes{ingestFunc: messagesTool.ingest}
+	} else if responsesTool != nil {
+		toolRectifier = rectifierNotes{ingestFunc: responsesTool.ingest}
+	}
 	evidence := newSearchEvidence()
 	clientWriteFailed := false
 	writeHeartbeat := func() error {
@@ -1353,10 +1359,15 @@ func (s *Server) streamNativeSSE(w http.ResponseWriter, response *http.Response,
 		}
 		if request.Protocol == wireChatCompletions {
 			normalizeNativeChatRequiredFields(root, route, true, chatStreamID, chatCreatedAt)
-			normalizeNativeChatUsage(root, liveContextWindow(route, response.Header))
+			if notes := normalizeNativeChatUsage(root, liveContextWindow(route, response.Header)); len(notes) > 0 {
+				s.log.Printf("UP channel=%s usage rectified %s", route.ChannelID, strings.Join(notes, ","))
+			}
 			s.guardNativeChatUsage(root, route, request)
 		}
 		if request.Protocol == wireResponses {
+			if notes := rectifyResponsesUsageEnvelope(root); len(notes) > 0 {
+				s.log.Printf("UP channel=%s usage rectified %s", route.ChannelID, strings.Join(notes, ","))
+			}
 			s.guardResponsesUsage(root, route, request)
 		}
 		setDownstreamResponseModel(root, responseModelForRoute(route))
@@ -1366,10 +1377,9 @@ func (s *Server) streamNativeSSE(w http.ResponseWriter, response *http.Response,
 			return writeChatFrames(out, lines, notes)
 		}
 		outFrames := []map[string]any{root}
-		if messagesTool != nil {
-			outFrames = messagesTool.ingest(root)
-		} else if responsesTool != nil {
-			outFrames = responsesTool.ingest(root)
+		if toolRectifier != nil {
+			frames, _ := toolRectifier.ingest(root)
+			outFrames = frames
 		}
 		for _, frame := range outFrames {
 			if frame == nil {

@@ -204,6 +204,7 @@ func applyMessagesUsage(result *canonicalResult, value any) {
 	if result == nil || usage == nil {
 		return
 	}
+	rectifyUsageMap(usage)
 	input, hasInput, validInput := optionalCanonicalToken(usage, "input_tokens")
 	cacheRead, _, validCacheRead := optionalCanonicalToken(usage, "cache_read_input_tokens")
 	cacheCreation, _, validCacheCreation := optionalCanonicalToken(usage, "cache_creation_input_tokens")
@@ -241,6 +242,7 @@ func applyChatUsage(result *canonicalResult, value any) {
 	if result == nil || usage == nil {
 		return
 	}
+	rectifyUsageMap(usage)
 	input, hasInput, validInput := firstCanonicalToken(usage, "prompt_tokens", "input_tokens")
 	output, hasOutput, validOutput := firstCanonicalToken(usage, "completion_tokens", "output_tokens")
 	total, hasTotal, validTotal := optionalCanonicalToken(usage, "total_tokens")
@@ -787,13 +789,18 @@ func validateMessagesDeltaBody(delta map[string]any) error {
 // live-context total is normalized from complete input/output counts because
 // Grok Build's Chat consumer uses total_tokens directly. DeepSeek's cache-hit
 // field is projected only after the complete measurement has passed validation.
-func normalizeNativeChatUsage(root map[string]any, window uint64) {
+func normalizeNativeChatUsage(root map[string]any, window uint64) []string {
 	rawUsage, present := root["usage"]
 	if !present || rawUsage == nil {
-		return
+		return nil
 	}
 	usage, ok := rawUsage.(map[string]any)
-	if !ok || !normalizeRequiredChatUsage(usage) ||
+	if !ok {
+		root["usage"] = nil
+		return nil
+	}
+	notes := rectifyUsageMap(usage)
+	if !normalizeRequiredChatUsage(usage) ||
 		!validChatUsageDetails(usage, "prompt_tokens_details", "cached_tokens", "audio_tokens") ||
 		!validChatUsageDetails(
 			usage,
@@ -804,18 +811,18 @@ func normalizeNativeChatUsage(root map[string]any, window uint64) {
 			"rejected_prediction_tokens",
 		) || !validOptionalChatCost(usage) {
 		root["usage"] = nil
-		return
+		return append(notes, "usage-dropped(core-measurement-unusable)")
 	}
 	prompt, _, _ := firstCanonicalToken(usage, "prompt_tokens", "input_tokens")
 	completion, _, _ := firstCanonicalToken(usage, "completion_tokens", "output_tokens")
 	if !intFitsLiveContext(window, prompt, completion) {
 		root["usage"] = nil
-		return
+		return notes
 	}
 
 	cacheHit, present, valid := optionalCanonicalToken(usage, "prompt_cache_hit_tokens")
 	if !present || !valid {
-		return
+		return notes
 	}
 
 	rawDetails, detailsPresent := usage["prompt_tokens_details"]
@@ -823,15 +830,16 @@ func normalizeNativeChatUsage(root map[string]any, window uint64) {
 		details, ok := rawDetails.(map[string]any)
 		if !ok {
 			root["usage"] = nil
-			return
+			return notes
 		}
 		if _, cachedPresent := details["cached_tokens"]; cachedPresent {
-			return
+			return notes
 		}
 		details["cached_tokens"] = cacheHit
-		return
+		return notes
 	}
 	usage["prompt_tokens_details"] = map[string]any{"cached_tokens": cacheHit}
+	return notes
 }
 
 func normalizeRequiredChatUsage(usage map[string]any) bool {
