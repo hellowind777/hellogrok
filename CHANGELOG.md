@@ -4,6 +4,17 @@ All notable changes to this project are documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.39] — 2026-09-16
+
+### Added
+
+- Managed `inference_idle_timeout_secs` for proxied channels: when a custom model does not configure Grok Build's per-chunk idle deadline, hellogrok temporarily materializes 1800 seconds (restored byte-for-byte on stop) so long relay stalls — queued generations that emit heartbeats but no content for many minutes — no longer hit the 600-second shell default. Explicit per-model or global `[models]` values remain user-owned and are never rewritten; first-party `api.deepseek.com` routes are excluded so their remote metadata stays authoritative (the watchdog below still protects them).
+- Downstream content watchdog on every streaming path (native Chat/Messages/Responses passthrough and the translated Responses projections). It mirrors Grok Build's per-protocol "meaningful content" idle classification — text, reasoning, tool-call deltas, and terminal signals count; keepalive comments, usage-only chunks, empty deltas, and lifecycle bookkeeping events do not — and fires one 30-second margin before the client's own content-progress timer. On fire it closes the upstream body and emits a retryable `proxy_stream_error`, so a genuinely stalled stream re-enters Grok Build's native 15-attempt retry budget instead of dying on the client's non-retryable `IdleTimeout`. Watchdog activity is logged as `SSE stalled: no content reached Grok Build for …`; timeouts below 60 seconds disable the watchdog to respect explicit fast-fail choices.
+
+### Fixed
+
+- A relay holding a stream with only keepalive bytes for longer than Grok Build's idle deadline (observed: GLM channels queuing for 3+ minutes with heartbeat-only frames) previously killed the turn permanently: the sampler's content-progress timer raises `IdleTimeout`, which is classified non-retryable, so neither the 15-attempt budget nor error-triggered compaction could save the turn. The turn now waits out stalls up to the managed deadline and degrades to a normal retryable failure past it.
+
 ## [0.1.38] — 2026-09-16
 
 ### Added
@@ -511,7 +522,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - CC Switch compatibility detection and conflict warnings.
 - Builds for Windows, Linux, and macOS on amd64 and arm64.
 
-[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.37...HEAD
+[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.39...HEAD
+[0.1.39]: https://github.com/hellowind777/hellogrok/compare/v0.1.38...v0.1.39
+[0.1.38]: https://github.com/hellowind777/hellogrok/compare/v0.1.37...v0.1.38
 [0.1.37]: https://github.com/hellowind777/hellogrok/compare/v0.1.36...v0.1.37
 [0.1.36]: https://github.com/hellowind777/hellogrok/compare/v0.1.35...v0.1.36
 [0.1.35]: https://github.com/hellowind777/hellogrok/compare/v0.1.34...v0.1.35

@@ -365,6 +365,7 @@ type App struct {
 	capacityKeys           map[string]string
 	managedContextWindows  map[string]uint64
 	managedThresholds      map[string]uint8
+	managedIdleTimeouts    map[string]uint64
 	autoCompactEnvironment *uint8
 
 	cfgMu             sync.Mutex
@@ -527,15 +528,27 @@ func (a *App) Start() error {
 	a.capacityKeys = make(map[string]string, len(routes))
 	a.managedContextWindows = make(map[string]uint64)
 	a.managedThresholds = make(map[string]uint8)
+	a.managedIdleTimeouts = make(map[string]uint64)
 	a.autoCompactEnvironment = autoCompactEnvironment
-	for _, route := range routes {
+	for index := range routes {
+		route := &routes[index]
 		key := capacity.RouteKey(route.OriginBase, route.WireModel, route.APIBackend)
 		a.capacityKeys[route.ChannelID] = key
 		learned, _ := capacityCache.Lookup(key)
 		if !route.ContextWindowConfigured && learned.ContextWindow > 0 && learned.ContextSource >= capacity.SourceResponseHeader {
 			a.managedContextWindows[route.ChannelID] = learned.ContextWindow
 		}
-		budget := a.capacityBudget(route)
+		if !route.InferenceIdleTimeoutConfigured && !config.IsOfficialDeepSeekRoute(*route) {
+			// Grok Build's 600s default ends a content-stalled turn with a
+			// non-retryable IdleTimeout. Project a longer deadline and mirror
+			// it into the live route so proxy timers stay consistent. The
+			// first-party DeepSeek route keeps remote metadata authoritative.
+			a.managedIdleTimeouts[route.ChannelID] = config.ManagedInferenceIdleTimeoutSecs
+			route.InferenceIdleTimeoutSecs = config.ManagedInferenceIdleTimeoutSecs
+			route.InferenceIdleTimeoutConfigured = true
+			a.logger.Printf("inference idle timeout model=%s managed=%ds; no user value configured", route.ChannelID, config.ManagedInferenceIdleTimeoutSecs)
+		}
+		budget := a.capacityBudget(*route)
 		switch {
 		case budget.Conflict:
 			a.logger.Printf("auto compact capacity conflict model=%s context_window=%d max_completion_tokens=%d margin=%d; threshold unchanged",
@@ -581,7 +594,7 @@ func (a *App) Start() error {
 	for _, route := range routes {
 		effectiveRoutes[route.ChannelID] = route
 	}
-	targets := buildConfigTargets(models, effectiveRoutes, a.managedContextWindows, a.managedThresholds)
+	targets := buildConfigTargets(models, effectiveRoutes, a.managedContextWindows, a.managedThresholds, a.managedIdleTimeouts)
 	res, err := cfgpatch.ApplyTargets(cfgPath, stPath, targets)
 	a.cfgMu.Unlock()
 	if err != nil {
@@ -598,8 +611,8 @@ func (a *App) Start() error {
 	a.patchedIDs = append([]string(nil), res.Targets...)
 	sort.Strings(a.patchedIDs)
 	a.modelAliases = cloneStringMap(res.LegacyModelAliases)
-	a.logger.Printf("config rewrite all: model_sections=%d runtime_models=%d base=%d api_base=%d api_backend=%d context_windows=%d max_completion_tokens=%d auto_compact_thresholds=%d backend_search=%d backend_tools=%d web_fetch=%d subagents_enabled=%d targets=%v",
-		res.ModelSections, res.RuntimeModels, res.BaseURLs, res.APIBaseURLs, res.APIBackends, res.ContextWindows, res.MaxCompletionTokens, res.AutoCompactThresholds, res.BackendSearch, res.BackendTools, res.WebFetch, res.SubagentsEnabled, res.Targets)
+	a.logger.Printf("config rewrite all: model_sections=%d runtime_models=%d base=%d api_base=%d api_backend=%d context_windows=%d max_completion_tokens=%d auto_compact_thresholds=%d inference_idle_timeouts=%d backend_search=%d backend_tools=%d web_fetch=%d subagents_enabled=%d targets=%v",
+		res.ModelSections, res.RuntimeModels, res.BaseURLs, res.APIBaseURLs, res.APIBackends, res.ContextWindows, res.MaxCompletionTokens, res.AutoCompactThresholds, res.InferenceIdleTimeouts, res.BackendSearch, res.BackendTools, res.WebFetch, res.SubagentsEnabled, res.Targets)
 	a.logger.Printf("config validation passed: backend_protocols=capability-projected backend_tools=true web_fetch=true backend_search=configured-or-selected-or-documented-default reasoning_config=user-or-catalog-owned model_limits=configured-first-otherwise-remote subagent_defaults=repaired-if-needed targets=%d", res.ValidatedTargets)
 	a.models = append([]config.Model(nil), models...)
 	a.routes = append([]config.Route(nil), routes...)
@@ -688,7 +701,7 @@ func configuredMaxCompletionTokens(route config.Route) uint64 {
 	return route.MaxCompletionTokens
 }
 
-func buildConfigTargets(models []config.Model, routes map[string]config.Route, contextWindows map[string]uint64, thresholds map[string]uint8) []cfgpatch.Target {
+func buildConfigTargets(models []config.Model, routes map[string]config.Route, contextWindows map[string]uint64, thresholds map[string]uint8, idleTimeouts map[string]uint64) []cfgpatch.Target {
 	targets := make([]cfgpatch.Target, 0, len(models))
 	for _, model := range models {
 		if strings.TrimSpace(model.BaseURL) == "" && strings.TrimSpace(model.APIBaseURL) == "" {
@@ -714,6 +727,10 @@ func buildConfigTargets(models []config.Model, routes map[string]config.Route, c
 		if threshold, ok := thresholds[model.ID]; ok {
 			value := threshold
 			target.AutoCompactThresholdPercent = &value
+		}
+		if timeout, ok := idleTimeouts[model.ID]; ok {
+			value := timeout
+			target.InferenceIdleTimeoutSecs = &value
 		}
 		targets = append(targets, target)
 	}
@@ -974,7 +991,7 @@ func (a *App) applyCapacityObservation(channelID string, observation capacity.Ob
 	for _, currentRoute := range a.routes {
 		routeMap[currentRoute.ChannelID] = currentRoute
 	}
-	targets := buildConfigTargets(a.models, routeMap, nextContextWindows, nextThresholds)
+	targets := buildConfigTargets(a.models, routeMap, nextContextWindows, nextThresholds, a.managedIdleTimeouts)
 	a.cfgMu.Lock()
 	result, err := cfgpatch.ApplyTargets(config.ConfigPath(), cfgpatch.StatePath(a.dataDir), targets)
 	a.cfgMu.Unlock()
@@ -1311,6 +1328,7 @@ func (a *App) Stop() error {
 	a.capacityKeys = nil
 	a.managedContextWindows = nil
 	a.managedThresholds = nil
+	a.managedIdleTimeouts = nil
 	a.autoCompactEnvironment = nil
 	a.lastError = ""
 	a.logger.Printf("stopped")

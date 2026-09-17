@@ -523,6 +523,113 @@ func TestRestoreAutoCompactThresholdFromInvalidTOML(t *testing.T) {
 	}
 }
 
+func TestApplyTargetsTemporarilyProjectsInferenceIdleTimeout(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	statePath := filepath.Join(dir, "state.json")
+	original := "[model.one]\nbase_url = \"https://one.example/v1\"\ninference_idle_timeout_secs = 900 # user value\n\n" +
+		"[model.two]\nbase_url = \"https://two.example/v1\"\n"
+	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	timeout := uint64(1800)
+	result, err := ApplyTargets(configPath, statePath, []Target{
+		{ID: "one", InferenceIdleTimeoutSecs: &timeout},
+		{ID: "two", InferenceIdleTimeoutSecs: &timeout},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.InferenceIdleTimeouts != 1 {
+		t.Fatalf("only the model without a user value should be managed: %+v", result)
+	}
+	patched, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(patched)
+	if !strings.Contains(text, "inference_idle_timeout_secs = 900 # user value") ||
+		!strings.Contains(text, "inference_idle_timeout_secs = 1800") {
+		t.Fatalf("idle timeout was not materialized correctly:\n%s", text)
+	}
+	if _, err := Restore(configPath, statePath); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(restored) != original {
+		t.Fatalf("idle timeout lifecycle was not byte-exact\nwant: %q\ngot:  %q", original, restored)
+	}
+}
+
+func TestRestorePreservesConcurrentInferenceIdleTimeoutEdit(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	statePath := filepath.Join(dir, "state.json")
+	original := "[model.one]\nbase_url = \"https://one.example/v1\"\n"
+	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	timeout := uint64(1800)
+	if _, err := ApplyTargets(configPath, statePath, []Target{{ID: "one", InferenceIdleTimeoutSecs: &timeout}}); err != nil {
+		t.Fatal(err)
+	}
+	patched, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	userEdited := strings.Replace(string(patched), "inference_idle_timeout_secs = 1800", "inference_idle_timeout_secs = 1500", 1)
+	if err := os.WriteFile(configPath, []byte(userEdited), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Restore(configPath, statePath); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(restored), "inference_idle_timeout_secs = 1500") {
+		t.Fatalf("concurrent user idle timeout was not preserved:\n%s", restored)
+	}
+}
+
+func TestRestoreInferenceIdleTimeoutFromInvalidTOML(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	statePath := filepath.Join(dir, "state.json")
+	original := "[model.one]\nbase_url = \"https://one.example/v1\"\n"
+	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	timeout := uint64(1800)
+	if _, err := ApplyTargets(configPath, statePath, []Target{{ID: "one", InferenceIdleTimeoutSecs: &timeout}}); err != nil {
+		t.Fatal(err)
+	}
+	patched, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalid := strings.Replace(string(patched), "inference_idle_timeout_secs = 1800", "inference_idle_timeout_secs = 1500", 1) + "broken = [\n"
+	if err := os.WriteFile(configPath, []byte(invalid), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Restore(configPath, statePath); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(restored), "base_url = \"https://one.example/v1\"") ||
+		!strings.Contains(string(restored), "inference_idle_timeout_secs = 1500") ||
+		!strings.Contains(string(restored), "broken = [") {
+		t.Fatalf("invalid-TOML recovery lost user content:\n%s", restored)
+	}
+}
+
 func TestApplyTargetsQuotesLegacyDottedModelHeaderAndRestoresExactly(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.toml")
@@ -2570,7 +2677,11 @@ func TestPrepareRestorePathsAgree(t *testing.T) {
 	managedState := func() State {
 		return State{
 			Format: stateFormat, ConfigPath: "unused",
-			Models: map[string]ModelState{},
+			Models: map[string]ModelState{
+				"one": {
+					InferenceIdleTimeout: ManagedLineState{Managed: true, Present: false, AppliedValue: "1800"},
+				},
+			},
 			Features: FeatureState{
 				SectionCreated: true,
 				BackendTools:   ManagedLineState{Managed: true, Present: false, AppliedValue: "true"},
@@ -2588,23 +2699,39 @@ func TestPrepareRestorePathsAgree(t *testing.T) {
 	}{
 		{
 			name:   "all fields at applied values",
-			config: "subagents.enabled = true\n\n[features]\nbackend_tools = true\nweb_fetch = true\n",
+			config: "subagents.enabled = true\n\n[features]\nbackend_tools = true\nweb_fetch = true\n\n[model.one]\ninference_idle_timeout_secs = 1800\n",
 		},
 		{
 			name:   "user edited dotted subagent value",
-			config: "subagents.enabled = false\n\n[features]\nbackend_tools = true\nweb_fetch = true\n",
+			config: "subagents.enabled = false\n\n[features]\nbackend_tools = true\nweb_fetch = true\n\n[model.one]\ninference_idle_timeout_secs = 1800\n",
 		},
 		{
 			name:   "user deleted dotted subagent line",
-			config: "[features]\nbackend_tools = true\nweb_fetch = true\n",
+			config: "[features]\nbackend_tools = true\nweb_fetch = true\n\n[model.one]\ninference_idle_timeout_secs = 1800\n",
 		},
 		{
 			name:   "user edited feature flags",
-			config: "subagents.enabled = true\n\n[features]\nbackend_tools = false\nweb_fetch = false\n",
+			config: "subagents.enabled = true\n\n[features]\nbackend_tools = false\nweb_fetch = false\n\n[model.one]\ninference_idle_timeout_secs = 1800\n",
 		},
 		{
 			name:   "features section deleted entirely",
-			config: "subagents.enabled = true\n",
+			config: "subagents.enabled = true\n\n[model.one]\ninference_idle_timeout_secs = 1800\n",
+		},
+		{
+			name:   "managed idle timeout at applied value",
+			config: "subagents.enabled = true\n\n[features]\nbackend_tools = true\nweb_fetch = true\n\n[model.one]\ninference_idle_timeout_secs = 1800\n",
+		},
+		{
+			name:   "user edited managed idle timeout",
+			config: "subagents.enabled = true\n\n[features]\nbackend_tools = true\nweb_fetch = true\n\n[model.one]\ninference_idle_timeout_secs = 1500\n",
+		},
+		{
+			name:   "user deleted managed idle timeout",
+			config: "subagents.enabled = true\n\n[features]\nbackend_tools = true\nweb_fetch = true\n\n[model.one]\n",
+		},
+		{
+			name:   "model section deleted entirely",
+			config: "subagents.enabled = true\n\n[features]\nbackend_tools = true\nweb_fetch = true\n",
 		},
 	}
 	for _, fixture := range fixtures {
@@ -2623,6 +2750,14 @@ func TestPrepareRestorePathsAgree(t *testing.T) {
 			}
 			if fallback.Subagents != parsed.Subagents {
 				t.Errorf("subagents state diverged\nparse: %+v\ntext:  %+v", parsed.Subagents, fallback.Subagents)
+			}
+			if len(fallback.Models) != len(parsed.Models) {
+				t.Fatalf("models state diverged\nparse: %+v\ntext:  %+v", parsed.Models, fallback.Models)
+			}
+			for id, parsedModel := range parsed.Models {
+				if fallback.Models[id] != parsedModel {
+					t.Errorf("model %q state diverged\nparse: %+v\ntext:  %+v", id, parsedModel, fallback.Models[id])
+				}
 			}
 		})
 	}

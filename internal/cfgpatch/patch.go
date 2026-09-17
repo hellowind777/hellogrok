@@ -50,6 +50,7 @@ var (
 	contextWindowLine              = regexp.MustCompile(`^(\s*context_window\s*=\s*)[0-9]+(\s*(?:#.*)?)?$`)
 	maxCompletionTokensLine        = regexp.MustCompile(`^(\s*max_completion_tokens\s*=\s*)[0-9]+(\s*(?:#.*)?)?$`)
 	autoCompactThresholdLine       = regexp.MustCompile(`^(\s*auto_compact_threshold_percent\s*=\s*)[0-9]+(\s*(?:#.*)?)?$`)
+	inferenceIdleTimeoutLine       = regexp.MustCompile(`^(\s*inference_idle_timeout_secs\s*=\s*)[0-9]+(\s*(?:#.*)?)?$`)
 	backendSearchLine              = regexp.MustCompile(`^(\s*supports_backend_search\s*=\s*)(?:true|false)(\s*(?:#.*)?)?$`)
 	supportsReasoningEffortLine    = regexp.MustCompile(`^(\s*supports_reasoning_effort\s*=\s*)(?:true|false)(\s*(?:#.*)?)?$`)
 	reasoningEffortLine            = regexp.MustCompile(`^(\s*reasoning_effort\s*=\s*)(?:"[^"]*"|'[^']*')(\s*(?:#.*)?)?$`)
@@ -64,6 +65,7 @@ var (
 	contextWindowAnyLine           = regexp.MustCompile(`^(\s*context_window\s*=\s*).*$`)
 	maxCompletionTokensAnyLine     = regexp.MustCompile(`^(\s*max_completion_tokens\s*=\s*).*$`)
 	autoCompactThresholdAnyLine    = regexp.MustCompile(`^(\s*auto_compact_threshold_percent\s*=\s*).*$`)
+	inferenceIdleTimeoutAnyLine    = regexp.MustCompile(`^(\s*inference_idle_timeout_secs\s*=\s*).*$`)
 	backendSearchAnyLine           = regexp.MustCompile(`^(\s*supports_backend_search\s*=\s*).*$`)
 	supportsReasoningEffortAnyLine = regexp.MustCompile(`^(\s*supports_reasoning_effort\s*=\s*).*$`)
 	reasoningEffortAnyLine         = regexp.MustCompile(`^(\s*reasoning_effort\s*=\s*).*$`)
@@ -102,6 +104,10 @@ type Target struct {
 	// AutoCompactThresholdPercent temporarily projects a model-specific safe
 	// threshold. Nil leaves the user's model/global/default resolution intact.
 	AutoCompactThresholdPercent *uint8
+	// InferenceIdleTimeoutSecs temporarily raises Grok Build's per-model idle
+	// deadline so long relay stalls do not kill the turn non-retryably. Nil
+	// leaves the field user-owned (explicit values are never rewritten).
+	InferenceIdleTimeoutSecs *uint64
 }
 
 // CCSwitchTakeover identifies CC Switch's Grok Build live-proxy projection.
@@ -148,6 +154,7 @@ type ModelState struct {
 	ContextWindow        ManagedLineState  `json:"context_window,omitempty"`
 	MaxCompletionTokens  ManagedLineState  `json:"max_completion_tokens,omitempty"`
 	AutoCompactThreshold ManagedLineState  `json:"auto_compact_threshold_percent,omitempty"`
+	InferenceIdleTimeout ManagedLineState  `json:"inference_idle_timeout_secs,omitempty"`
 	BackendSearch        ManagedLineState  `json:"backend_search"`
 	// Reasoning fields are restore-only state from releases that projected a
 	// DeepSeek menu. New transactions never manage user-owned reasoning config.
@@ -185,6 +192,7 @@ type ApplyResult struct {
 	ContextWindows        int
 	MaxCompletionTokens   int
 	AutoCompactThresholds int
+	InferenceIdleTimeouts int
 	BackendSearch         int
 	BackendTools          int
 	WebFetch              int
@@ -665,6 +673,12 @@ func validateManagedConfig(raw []byte, targets map[string]Target, state State) e
 				return fmt.Errorf("[model.%s].auto_compact_threshold_percent must be %d", id, *expected)
 			}
 		}
+		if expected := targets[id].InferenceIdleTimeoutSecs; expected != nil && state.Models[id].InferenceIdleTimeout.Managed {
+			actual, ok := positiveUint64(model["inference_idle_timeout_secs"])
+			if !ok || actual != *expected {
+				return fmt.Errorf("[model.%s].inference_idle_timeout_secs must be %d", id, *expected)
+			}
+		}
 		if targets[id].ProjectBackendSearch || state.Models[id].BackendSearch.Managed {
 			if value, ok := model["supports_backend_search"].(bool); !ok || value != targets[id].SupportsBackendSearch {
 				return fmt.Errorf("[model.%s].supports_backend_search must be %t", id, targets[id].SupportsBackendSearch)
@@ -1097,6 +1111,16 @@ func rewriteModelBlock(block []string, id string, target Target, state *State, e
 			state: &modelState.AutoCompactThreshold, changed: &result.AutoCompactThresholds,
 		})
 	}
+	// Like max_completion_tokens, materialize only a missing idle timeout so
+	// an explicit [model.*] value remains user-owned and highest priority.
+	if target.InferenceIdleTimeoutSecs != nil &&
+		(modelState.InferenceIdleTimeout.Managed || !modelBlockHasField(block, inferenceIdleTimeoutAnyLine)) {
+		fields = append(fields, managedField{
+			name: "inference_idle_timeout_secs", pattern: inferenceIdleTimeoutLine,
+			anyPattern: inferenceIdleTimeoutAnyLine, value: fmt.Sprintf("%d", *target.InferenceIdleTimeoutSecs),
+			state: &modelState.InferenceIdleTimeout, changed: &result.InferenceIdleTimeouts,
+		})
+	}
 	orderedFields := make([]managedField, 0, 1)
 	if target.ProjectBackendSearch || modelState.BackendSearch.Managed {
 		orderedFields = append(orderedFields, managedField{
@@ -1469,6 +1493,7 @@ func matchesOriginalManagedState(raw []byte, state State) (bool, error) {
 			{key: "context_window", state: modelState.ContextWindow},
 			{key: "max_completion_tokens", state: modelState.MaxCompletionTokens},
 			{key: "auto_compact_threshold_percent", state: modelState.AutoCompactThreshold},
+			{key: "inference_idle_timeout_secs", state: modelState.InferenceIdleTimeout},
 			{key: "supports_backend_search", state: modelState.BackendSearch},
 			{key: "supports_reasoning_effort", state: modelState.SupportsReasoningEffort},
 			{key: "reasoning_effort", state: modelState.ReasoningEffort},
@@ -1650,6 +1675,10 @@ func prepareRestoreState(raw []byte, state State) (State, error) {
 		if err != nil {
 			return State{}, err
 		}
+		modelState.InferenceIdleTimeout, _, err = managedStateForRestore(section, model, "inference_idle_timeout_secs", modelState.InferenceIdleTimeout)
+		if err != nil {
+			return State{}, err
+		}
 		modelState.BackendSearch, _, err = managedStateForRestore(section, model, "supports_backend_search", modelState.BackendSearch)
 		if err != nil {
 			return State{}, err
@@ -1732,6 +1761,7 @@ func prepareRestoreStateText(raw []byte, state State) (State, error) {
 			{"context_window", contextWindowAnyLine, &modelState.ContextWindow},
 			{"max_completion_tokens", maxCompletionTokensAnyLine, &modelState.MaxCompletionTokens},
 			{"auto_compact_threshold_percent", autoCompactThresholdAnyLine, &modelState.AutoCompactThreshold},
+			{"inference_idle_timeout_secs", inferenceIdleTimeoutAnyLine, &modelState.InferenceIdleTimeout},
 			{"supports_backend_search", backendSearchAnyLine, &modelState.BackendSearch},
 			{"supports_reasoning_effort", supportsReasoningEffortAnyLine, &modelState.SupportsReasoningEffort},
 			{"reasoning_effort", reasoningEffortAnyLine, &modelState.ReasoningEffort},
@@ -1993,6 +2023,7 @@ func validateRestorableConfig(raw []byte, state State) error {
 			{key: "context_window", state: modelState.ContextWindow},
 			{key: "max_completion_tokens", state: modelState.MaxCompletionTokens},
 			{key: "auto_compact_threshold_percent", state: modelState.AutoCompactThreshold},
+			{key: "inference_idle_timeout_secs", state: modelState.InferenceIdleTimeout},
 			{key: "supports_backend_search", state: modelState.BackendSearch},
 			{key: "supports_reasoning_effort", state: modelState.SupportsReasoningEffort},
 			{key: "reasoning_effort", state: modelState.ReasoningEffort},
@@ -2277,6 +2308,7 @@ func restoreModelBlock(block []string, modelState ModelState, restored int, fina
 		{contextWindowLine, contextWindowAnyLine, modelState.ContextWindow},
 		{maxCompletionTokensLine, maxCompletionTokensAnyLine, modelState.MaxCompletionTokens},
 		{autoCompactThresholdLine, autoCompactThresholdAnyLine, modelState.AutoCompactThreshold},
+		{inferenceIdleTimeoutLine, inferenceIdleTimeoutAnyLine, modelState.InferenceIdleTimeout},
 		{backendSearchLine, backendSearchAnyLine, modelState.BackendSearch},
 		{supportsReasoningEffortLine, supportsReasoningEffortAnyLine, modelState.SupportsReasoningEffort},
 		{reasoningEffortLine, reasoningEffortAnyLine, modelState.ReasoningEffort},
@@ -2309,7 +2341,7 @@ func restoreModelBlock(block []string, modelState ModelState, restored int, fina
 	block, restored = restoreManagedCompositeField(block, reasoningEffortsAnyLine, modelState.ReasoningEfforts, restored)
 	if finalBlock {
 		restoreTerminalBlockEnding(block, modelState.Model, modelState.BaseURL, modelState.APIBaseURL,
-			modelState.APIBackend, modelState.ContextWindow, modelState.MaxCompletionTokens, modelState.AutoCompactThreshold, modelState.BackendSearch,
+			modelState.APIBackend, modelState.ContextWindow, modelState.MaxCompletionTokens, modelState.AutoCompactThreshold, modelState.InferenceIdleTimeout, modelState.BackendSearch,
 			modelState.SupportsReasoningEffort, modelState.ReasoningEffort, modelState.ReasoningEfforts)
 	}
 	return block, restored

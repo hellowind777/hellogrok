@@ -6,7 +6,7 @@
 
 跨平台 Grok Build 本地代理，让自定义模型渠道兼容常见 API 格式、Build 原生 Web 工具、独立鉴权和自动配置恢复。
 
-[![Version](https://img.shields.io/badge/version-0.1.38-2f6feb.svg)](./internal/appinfo/appinfo.go)
+[![Version](https://img.shields.io/badge/version-0.1.39-2f6feb.svg)](./internal/appinfo/appinfo.go)
 [![Go](https://img.shields.io/badge/Go-1.26.6-00ADD8.svg)](./go.mod)
 [![CI](https://github.com/hellowind777/hellogrok/actions/workflows/ci.yml/badge.svg)](https://github.com/hellowind777/hellogrok/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
@@ -64,6 +64,7 @@ hellogrok 为这些自定义渠道提供统一的本地兼容层。运行时准�
 - 转发前校验各协议的工具历史：Responses 调用必须有匹配的 `function_call_output`，Messages 的 `tool_use` 必须由紧邻的下一条 user 消息中的 `tool_result` 完整配对，Chat 工具调用必须有匹配的 tool 消息。确定性错误返回不可重试的 `400`，不会进入 Grok Build 重试循环。
 - 在私有 `keepalive`、`keep-alive`、`keep_alive`、`heartbeat`、`ping` 帧到达 Grok Build 前将其转换为标准 SSE 注释，不占用 Responses 事件序号；收到各协议的终止事件后立即关闭上游流。终态判定按协议、不按渠道或模型：Chat Completions 看 `finish_reason`，Messages 看 `stop_reason`/`message_stop`，Responses 看 `status` completed/failed/incomplete 或已收集的 output item。中转随后省略 `[DONE]`、`message_stop` 或 `response.completed` 并干净关闭时，代理会补发对应终态帧，而不是写成会让 Grok Build 把已完成轮次重试 15 次的 `proxy_stream_error`。
 - 普通渠道的上游响应头等待及所有响应正文的两次读取间隔最多为 601 秒，比 Grok Build shell 默认的 600 秒多一秒；`api.deepseek.com` 官方路由使用 660 秒，以覆盖服务商记录的最长十分钟排队。请求没有总时限，非流式排队空行或规范化心跳等任意上游字节都会刷新空闲时限。
+- 为未配置 `inference_idle_timeout_secs` 的代理渠道临时补为 1800 秒（停止时逐字节恢复；`api.deepseek.com` 官方路由除外，其远端元数据保持权威），让排队中只发心跳不产生内容的中转（已观测超过 3 分钟的纯心跳停顿）不再撞上 Grok Build 600 秒的默认内容时限；显式的 per-model 或全局 `[models]` 值保持用户所有。所有流式路径（含 DeepSeek 官方路由）另有下游无内容看门狗：按 Grok Build 各协议的内容判定口径镜像计时（文本、推理、工具增量与终态信号算进度，心跳、空增量、仅用量帧与生命周期簿记事件不算），并始终比客户端内容计时器提前 30 秒触发。触发时关闭上游并发出可重试的 `proxy_stream_error`，真正卡死的流因此进入 Grok Build 原生 15 次重试预算，而不是死于不可重试的客户端 `IdleTimeout`。小于 60 秒的显式超时禁用看门狗，尊重快速失败的选择。
 - 在 Grok Build 看到之前吸收上游瞬态软故障。上游响应头尚未发出时，可重试失败（busy/过载 `503`、`429`、可重试 `5xx` 或响应头超时）会在代理内以指数退避（2s 至 30s，尊重上游 `Retry-After`，上限 60s）自动重试，默认最多等待 90 秒。Responses SSE 若到目前为止的唯一终态是可重试的 `response.failed`（限流、并发、过载），也会按同样方式暂扣——响应头和早期帧先缓冲（最多 32 帧），重试不会变成第二条流——并在同一窗口内重放；`absorb_retry_max_secs = 0` 则直接透传该失败事件。上游返回的 `408` 在服务器之间不可能是 RFC 语义的"客户端超时"，一律视为边缘/网关超时页（等价 `504`）：同样进入吸收窗口，窗口耗尽后改写为可重试的 `504` 透传，而不是触发 Grok Build 对 408 的终局判定。Cloudflare 源站 TLS 失败（`525`、`526`）也按同样方式吸收，尽管 Grok Build 把它们归为终止类：中转源站重启或证书轮换通常会在窗口内恢复，而在边缘与源站 TLS 握手阶段失败的请求根本没有到达源站应用，重放没有副作用；窗口耗尽后按 Grok Build 预期的终止判定透传。窗口期内 Grok Build 自己的 15 次重试预算完全不动：只有窗口耗尽后客户端才会看到失败，且该失败仍以可重试形式透传，客户端原生预算分毫不少。传输错误不做吸收，因为 Grok Build 首次重试时的 HTTP/1.1 客户端重建比代理内重放更擅长处理；响应头发送后的流式失败不受影响。`absorb_retry_max_secs = 0` 可按渠道关闭该窗口。
 - 对软故障永不缩短 Grok Build 的原生重试预算。只有重试必然无果的确定性错误（鉴权、权限、账单、额度、无效请求或模型）才收到 `X-Should-Retry: false`，让 Grok Build 直接显示供应商的真实解释，而不是用反复重试掩盖。默认透传判定与 Grok Build 的边缘客户端策略一致——除源站 TLS 两个状态码外，`429` 和所有 `5xx` 都可重试——因此瞬态 Cloudflare 边缘页（`520`–`524`、`529`、`530`）不会因代理加盖的请求头而失去客户端原生重试。可重试的 busy/过载 `503` 透传时若上游未带 `Retry-After`，代理会补充 30 秒的 `Retry-After`，让 Grok Build 的重试节奏更合理。
 - 软故障吸收对所有渠道始终生效：可重试 `5xx`、`429`、上游 `408` 边缘超时页、Cloudflare 源站 TLS `525`/`526` 和响应头超时一律在窗口内重试——它们会自行恢复，交给 Grok Build 重试只是空耗时间。全局 `[models]` 的 `error_resilience` 设置只控制确定性 4xx 错误（鉴权、权限、无效请求或模型）：默认（`off`）立即透传供应商原始解释并标记 `X-Should-Retry: false`，因为重试不可能成功；可选的 `balanced` 值额外把它们纳入吸收窗口，按固定 30 秒后 60 秒的节奏等待——中转侧此类故障经常自行恢复（令牌轮换、权限修复、配置热加载、短暂部署），无人值守的任务因此能挺过数分钟级的中断而不是在第一次响应即告失败。推理历史被拒绝在任何档位下都不吸收：它报告的是用户必须看到的异源会话状态，隐藏只会拖延恢复。
@@ -199,7 +200,7 @@ supports_backend_search = false
 | `context_window` | 否 | 供应商/模型目录 | 输入与输出共享的总上下文容量。显式模型/provider 值优先；缺失时，hellogrok 可以学习可信上游值并临时物化到模型级，使 Grok Build 使用相同的自动压缩分母。 |
 | `max_completion_tokens` | 否 | 模型元数据 | 最大生成 token 额度。显式配置优先；缺失时，hellogrok 根据实际发出的请求和可信上游元数据计算预算，但不会把请求中观察到的值写回为模型输出上限。 |
 | `auto_compact_threshold_percent` | 否 | 模型值，其次 `[session]`，最后 `85` | Grok Build 相对于 `context_window` 的首选压缩触发百分比。安全时保持原值；需要为最大输出和安全余量预留空间时，按模型临时降低。有效范围为 `0` 到 `100`。 |
-| `inference_idle_timeout_secs` | 否 | Grok Build/供应商策略 | 等待上游响应头或正文数据时允许的最长空闲间隔。模型值优先于全局 `[models]` 值；DeepSeek 官方端点未显式设置时使用 660 秒。 |
+| `inference_idle_timeout_secs` | 否 | 托管 `1800`，否则按 Grok Build/供应商策略 | 等待上游响应头或正文数据时允许的最长空闲间隔。Grok Build 还会把同一值作为按块内容进度时限：文本、推理、工具调用增量与终态信号算进度，心跳和空增量不算。模型值优先于全局 `[models]` 值；两者都缺失时，hellogrok 为代理渠道临时补为 `1800`（停止时逐字节恢复；`api.deepseek.com` 官方路由除外），并同步到实时路由以保持代理计时一致。每条流式路径另有下游无内容看门狗，比该时限提前 30 秒触发——卡死的流会变成可重试的 `proxy_stream_error`，而不是客户端不可重试的 `IdleTimeout`。小于 60 秒的显式值会禁用看门狗，以尊重快速失败的选择。 |
 | `absorb_retry_max_secs` | 否 | `90` | 代理侧重试上游瞬态软故障（busy/过载 `503`、`429`、可重试 `5xx`、响应头超时、上游 `408` 边缘超时页，以及 Cloudflare 源站 TLS `525`/`526`）的总等待窗口。窗口期内 Grok Build 的重试预算不受影响；窗口耗尽后 Grok Build 的重试指示会显示错误原因（`<原因> | Retrying (N/M)`）并继续原生重试。显式 `0` 可关闭该渠道的吸收层。 |
 | `absorb_retry_backoff_cap_secs` | 否 | `30` | 吸收层单次退避上限。错误响应上的上游 `Retry-After` 仍会主导等待节奏，上限 60 秒。 |
 | `error_resilience` | 否 | `off` | 全局 `[models]` 设置（非按渠道）。只控制确定性 4xx（软故障吸收始终生效）：`off` 直接透传鉴权、权限、无效请求/模型拒绝及供应商原始解释；`balanced` 额外吸收它们，按 30s→60s 固定节奏等待中转侧自行恢复（令牌轮换、权限修复、短暂部署）。 |
@@ -509,7 +510,7 @@ hellogrok 会保留上游状态和错误正文。结构化限流、超时、过�
 
 ### 一直显示正在重试
 
-Grok Build 对可重试状态码（429、5xx）最多重试 15 次，单轮最长约 5.5 分钟。供应商瞬时过载（busy `503`）会先被 hellogrok 的吸收窗口隐藏，透传时还会用补充的 `Retry-After` 调整重试节奏，因此短时故障通常根本不会出现在界面上。当上游持续故障的时间超过吸收窗口时，客户端保留完整重试预算、界面停留在“重试中”阶段——这正是原生预期行为。
+Grok Build 对可重试状态码（429、5xx）最多重试 15 次，单轮最长约 5.5 分钟。供应商瞬时过载（busy `503`）会先被 hellogrok 的吸收窗口隐藏，透传时还会用补充的 `Retry-After` 调整重试节奏，因此短时故障通常根本不会出现在界面上。只有心跳没有内容的停顿会先等满该渠道的空闲时限（hellogrok 托管时为 1800 秒），之后才进入重试阶段；看门狗裕度之后仍无内容的流会被转为可重试的 `proxy_stream_error`（日志为 `SSE stalled: no content reached Grok Build for …`），而不是死于客户端不可重试的 `IdleTimeout`。当上游持续故障的时间超过吸收窗口时，客户端保留完整重试预算、界面停留在“重试中”阶段——这正是原生预期行为。
 
 对于真正不可达的渠道（连接被拒、DNS、TLS 握手），重试永远不可能成功。可以对该渠道设置 `dead_channel_fail_fast = true` 启用死渠道熔断：连续 6 次拨号级失败（可用 `dead_channel_fail_threshold` 调整）后，代理返回 `503 proxy_circuit_open`（`X-Should-Retry: false`），本轮在几秒内结束而不是空烧预算。熔断后每 5 分钟放行一次探测请求；上游返回任何状态的响应都会自动合闸，探测失败则重新计时；探测若始终没有报告结果，2 分钟租约到期即视为丢失，断开或响应头超时的探测不会把渠道永久锁死。busy `503`、`429`、超时和传输重置永不计数。
 
@@ -557,7 +558,7 @@ Chat 或 Messages 响应中缺失的 ID 会在交给 Grok Build 前补齐；Resp
 
 流结束日志会包含 `heartbeats=<数量>`。若仍出现同一错误且该计数始终为零，请用 `hellogrok routes` 确认 Grok Build 确实经过当前代理；此时服务商很可能使用了其他私有事件名，应根据不含凭据的流抓取结果诊断，而不是添加模型专用绕过逻辑。
 
-普通渠道最多等待上游响应头 601 秒，任意响应正文（包括非流式 JSON 和错误正文）的两次读取之间也最多等待 601 秒，比 Grok Build shell 默认的 600 秒多一秒，以便由 Grok Build 原生负责超时分类。`api.deepseek.com` 官方路由使用 660 秒，因为 DeepSeek 最长可排队十分钟。非流式排队空行或流式心跳都属于有效数据，会刷新空闲时限。响应头超时属于软故障：代理会先在吸收窗口内重试，窗口耗尽后才返回可重试的 `504`；读取非流式正文时超时会立即返回可重试的 `504`；若 `200` 流已经开始，则输出接收协议兼容的 `proxy_stream_error` 并关闭上游。代理不设置请求总时限，因此持续有数据的长响应不会被终止。日志中的 `response_model` 会同时显示上游声明模型和配置模型：`mismatch=true` 表示中转静默替换了模型，`conflict=true` 表示不同响应帧声明了不同模型。
+普通渠道最多等待上游响应头 601 秒，任意响应正文（包括非流式 JSON 和错误正文）的两次读取之间也最多等待 601 秒，比 Grok Build shell 默认的 600 秒多一秒，以便由 Grok Build 原生负责超时分类。`api.deepseek.com` 官方路由使用 660 秒，因为 DeepSeek 最长可排队十分钟。非流式排队空行或流式心跳都属于有效数据，会刷新空闲时限。响应头超时属于软故障：代理会先在吸收窗口内重试，窗口耗尽后才返回可重试的 `504`；读取非流式正文时超时会立即返回可重试的 `504`；若 `200` 流已经开始，则输出接收协议兼容的 `proxy_stream_error` 并关闭上游。代理不设置请求总时限，因此持续有数据的长响应不会被终止。字节活跃与内容进度分别计时：心跳刷新的是上面的上游字节窗口，而 Grok Build 的内容进度计时器只认真实内容（文本、推理、工具调用增量、终态信号）。因此每条流式路径另有下游无内容看门狗，按“渠道空闲时限减 30 秒”镜像计时；流只有字节没有内容并超过该点时，代理关闭上游并发出可重试的 `proxy_stream_error`，本轮进入 Grok Build 原生重试预算。日志中的 `response_model` 会同时显示上游声明模型和配置模型：`mismatch=true` 表示中转静默替换了模型，`conflict=true` 表示不同响应帧声明了不同模型。
 
 ### 自动压缩一直不触发
 

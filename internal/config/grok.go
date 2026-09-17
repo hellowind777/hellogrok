@@ -95,6 +95,14 @@ const (
 	ChatSearchDialectMessages         ChatSearchDialect = "messages"
 )
 
+// ManagedInferenceIdleTimeoutSecs is the per-model idle timeout hellogrok
+// materializes for proxied channels that do not configure one. Grok Build's
+// shell default of 600 seconds kills a turn non-retryably when a relay holds
+// the stream without content; the managed value gives long queued generations
+// room to finish, while hellogrok's downstream watchdog still converts a true
+// stall into a retryable stream error one margin earlier.
+const ManagedInferenceIdleTimeoutSecs uint64 = 1800
+
 // authProviderConfig mirrors the fields Grok Build accepts in
 // [auth_provider.*] and [model_providers.*.auth]. Keeping this typed prevents
 // a malformed helper declaration from being mistaken for usable dynamic auth.

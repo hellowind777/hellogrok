@@ -19,11 +19,20 @@ var (
 	heartbeatNameReplacer = strings.NewReplacer("-", "", "_", "", ".", "", " ", "")
 )
 
+// contentStallMessage describes a watchdog-terminated stream. It surfaces in
+// Grok Build as a retryable proxy_stream_error, so the turn re-enters the
+// client's native retry budget instead of dying on its non-retryable
+// IdleTimeout.
+func contentStallMessage(protocol string, timeout time.Duration) string {
+	return "upstream " + protocol + " stream stalled: no content for " + timeout.Round(time.Second).String()
+}
+
 type translatedStreamWriter struct {
 	w           http.ResponseWriter
 	flusher     http.Flusher
 	sequence    int
 	writeFailed bool
+	watchdog    *contentWatchdog
 }
 
 func beginTranslatedStream(w http.ResponseWriter, response *http.Response) (*translatedStreamWriter, error) {
@@ -53,6 +62,7 @@ func (w *translatedStreamWriter) emit(typ string, values map[string]any) error {
 	}
 	w.sequence++
 	w.flusher.Flush()
+	w.watchdog.observe(wireResponses, values)
 	return nil
 }
 
@@ -711,6 +721,9 @@ func (s *Server) streamMessagesSSE(w http.ResponseWriter, response *http.Respons
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	watchdog := newContentWatchdog(route, func() { _ = response.Body.Close() })
+	defer watchdog.stop()
+	writer.watchdog = watchdog
 	modelObserver := newUpstreamModelObserver(request.Protocol)
 	defer modelObserver.log(s.log, route)
 	state := newMessagesStreamState(writer, route, request)
@@ -741,7 +754,10 @@ func (s *Server) streamMessagesSSE(w http.ResponseWriter, response *http.Respons
 		streamErr = nil
 	}
 	aborted := isClientStreamAbort(streamErr, writer.writeFailed, response)
-	if aborted {
+	if watchdog.stalled() {
+		s.log.Printf("UP channel=%s Messages SSE stalled: no content reached Grok Build for %s; emitting retryable stream error", route.ChannelID, watchdog.timeout.Round(time.Second))
+		writer.emitStreamError(contentStallMessage("Messages", watchdog.timeout))
+	} else if aborted {
 		s.log.Printf("UP channel=%s Messages SSE aborted by client events=%d", route.ChannelID, writer.sequence)
 	} else if streamErr != nil {
 		s.log.Printf("UP channel=%s Messages SSE conversion error: %v", route.ChannelID, streamErr)
@@ -1154,6 +1170,9 @@ func (s *Server) streamChatSSE(w http.ResponseWriter, response *http.Response, r
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	watchdog := newContentWatchdog(route, func() { _ = response.Body.Close() })
+	defer watchdog.stop()
+	writer.watchdog = watchdog
 	modelObserver := newUpstreamModelObserver(request.Protocol)
 	defer modelObserver.log(s.log, route)
 	state := newChatStreamState(writer, route, request)
@@ -1187,7 +1206,10 @@ func (s *Server) streamChatSSE(w http.ResponseWriter, response *http.Response, r
 		streamErr = state.finish()
 	}
 	aborted := isClientStreamAbort(streamErr, writer.writeFailed, response)
-	if aborted {
+	if watchdog.stalled() {
+		s.log.Printf("UP channel=%s Chat Completions SSE stalled: no content reached Grok Build for %s; emitting retryable stream error", route.ChannelID, watchdog.timeout.Round(time.Second))
+		writer.emitStreamError(contentStallMessage("Chat Completions", watchdog.timeout))
+	} else if aborted {
 		s.log.Printf("UP channel=%s Chat Completions SSE aborted by client events=%d", route.ChannelID, writer.sequence)
 	} else if streamErr != nil {
 		s.log.Printf("UP channel=%s Chat Completions SSE conversion error: %v", route.ChannelID, streamErr)
@@ -1208,6 +1230,8 @@ func (s *Server) streamNativeSSE(w http.ResponseWriter, response *http.Response,
 	}
 	modelObserver := newUpstreamModelObserver(request.Protocol)
 	defer modelObserver.log(s.log, route)
+	watchdog := newContentWatchdog(route, func() { _ = response.Body.Close() })
+	defer watchdog.stop()
 	copySafeResponseHeaders(w.Header(), response.Header)
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -1297,6 +1321,7 @@ func (s *Server) streamNativeSSE(w http.ResponseWriter, response *http.Response,
 			if err := writeNativeFrame(lines, encoded); err != nil {
 				return err
 			}
+			watchdog.observe(request.Protocol, frame)
 			frames++
 			if isUpstreamTerminalFrame(request.Protocol, frame) {
 				protocolTerminal = true
@@ -1399,6 +1424,7 @@ func (s *Server) streamNativeSSE(w http.ResponseWriter, response *http.Response,
 			if err := writeNativeFrame(lines, encoded); err != nil {
 				return err
 			}
+			watchdog.observe(request.Protocol, frame)
 			frames++
 			if request.Protocol == wireMessages {
 				typ := stringValue(frame["type"])
@@ -1420,7 +1446,11 @@ func (s *Server) streamNativeSSE(w http.ResponseWriter, response *http.Response,
 		}
 	}
 	aborted := isClientStreamAbort(streamErr, clientWriteFailed, response)
-	if aborted {
+	if watchdog.stalled() {
+		s.log.Printf("UP channel=%s %s SSE stalled: no content reached Grok Build for %s; emitting retryable stream error", route.ChannelID, protocolLabel(request.Protocol), watchdog.timeout.Round(time.Second))
+		writeNativeStreamError(w, flusher, request.Protocol, contentStallMessage(protocolLabel(request.Protocol), watchdog.timeout))
+		terminal = true
+	} else if aborted {
 		s.log.Printf("UP channel=%s %s SSE aborted by client frames=%d", route.ChannelID, protocolLabel(request.Protocol), frames)
 	} else if streamErr != nil {
 		s.log.Printf("UP channel=%s %s SSE read error: %v", route.ChannelID, protocolLabel(request.Protocol), streamErr)
