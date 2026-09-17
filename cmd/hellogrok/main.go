@@ -538,11 +538,10 @@ func (a *App) Start() error {
 		if !route.ContextWindowConfigured && learned.ContextWindow > 0 && learned.ContextSource >= capacity.SourceResponseHeader {
 			a.managedContextWindows[route.ChannelID] = learned.ContextWindow
 		}
-		if !route.InferenceIdleTimeoutConfigured && !config.IsOfficialDeepSeekRoute(*route) {
+		if !route.InferenceIdleTimeoutConfigured {
 			// Grok Build's 600s default ends a content-stalled turn with a
 			// non-retryable IdleTimeout. Project a longer deadline and mirror
-			// it into the live route so proxy timers stay consistent. The
-			// first-party DeepSeek route keeps remote metadata authoritative.
+			// it into the live route so proxy timers stay consistent.
 			a.managedIdleTimeouts[route.ChannelID] = config.ManagedInferenceIdleTimeoutSecs
 			route.InferenceIdleTimeoutSecs = config.ManagedInferenceIdleTimeoutSecs
 			route.InferenceIdleTimeoutConfigured = true

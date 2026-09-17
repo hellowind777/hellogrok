@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -997,7 +998,6 @@ func TestAppDoesNotInventDeepSeekCapacityOrReasoningConfig(t *testing.T) {
 	for _, unexpected := range []string{
 		"context_window",
 		"max_completion_tokens",
-		"inference_idle_timeout_secs",
 		"reasoning_effort =",
 		"reasoning_efforts =",
 		"supports_reasoning_effort =",
@@ -1005,6 +1005,12 @@ func TestAppDoesNotInventDeepSeekCapacityOrReasoningConfig(t *testing.T) {
 		if strings.Contains(string(patched), unexpected) {
 			t.Fatalf("DeepSeek configuration was invented for %q:\n%s", unexpected, patched)
 		}
+	}
+	// The managed idle timeout applies to every proxied channel, including
+	// first-party DeepSeek: it is a resilience projection, not capacity or
+	// reasoning metadata.
+	if !strings.Contains(string(patched), fmt.Sprintf("inference_idle_timeout_secs = %d", config.ManagedInferenceIdleTimeoutSecs)) {
+		t.Fatalf("managed idle timeout missing from DeepSeek channel:\n%s", patched)
 	}
 	if err := app.Stop(); err != nil {
 		t.Fatal(err)

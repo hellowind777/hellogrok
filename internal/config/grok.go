@@ -101,7 +101,7 @@ const (
 // the stream without content; the managed value gives long queued generations
 // room to finish, while hellogrok's downstream watchdog still converts a true
 // stall into a retryable stream error one margin earlier.
-const ManagedInferenceIdleTimeoutSecs uint64 = 1800
+const ManagedInferenceIdleTimeoutSecs uint64 = 900
 
 // authProviderConfig mirrors the fields Grok Build accepts in
 // [auth_provider.*] and [model_providers.*.auth]. Keeping this typed prevents

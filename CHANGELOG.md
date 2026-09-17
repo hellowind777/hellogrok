@@ -4,6 +4,13 @@ All notable changes to this project are documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.40] — 2026-09-17
+
+### Changed
+
+- Managed `inference_idle_timeout_secs` lowered from 1800 to 900 seconds. The 30-minute ceiling traded too much failure-detection latency for stall tolerance; 15 minutes still covers twice DeepSeek's documented ten-minute queue and multiples of the observed three-minute relay stalls, and the downstream watchdog (deadline minus 30 seconds) already converts a true stall into a retryable `proxy_stream_error`, so the extra wait mostly delayed discovery.
+- The managed idle timeout now applies to every proxied channel, including first-party `api.deepseek.com` routes. The resilience projection is no longer special-cased: an explicit value remains user-owned and wins on every channel alike, and the proxy's DeepSeek-specific 660-second upstream byte window is unaffected. The DeepSeek guard test now asserts the managed timeout is present instead of invented.
+
 ## [0.1.39] — 2026-09-16
 
 ### Added
@@ -522,7 +529,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - CC Switch compatibility detection and conflict warnings.
 - Builds for Windows, Linux, and macOS on amd64 and arm64.
 
-[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.39...HEAD
+[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.40...HEAD
+[0.1.40]: https://github.com/hellowind777/hellogrok/compare/v0.1.39...v0.1.40
 [0.1.39]: https://github.com/hellowind777/hellogrok/compare/v0.1.38...v0.1.39
 [0.1.38]: https://github.com/hellowind777/hellogrok/compare/v0.1.37...v0.1.38
 [0.1.37]: https://github.com/hellowind777/hellogrok/compare/v0.1.36...v0.1.37
