@@ -1,8 +1,8 @@
-# Release Notes — v0.1.40
+# Release Notes — v0.1.41
 
-## Shorter managed stall window, uniform across channels
+## Self-healing path for unnamed tool calls
 
-- **Managed `inference_idle_timeout_secs` lowered from 1800 to 900 seconds.** The 30-minute ceiling traded too much failure-detection latency for stall tolerance. Fifteen minutes still covers twice DeepSeek's documented ten-minute queue and multiples of the observed three-minute relay stalls, and the downstream watchdog (deadline minus 30 seconds) already converts a true stall into a retryable `proxy_stream_error`, so the extra wait mostly delayed discovery.
-- **The managed timeout now applies to every proxied channel, including first-party `api.deepseek.com` routes.** It is a resilience projection, not channel metadata, so it is no longer special-cased. Explicit per-model or global `[models]` values remain user-owned and win on every channel alike. The proxy's DeepSeek-specific 660-second upstream byte window is unaffected.
+- **Unnamed Chat tool calls no longer die as a silent terminal `NotFound`.** When a streamed call keeps an empty name after shape inference (for example an empty name plus arguments missing the opening `{` with trailing garbage), hellogrok now routes it to a deterministic carrier instead of handing Grok Build an empty name the model never sees fed back.
+- **Parseable arguments go to `run_terminal_command` (`command` carries the raw text); corrupt arguments go to `read_file` (`target_file` carries the raw text).** Both carriers fail cleanly, so the raw arguments return through a `tool_result` and the model regenerates the call on the next turn. The route is logged as `unresolved-name-routed(name=…)`. When neither carrier is declared on the request, the call is left untouched.
 
-Restart both hellogrok executables after upgrading; the rewritten channel values take effect at the next proxy start. Channels you configured explicitly keep their value unchanged.
+Upgrade the running proxy to pick up the new behavior; the next affected turn recovers without a new session.

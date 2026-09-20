@@ -6,7 +6,7 @@
 
 跨平台 Grok Build 本地代理，让自定义模型渠道兼容常见 API 格式、Build 原生 Web 工具、独立鉴权和自动配置恢复。
 
-[![Version](https://img.shields.io/badge/version-0.1.40-2f6feb.svg)](./internal/appinfo/appinfo.go)
+[![Version](https://img.shields.io/badge/version-0.1.41-2f6feb.svg)](./internal/appinfo/appinfo.go)
 [![Go](https://img.shields.io/badge/Go-1.26.6-00ADD8.svg)](./go.mod)
 [![CI](https://github.com/hellowind777/hellogrok/actions/workflows/ci.yml/badge.svg)](https://github.com/hellowind777/hellogrok/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
@@ -94,7 +94,7 @@ hellogrok 为这些自定义渠道提供统一的本地兼容层。运行时准�
 Grok Build 在本地执行文件、终端、grep、子代理、客户端 `web_search`、MCP（先 `search_tool` 再 `use_tool`）和 Skill。hellogrok 通过 Responses、Messages 和 Chat Completions 转发这些声明，包括中转后的 grok-4.5/4.6 渠道。第三方渠道不会收到 xAI 专属的 `x_search`；供应商 hosted 工具仍须由上游真实支持。
 
 - 发给上游的工具表只保留 Grok Build 的 `client_name`（`list_dir`、`read_file`、`run_terminal_command`、`spawn_subagent` 等）。Claude/Codex 别名（`LS`、`Read`、`Bash`、`Task`、`Grep`、`Write`、`ToolSearch` 等）只在回来的调用上改写，不会克隆进每轮 `tools`。
-- 入站调用会改写成已声明的 `client_name` 与参数键。Chat 顶层 `name`/`arguments`、旧版 `function_call`、对象形式参数、按参数形状回收的空名称（含丢失首个流式增量导致的截断参数），以及常见 XML/正文 JSON 调用，都会在 Grok Build 分发前规范化。参数别名按已声明 schema 归一（`target_path` 落到 `target_file`、`target_directory` 或 `file_path`）；一个参数片段都未累积的流式调用，在已声明工具含必填属性时会在分发前丢弃并记录 `empty-args-discarded(name=...)`——空参数对象永远无法满足必填字段，否则 Grok Build 只会报出必然的 `missing field` 解析失败。
+- 入站调用会改写成已声明的 `client_name` 与参数键。Chat 顶层 `name`/`arguments`、旧版 `function_call`、对象形式参数、按参数形状回收的空名称（含丢失首个流式增量导致的截断参数），以及常见 XML/正文 JSON 调用，都会在 Grok Build 分发前规范化。参数别名按已声明 schema 归一（`target_path` 落到 `target_file`、`target_directory` 或 `file_path`）；一个参数片段都未累积的流式调用，在已声明工具含必填属性时会在分发前丢弃并记录 `empty-args-discarded(name=...)`——空参数对象永远无法满足必填字段，否则 Grok Build 只会报出必然的 `missing field` 解析失败。形状推断仍无法命名的无名调用不会以空名称到达 Grok Build，而是进入自愈载体：可解析参数走 `run_terminal_command`（`command` 携带原文），损坏参数走 `read_file`（`target_file` 携带原文），并记录 `unresolved-name-routed(name=...)`，失败经 `tool_result` 回喂模型后由模型重新生成调用；当两个载体均未声明时保持原样透传。
 - 直接 MCP 名（`server__tool`、`mcp__server__tool`）在声明了 `use_tool` 时会包成该元工具。Write 整文件写入会落到 `write` 或 `search_replace`。Glob 模式会落到 `glob`、`grep` 或 `rg --files`。缺失的必填 `description` 和 `subagent_type` 会补齐。
 - 中转 grok-4.5/4.6 发出的 Grok Build 原名原样通过。历史里的 tool 结果消息会补上对应 `name`，避免思考模型在下一轮拒绝请求。
 - hellogrok 不会凭空创造当前请求未声明的工具。模型若不发出 tool call，仍然不会执行工具。
@@ -530,7 +530,7 @@ Grok Build 对可重试状态码（429、5xx）最多重试 15 次，单轮最�
 
 ### Agent tried calling a tool that doesn't exist
 
-Grok Build 按精确 `client_name` 分发（是 `list_dir`，不是 `List`）。第三方或中转模型可能发出 Claude/Codex 名称、Chat 顶层 `name`、后续 SSE 帧上的空 `function.name`、正文里的 XML，或直接 MCP 名；中继也可能丢掉工具调用的第一个流式增量，留下空名称和缺开头 `{"` 的参数。当前 hellogrok 会重组 Chat 工具流、把 Messages `tool_use` 块与 Responses `function_call` 项扣留到停止帧、修复截断的参数前缀、按参数形状回收空名称，把这些调用改写成该请求已声明的工具，并在实时响应与回放历史上补修 `name`。
+Grok Build 按精确 `client_name` 分发（是 `list_dir`，不是 `List`）。第三方或中转模型可能发出 Claude/Codex 名称、Chat 顶层 `name`、后续 SSE 帧上的空 `function.name`、正文里的 XML，或直接 MCP 名；中继也可能丢掉工具调用的第一个流式增量，留下空名称和缺开头 `{"` 的参数。当前 hellogrok 会重组 Chat 工具流、把 Messages `tool_use` 块与 Responses `function_call` 项扣留到停止帧、修复截断的参数前缀、按参数形状回收空名称，把这些调用改写成该请求已声明的工具，并在实时响应与回放历史上补修 `name`。形状恢复后仍无名称的调用会进入自愈载体（可解析参数走 `run_terminal_command`，损坏参数走 `read_file`，日志记 `unresolved-name-routed`），让 Grok Build 正常解析并把原文经 `tool_result` 回喂模型，而不是以空名称死于终端态 `NotFound`。
 
 升级后请重启两个 hellogrok 可执行文件，然后 **新开一轮会话**。旧对话里可能已经存下未映射的 `List` 或空名称；修好实时响应不会改写升级前写入的历史。若日志出现 `tool identity adapted List->list_dir`（或 `->use_tool`）而 TUI 仍提示工具不存在，说明模型调用了未声明的名称——hellogrok 不会凭空创造。
 

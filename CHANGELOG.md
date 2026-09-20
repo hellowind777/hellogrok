@@ -4,6 +4,16 @@ All notable changes to this project are documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.41] — 2026-09-20
+
+### Added
+
+- Self-healing carrier for Chat tool calls whose name stays unresolved after shape inference. Parseable arguments are carried by `run_terminal_command` (`command` holds the raw text); corrupt non-JSON arguments are carried by `read_file` (`target_file` holds the raw text, `(no arguments)` when empty). The route is logged as `unresolved-name-routed(name=…)` with a valid JSON carrier payload, so the failure returns through a `tool_result` and the model regenerates the call. When neither carrier is declared on the request the call is left untouched.
+
+### Fixed
+
+- Unnamed Chat tool calls that shape inference cannot name (for example an empty name plus arguments missing the opening `{` with trailing garbage) no longer reach Grok Build with an empty name and die as a silent terminal `NotFound` the model never sees fed back. The turn now recovers through the carrier path above instead of stalling.
+
 ## [0.1.40] — 2026-09-17
 
 ### Changed
@@ -529,7 +539,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - CC Switch compatibility detection and conflict warnings.
 - Builds for Windows, Linux, and macOS on amd64 and arm64.
 
-[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.40...HEAD
+[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.41...HEAD
+[0.1.41]: https://github.com/hellowind777/hellogrok/compare/v0.1.40...v0.1.41
 [0.1.40]: https://github.com/hellowind777/hellogrok/compare/v0.1.39...v0.1.40
 [0.1.39]: https://github.com/hellowind777/hellogrok/compare/v0.1.38...v0.1.39
 [0.1.38]: https://github.com/hellowind777/hellogrok/compare/v0.1.37...v0.1.38

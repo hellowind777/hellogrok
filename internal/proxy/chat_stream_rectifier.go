@@ -340,6 +340,15 @@ func (r *chatToolRectifier) flush() ([]map[string]any, []string) {
 		if strings.TrimSpace(resolved) == "" {
 			resolved = name
 		}
+		if strings.TrimSpace(resolved) == "" {
+			// An unnamed call that shape inference could not resolve reaches Grok
+			// Build with an empty name and dies as NotFound, a terminal error the
+			// model never sees fed back. Route it onto a self-healing path instead:
+			// hand the raw arguments to a real tool so the next turn returns them
+			// in a tool_result and the model regenerates the call.
+			resolved, rewritten = fallbackUnresolvedCall(rewritten, r.advertised)
+			notes = append(notes, fmt.Sprintf("unresolved-name-routed(name=%s)", resolved))
+		}
 		if len(parseToolArguments(rewritten)) == 0 {
 			// A call that accumulated no argument fragments at all cannot
 			// satisfy a schema with required properties: Grok Build would
@@ -369,6 +378,30 @@ func (r *chatToolRectifier) flush() ([]map[string]any, []string) {
 		}
 	}
 	return frames, uniqueStrings(notes)
+}
+
+// fallbackUnresolvedCall picks a deterministic advertised tool to carry an
+// unnamed, shape-unresolvable call so Grok Build parses it and feeds the error
+// back to the model. Parseable arguments go to run_terminal_command (a shell
+// echo of the raw text); corrupt arguments go to read_file (the raw text as the
+// path). Both fail cleanly and return the original arguments to the model,
+// which is what makes the retry possible. Returns empty when neither tool is
+// advertised, leaving the call untouched.
+func fallbackUnresolvedCall(arguments string, advertised []advertisedTool) (string, string) {
+	carrier := "run_terminal_command"
+	key := "command"
+	if !jsonObjectComplete(arguments) {
+		carrier = "read_file"
+		key = "target_file"
+	}
+	if !advertisedHas(advertised, carrier) {
+		return "", arguments
+	}
+	raw := strings.TrimSpace(arguments)
+	if raw == "" {
+		raw = "(no arguments)"
+	}
+	return advertisedCanonicalName(advertised, carrier), encodeToolArguments(map[string]any{key: raw})
 }
 
 func (r *chatToolRectifier) toolFrame(template map[string]any, call map[string]any) map[string]any {

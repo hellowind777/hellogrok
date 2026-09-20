@@ -567,6 +567,68 @@ func TestChatRectifierDiscardsEmptyObjectArgumentsForRequiredTool(t *testing.T) 
 
 // Tools whose schema has no required properties accept an empty arguments
 // object, so argument-less calls to them must still be forwarded.
+// The reported failure mode: a name-dropped call whose arguments also lost the
+// leading `{` and stay unparseable. Shape inference cannot name it, so it used
+// to reach Grok Build with an empty name and die as a silent NotFound. It must
+// now be routed onto a self-healing carrier that hands the raw arguments back.
+func TestChatRectifierRoutesCorruptUnnamedCallToSelfHealingCarrier(t *testing.T) {
+	rectifier := newChatToolRectifier(grokBuildTools(), "")
+	var out []map[string]any
+	var notes []string
+	collect := func(root map[string]any) {
+		frames, n := rectifier.ingest(root)
+		out = append(out, frames...)
+		notes = append(notes, n...)
+	}
+	// Exact shape from the incident: empty name, arguments missing the opening
+	// brace and carrying trailing garbage, so they never parse.
+	collect(chatToolChunk(0, "call_bad", "", `8,"-B":3,"glob":"screen_default.py","head_limit":40`, nil))
+	collect(chatFinishChunk("tool_calls"))
+	frames, n := rectifier.flush()
+	out = append(out, frames...)
+	notes = append(notes, n...)
+	acc := grokBuildAccumulateChatToolCalls(out)
+	if len(acc) != 1 {
+		t.Fatalf("unnamed call did not reach Grok Build: %#v", acc)
+	}
+	if acc[0].Name != "read_file" {
+		t.Fatalf("corrupt unnamed call routed to %q, want read_file: %#v", acc[0].Name, acc)
+	}
+	if !jsonObjectComplete(acc[0].Arguments) {
+		t.Fatalf("carrier arguments not valid JSON: %q", acc[0].Arguments)
+	}
+	obj := parseToolArguments(acc[0].Arguments)
+	if !strings.Contains(stringValue(obj["target_file"]), "screen_default.py") {
+		t.Fatalf("raw arguments not preserved for feedback: %#v", obj)
+	}
+	if joined := strings.Join(notes, ","); !strings.Contains(joined, "unresolved-name-routed(name=read_file)") {
+		t.Fatalf("route was not logged: %v", notes)
+	}
+}
+
+// A name-dropped call whose arguments stay parseable but match no advertised
+// schema still cannot be named; route it to run_terminal_command so the model
+// gets the raw text back instead of a silent NotFound.
+func TestChatRectifierRoutesParseableUnnamedCallToShellCarrier(t *testing.T) {
+	rectifier := newChatToolRectifier(grokBuildTools(), "")
+	var out []map[string]any
+	frames, _ := rectifier.ingest(chatToolChunk(0, "call_bad", "", `{"nonsense":true}`, nil))
+	out = append(out, frames...)
+	frames, notes := rectifier.flush()
+	out = append(out, frames...)
+	acc := grokBuildAccumulateChatToolCalls(out)
+	if len(acc) != 1 || acc[0].Name != "run_terminal_command" {
+		t.Fatalf("parseable unnamed call routed to %#v, want run_terminal_command", acc)
+	}
+	obj := parseToolArguments(acc[0].Arguments)
+	if !strings.Contains(stringValue(obj["command"]), "nonsense") {
+		t.Fatalf("raw arguments not preserved for feedback: %#v", obj)
+	}
+	if joined := strings.Join(notes, ","); !strings.Contains(joined, "unresolved-name-routed(name=run_terminal_command)") {
+		t.Fatalf("route was not logged: %v", notes)
+	}
+}
+
 func TestChatRectifierKeepsArgumentLessCallForOptionalTool(t *testing.T) {
 	rectifier := newChatToolRectifier([]advertisedTool{{Name: "scheduler_list"}}, "")
 	var out []map[string]any
